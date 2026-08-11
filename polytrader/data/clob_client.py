@@ -38,10 +38,12 @@ class ClobClient:
 
     def __init__(self, api_base: str = "https://clob.polymarket.com",
                  ws_url: str = "wss://ws-subscriptions-clob.polymarket.com",
-                 http: HttpClient | None = None):
+                 http: HttpClient | None = None,
+                 proxy: str | None = None):
         self.api_base = api_base.rstrip("/")
         self.ws_url = ws_url
         self.http = http or HttpClient()
+        self.proxy = proxy  # WS 代理（websocket-client 不读系统代理，需显式传入）
 
     # ---- REST ----
     def get_book(self, token_id: str) -> OrderBook | None:
@@ -89,8 +91,14 @@ class ClobClient:
             except json.JSONDecodeError:
                 log.warning("WS invalid message: %.100s", message)
                 return
+            # book 快照实际为 JSON 数组 [{...}]；单条消息也可能是对象
+            if isinstance(payload, list):
+                payload = payload[0] if payload else {}
+            if not isinstance(payload, dict):
+                return
             event = payload.get("event_type")
-            if event == "book":
+            is_book = event == "book" or (event is None and (payload.get("bids") or payload.get("asks")))
+            if is_book:
                 asset_id = payload.get("asset_id", "")
                 book = OrderBook(token_id=asset_id)
                 for level in payload.get("bids", []) or []:
@@ -129,10 +137,36 @@ class ClobClient:
             on_error=_on_error,
             on_close=_on_close,
         )
+        proxy_kwargs = _ws_proxy_kwargs(self.proxy)
         while not stop.is_set():
-            ws.run_forever(ping_interval=20, ping_timeout=10)
+            ws.run_forever(ping_interval=20, ping_timeout=10, **proxy_kwargs)
             if stop.is_set():
                 break
             log.info("WS disconnected, reconnecting in 3s...")
             time.sleep(3)
         ws.close()
+
+
+def _ws_proxy_kwargs(proxy: str | None) -> dict:
+    """把 proxy URL 转成 websocket-client run_forever 的代理参数。
+
+    支持 http/https/socks5/socks5h 形式。websocket-client 不读环境代理变量。
+    """
+    if not proxy:
+        return {}
+    from urllib.parse import urlparse
+
+    u = urlparse(proxy)
+    scheme = (u.scheme or "").lower()
+    port = u.port or (443 if scheme in ("https", "wss") else 80)
+    if scheme in ("http", "https"):
+        # proxy_type 必须显式传 "http"：websocket-client 的 options.get("proxy_type", "http")
+        # 在值 None 时返回 None，会触发 "Only http, socks4, socks5..." 校验错误
+        return {"http_proxy_host": u.hostname, "http_proxy_port": port,
+                "proxy_type": "http"}
+    if scheme in ("socks5", "socks5h"):
+        # websocket-client 3.x 原生支持 socks5h（远端 DNS 解析）
+        return {"http_proxy_host": u.hostname, "http_proxy_port": port,
+                "proxy_type": "socks5h"}
+    log.warning("unsupported WS proxy scheme %r, connecting direct", scheme)
+    return {}

@@ -46,9 +46,21 @@ def test_parse_book_array_levels():
 def test_to_level_variants():
     assert _to_level(["0.5", "100"]) == OrderBookLevel(0.5, 100.0)
     assert _to_level([0.5, 100]) == OrderBookLevel(0.5, 100.0)
+    assert _to_level({"price": "0.5", "size": "100"}) == OrderBookLevel(0.5, 100.0)
+    assert _to_level({"price": None, "size": "100"}) is None
     assert _to_level(["bad", "100"]) is None
     assert _to_level(None) is None
     assert _to_level(["0.5"]) is None
+
+
+def test_ws_proxy_kwargs():
+    from polytrader.data.clob_client import _ws_proxy_kwargs
+    assert _ws_proxy_kwargs(None) == {}
+    http = _ws_proxy_kwargs("http://127.0.0.1:7890")
+    assert http["proxy_type"] == "http"
+    assert http["http_proxy_host"] == "127.0.0.1"
+    socks = _ws_proxy_kwargs("socks5h://127.0.0.1:7890")
+    assert socks["proxy_type"] == "socks5h"
 
 
 def test_midpoint():

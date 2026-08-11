@@ -8,4 +8,5 @@ numpy>=1.26.0
 pandas>=2.1.0
 lightgbm>=4.3.0
 scikit-learn>=1.3.0
+PySocks>=1.7.1        # websocket-client 的 socks 代理支持
 pytest>=7.4.0
