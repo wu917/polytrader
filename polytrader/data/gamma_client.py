@@ -91,7 +91,11 @@ class GammaClient:
         return [self._market_from_json(m) for m in items if isinstance(m, dict)]
 
     def get_market(self, condition_id: str) -> Market | None:
-        data = self.http.get_json(f"{self.api_base}/markets/{condition_id}")
+        # quote 防路径遍历/注入（condition_id 虽来自 Polymarket API，纵深防御）
+        from urllib.parse import quote
+
+        safe_id = quote(condition_id, safe="")
+        data = self.http.get_json(f"{self.api_base}/markets/{safe_id}")
         if not data:
             return None
         return self._market_from_json(data)

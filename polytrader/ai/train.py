@@ -1,6 +1,11 @@
-"""训练流水线：标签提取 + 训练 + 概率校准 + 模型持久化。"""
+"""训练流水线：标签提取 + 训练 + 概率校准 + 模型持久化。
+
+安全：artifact 为 pickle 格式，加载时强制路径白名单（models/ 目录内）
++ SHA-256 sidecar 完整性校验，防止从不可信来源加载模型导致 RCE。
+"""
 from __future__ import annotations
 
+import hashlib
 import logging
 import pickle
 from pathlib import Path
@@ -10,10 +15,14 @@ import numpy as np
 
 from polytrader.ai.features import feature_matrix
 from polytrader.ai.models import ProbabilityModel, get_default_model
+from polytrader.config import PROJECT_ROOT
 from polytrader.logging_setup import get_logger
 from polytrader.models import Market
 
 log = get_logger("ai.train")
+
+# artifact 允许的加载目录（默认安全边界）
+ARTIFACT_DIRS = (PROJECT_ROOT / "models",)
 
 
 def extract_label(market: Market) -> int | None:
@@ -103,15 +112,42 @@ def train_model(
 
 
 def save_artifact(artifact: dict[str, Any], path: str | Path) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as fh:
-        pickle.dump(artifact, fh)
-    log.info("artifact saved to %s", path)
+    """保存 artifact 并生成 SHA-256 sidecar（load_artifact 校验用）。"""
+    data = pickle.dumps(artifact)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    Path(str(p) + ".sha256").write_text(digest + "\n")
+    log.info("artifact saved to %s (sha256 %s)", p, digest[:12])
 
 
-def load_artifact(path: str | Path) -> dict[str, Any]:
-    with open(path, "rb") as fh:
-        return pickle.load(fh)
+def load_artifact(path: str | Path, allow_untrusted: bool = False) -> dict[str, Any]:
+    """加载 artifact，带安全校验：
+    1. 默认只允许加载 ARTIFACT_DIRS（models/）内的文件——pickle 可执行任意代码，
+       绝不能加载不可信来源的模型文件；
+    2. 存在 .sha256 sidecar 时校验完整性（防损坏/篡改）。
+    """
+    p = Path(path).resolve()
+    trusted = any(str(p).startswith(str(d.resolve())) for d in ARTIFACT_DIRS)
+    if not allow_untrusted and not trusted:
+        raise ValueError(
+            f"refusing to load artifact from untrusted location: {p} "
+            f"(allowed: {[str(d) for d in ARTIFACT_DIRS]}; "
+            f"pass allow_untrusted=True only for files you fully control)"
+        )
+    data = p.read_bytes()
+    sidecar = Path(str(p) + ".sha256")
+    if sidecar.exists():
+        expected = sidecar.read_text().strip()
+        actual = hashlib.sha256(data).hexdigest()
+        if expected != actual:
+            raise ValueError(
+                f"artifact checksum mismatch for {p}: file may be corrupted or tampered"
+            )
+    else:
+        log.warning("artifact %s has no .sha256 sidecar; integrity not verified", p)
+    return pickle.loads(data)
 
 
 class _CalibratedWrapper(ProbabilityModel):

@@ -176,6 +176,25 @@ def test_mirror_target_qualification():
     assert targets == []
 
 
+def test_mirror_target_inactive_wallet_filtered():
+    """lookback_days 内无活跃交易的钱包被过滤。"""
+    import time
+    stale = WalletProfile(address="0xstale", realized_profit_usd=9000, total_trades=60,
+                          recent_activity=[{"timestamp": time.time() - 200 * 86400}])  # 200 天前
+    engine = _mirror_engine(FakeDataApiMirror({}), min_profit_usd=5000, min_trades=30,
+                            lookback_days=90)
+    assert engine.refresh_targets([stale]) == []
+
+
+def test_mirror_target_active_wallet_kept():
+    import time
+    active = WalletProfile(address="0xact", realized_profit_usd=9000, total_trades=60,
+                           recent_activity=[{"timestamp": time.time() - 3600}])  # 1 小时前
+    engine = _mirror_engine(FakeDataApiMirror({}), min_profit_usd=5000, min_trades=30,
+                            lookback_days=90)
+    assert engine.refresh_targets([active]) == ["0xact"]
+
+
 def test_mirror_skips_unknown_token_when_yes_only():
     """mirror_yes_only 时未知 token 保守拒绝（评审修复）。"""
     trades = [t("BUY", "unknown-token-xyz", 50, 0.55, 2100000000, wallet="0xpro")]

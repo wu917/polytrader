@@ -113,6 +113,39 @@ def test_build_dataset_too_few_samples():
     assert build_dataset([make_market("solo", prices=["1.0", "0.0"], closed=True)]) is None
 
 
+# ---------- artifact 安全 ----------
+
+def test_artifact_save_load_roundtrip(tmp_path):
+    from polytrader.ai.train import load_artifact, save_artifact
+    artifact = {"model": HistGBProbabilityModel(max_iter=10), "columns": ["a"]}
+    # 保存到 models/ 外的路径也能 save，但 load 默认拒绝
+    path = tmp_path / "models" / "test.pkl"
+    path.parent.mkdir()
+    save_artifact(artifact, path)
+    loaded = load_artifact(path, allow_untrusted=True)
+    assert "columns" in loaded
+    assert loaded["columns"] == ["a"]
+
+
+def test_artifact_load_rejects_untrusted_path(tmp_path):
+    from polytrader.ai.train import load_artifact, save_artifact
+    path = tmp_path / "test.pkl"
+    save_artifact({"model": None, "columns": []}, path)
+    with pytest.raises(ValueError, match="untrusted location"):
+        load_artifact(path)
+
+
+def test_artifact_load_detects_tampering(tmp_path):
+    from polytrader.ai.train import load_artifact, save_artifact
+    path = tmp_path / "models" / "t.pkl"
+    path.parent.mkdir()
+    save_artifact({"model": None, "columns": []}, path)
+    # 篡改 pkl 内容但保留 sidecar
+    path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        load_artifact(path, allow_untrusted=True)
+
+
 # ---------- LLM ----------
 
 def test_parse_probability_variants():
@@ -135,6 +168,23 @@ def test_llm_scorer_disabled_without_key():
     scorer = LLMScorer(api_key="")
     assert scorer.enabled is False
     assert scorer.score("Q?") is None
+
+
+def test_llm_scorer_rejects_non_https_base_url():
+    """安全：LLM base_url 必须 https，防止 key 明文传输。"""
+    with pytest.raises(ValueError):
+        LLMScorer(api_key="k", base_url="http://api.example.com/v1")
+
+
+def test_llm_scorer_clears_proxy_by_default():
+    """安全：LLM 请求默认绕过代理（key 不经过第三方代理）。"""
+    from polytrader.data.http_client import HttpClient
+    http = HttpClient(proxy="socks5h://127.0.0.1:7890")
+    scorer = LLMScorer(api_key="k", http=http)
+    assert scorer.http.session.proxies == {}
+    http2 = HttpClient(proxy="socks5h://127.0.0.1:7890")
+    scorer_proxy = LLMScorer(api_key="k", http=http2, use_proxy=True)
+    assert scorer_proxy.http.session.proxies != {}
 
 
 # ---------- AI 策略 ----------

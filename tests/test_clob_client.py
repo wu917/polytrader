@@ -61,6 +61,10 @@ def test_ws_proxy_kwargs():
     assert http["http_proxy_host"] == "127.0.0.1"
     socks = _ws_proxy_kwargs("socks5h://127.0.0.1:7890")
     assert socks["proxy_type"] == "socks5h"
+    # 不支持的 scheme 必须报错而非静默直连（安全）
+    import pytest
+    with pytest.raises(ValueError, match="unsupported WS proxy scheme"):
+        _ws_proxy_kwargs("ftp://127.0.0.1:21")
 
 
 def test_midpoint():

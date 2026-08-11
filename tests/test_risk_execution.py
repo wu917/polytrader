@@ -107,11 +107,11 @@ def test_mark_to_market_updates_equity():
     rm = RiskManager(mode="dry-run", initial_equity=1000.0)
     t = rm_trade(100.0, shares=200.0)
     t.token_id = "tokA"
-    rm.record_trade(t)
+    rm.record_trade(t)                          # 成本 200 股 × 0.5 = 100
     unrealized = rm.mark_to_market({"tokA": 0.6})
-    assert unrealized == pytest.approx(120.0)
-    assert rm.state.current_equity == pytest.approx(1120.0)
-    assert rm.state.peak_equity == pytest.approx(1120.0)
+    assert unrealized == pytest.approx(20.0)    # 200×0.6 - 100 成本
+    assert rm.state.current_equity == pytest.approx(1020.0)
+    assert rm.state.peak_equity == pytest.approx(1020.0)
 
 
 def rm_trade(usd_value, shares=100.0, price=0.5, token_id="tokA") -> "Trade":
@@ -195,6 +195,66 @@ def test_order_manager_kelly_zero_skips():
     om = OrderManager(DryRunBroker(), rm, bankroll_usd=10000.0, kelly_fraction=1.0)
     sig = make_signal(price=0.50, prob=0.45)  # Kelly=0
     assert om.execute([sig]) == []
+
+
+# ---------- PaperBroker（真实取价模拟）----------
+
+class FakeClob:
+    def __init__(self, book_or_none, ask_price=None):
+        self._book = book_or_none
+        self._ask = ask_price
+
+    def get_book(self, token_id):
+        if self._book is None:
+            return None
+        from polytrader.models import OrderBook, OrderBookLevel
+        if self._ask is not None:
+            return OrderBook(token_id=token_id, asks=[OrderBookLevel(self._ask, 100)])
+        return self._book
+
+
+def test_paper_broker_fills_at_ask():
+    from polytrader.execution.broker import PaperBroker
+    # 信号价 0.50，ask 0.52 → 滑点 4% < 5% 容忍
+    broker = PaperBroker(FakeClob(True, ask_price=0.52), slippage_tolerance=0.05)
+    sig = make_signal(price=0.50, size=100.0)
+    trade = broker.place(sig)
+    assert trade.status == "filled"
+    assert trade.price == 0.52
+    assert trade.mode == "paper"
+
+
+def test_paper_broker_rejects_no_ask():
+    from polytrader.execution.broker import PaperBroker
+    broker = PaperBroker(FakeClob(None))
+    trade = broker.place(make_signal(price=0.50, size=100.0))
+    assert trade.status == "rejected"
+    assert "no ask" in trade.reason
+
+
+def test_paper_broker_rejects_excessive_slippage():
+    from polytrader.execution.broker import PaperBroker
+    # 信号价 0.50，ask 0.60 → 滑点 20% > 2% 容忍
+    broker = PaperBroker(FakeClob(True, ask_price=0.60), slippage_tolerance=0.02)
+    trade = broker.place(make_signal(price=0.50, size=100.0))
+    assert trade.status == "rejected"
+    assert "slippage" in trade.reason
+
+
+def test_mark_to_market_drawdown_path():
+    """价格下跌后权益下降、回撤上升，触发回撤熔断。"""
+    rm = RiskManager(mode="dry-run", max_drawdown_pct=0.10, initial_equity=1000.0)
+    t = rm_trade(200.0, shares=400.0, price=0.5)
+    t.token_id = "tokA"
+    rm.record_trade(t)                            # 成本 200
+    rm.mark_to_market({"tokA": 0.50})             # 平：市值 200 = 成本
+    assert rm.state.current_equity == pytest.approx(1000.0)
+    assert rm.drawdown_pct == 0.0
+    rm.mark_to_market({"tokA": 0.20})             # 市值 80 → 亏损 120
+    assert rm.state.current_equity == pytest.approx(880.0)
+    assert rm.drawdown_pct == pytest.approx(0.12)
+    ok, reason = rm.check(make_signal(price=0.50, size=100.0))
+    assert not ok and "drawdown" in reason
 
 
 class RejectingBroker(DryRunBroker):

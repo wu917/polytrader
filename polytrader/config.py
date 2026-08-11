@@ -9,12 +9,15 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from polytrader.logging_setup import get_logger
+
+log = get_logger("config")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 # YAML 嵌套路径 -> Config 字段名 的显式映射（避免歧义与命名漂移）
-FIELD_MAP: dict[tuple[str, ...], str] = {
-    ("mode",): "mode",
+FIELD_MAP: dict[tuple[str, ...], str] = {    ("mode",): "mode",
     ("network", "proxy"): "proxy",
     ("network", "request_timeout"): "request_timeout",
     ("network", "max_retries"): "max_retries",
@@ -52,6 +55,25 @@ FIELD_MAP: dict[tuple[str, ...], str] = {
     ("logging", "level"): "log_level",
     ("logging", "file"): "log_file",
 }
+
+# 风控关键参数与运行模式禁止通过 POLY_ 环境变量覆盖
+# （防止 shell 侧静默削弱风控或切换 live 模式，只能经 config.yaml 显式修改）
+ENV_PROTECTED_PATHS: tuple[tuple[str, ...], ...] = (
+    ("mode",),
+    ("risk", "max_position_usd"),
+    ("risk", "max_total_exposure_usd"),
+    ("risk", "max_daily_loss_usd"),
+    ("risk", "max_drawdown_pct"),
+    ("risk", "max_open_positions"),
+    ("risk", "min_price"),
+    ("risk", "max_price"),
+    ("risk", "cooldown_seconds"),
+)
+
+# 凭证字段：__repr__ 时遮盖
+SENSITIVE_FIELDS = frozenset({
+    "private_key", "api_key", "api_secret", "api_passphrase", "llm_api_key",
+})
 
 
 def load_env(env_path: Path | None = None) -> None:
@@ -193,6 +215,18 @@ class Config:
     def effective_proxy(self) -> str | None:
         return self.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
 
+    def __repr__(self) -> str:
+        """脱敏表示：凭证字段一律遮盖，防止 print(cfg)/日志泄漏。"""
+        parts = []
+        for field_name in self.__dataclass_fields__:
+            if field_name == "raw":
+                continue
+            value = getattr(self, field_name)
+            if field_name in SENSITIVE_FIELDS and value:
+                value = "***"
+            parts.append(f"{field_name}={value!r}")
+        return f"Config({', '.join(parts)})"
+
 
 def load_config(
     path: str | Path | None = None,
@@ -208,7 +242,22 @@ def load_config(
     if load_env_file:
         load_env(Path(env_path) if env_path else None)
 
-    merged = _deep_merge(raw, _env_overrides())
+    env_over = _env_overrides()
+    # 过滤受保护路径：风控参数与 mode 不接受 env 覆盖
+    for path in ENV_PROTECTED_PATHS:
+        node = env_over
+        for part in path[:-1]:
+            node = node.get(part)
+            if not isinstance(node, dict):
+                break
+        else:
+            if path[-1] in node:
+                log.warning("ignoring protected env override POLY_%s "
+                            "(must be set in config.yaml)",
+                            "__".join(p.upper() for p in path))
+                del node[path[-1]]
+
+    merged = _deep_merge(raw, env_over)
 
     cfg = Config(raw=merged)
     for path, value in _walk_leaves(merged).items():

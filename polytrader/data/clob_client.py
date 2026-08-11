@@ -168,5 +168,8 @@ def _ws_proxy_kwargs(proxy: str | None) -> dict:
         # websocket-client 3.x 原生支持 socks5h（远端 DNS 解析）
         return {"http_proxy_host": u.hostname, "http_proxy_port": port,
                 "proxy_type": "socks5h"}
-    log.warning("unsupported WS proxy scheme %r, connecting direct", scheme)
-    return {}
+    # 不支持的 scheme 显式报错，禁止静默直连（直连可能绕过用户代理暴露真实 IP）
+    raise ValueError(
+        f"unsupported WS proxy scheme {scheme!r} in {proxy!r}; "
+        "supported: http, https, socks5, socks5h"
+    )

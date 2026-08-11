@@ -168,14 +168,19 @@ class RiskManager:
         log.info("PnL update: today=%+.2f", self.state.realized_pnl_today)
 
     def mark_to_market(self, prices: dict[str, float] | None = None) -> float:
-        """按当前价格重估持仓，更新权益与回撤。返回未实现盈亏。"""
+        """按当前价格重估持仓，更新权益与回撤。返回未实现盈亏（净盈亏，非市值）。
+
+        equity = initial + realized_pnl + (持仓市值 - 持仓成本)
+        """
         self.update_prices(prices or {})
-        unrealized = 0.0
+        market_value = 0.0
         for token_id, shares in self.state.open_positions.items():
             price = self.prices.get(token_id)
             if price is None:
                 continue
-            unrealized += shares * price
+            market_value += shares * price
+        open_cost = sum(self.state.cost_basis.values())
+        unrealized = market_value - open_cost
         self.state.current_equity = self.initial_equity + self.state.realized_pnl_today + unrealized
         if self.state.current_equity > self.state.peak_equity:
             self.state.peak_equity = self.state.current_equity

@@ -27,11 +27,17 @@ class LLMScorer:
 
     def __init__(self, api_key: str = "", base_url: str = "https://api.openai.com/v1",
                  model: str = "gpt-4o-mini", http: HttpClient | None = None,
-                 timeout: int = 30):
+                 timeout: int = 30, use_proxy: bool = False):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
+        # 安全：LLM API key 只应发给目标 API 服务商。默认不走代理
+        # （代理可能为第三方，能截获 Authorization header）。
+        if not self.base_url.startswith("https://"):
+            raise ValueError(f"LLM base_url must be https, got: {base_url}")
         self.http = http or HttpClient(timeout=timeout)
+        if not use_proxy:
+            self.http.session.proxies.clear()
         self.enabled = bool(api_key)
 
     def score(self, question: str, description: str = "", market_category: str = "") -> float | None:
