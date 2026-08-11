@@ -41,30 +41,34 @@ class LLMScorer:
         self.enabled = bool(api_key)
 
     def score(self, question: str, description: str = "", market_category: str = "") -> float | None:
-        """返回 P(YES) ∈ [0,1]；不可用时返回 None。"""
+        """返回 P(YES) ∈ [0,1]；不可用时返回 None（自动重试 1 次）。"""
         if not self.enabled:
             return None
         user = f"Market: {question}\nCategory: {market_category}\nDetails: {(description or '')[:1500]}"
-        try:
-            resp = self.http.post(
-                f"{self.base_url}/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 120,
-                },
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            return _parse_probability(content)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("LLM score failed: %s", exc)
-            return None
+        for attempt in range(2):  # 推理模型偶发超时/限流，重试一次
+            try:
+                resp = self.http.post(
+                    f"{self.base_url}/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user},
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 800,  # 推理模型需要足够 token（reasoning + 输出）
+                    },
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"]
+                parsed = _parse_probability(content)
+                if parsed is not None:
+                    return parsed
+                log.warning("LLM content unparsable (attempt %d): %.100r", attempt + 1, content)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("LLM score failed (attempt %d): %s", attempt + 1, exc)
+        return None
 
     def score_many(self, questions: list[tuple[str, str, str]],
                    max_parallel: int = 5) -> list[float | None]:

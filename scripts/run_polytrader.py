@@ -289,6 +289,198 @@ def cmd_backtest(args) -> int:
     return 0
 
 
+def cmd_llm_scan(args) -> int:
+    """LLM 盘口策略实盘扫描：真实活跃市场 + 订单簿 → DeepSeek 评分 → 信号。"""
+    import json
+    import time as _time
+
+    from polytrader.ai.llm_scorer import LLMScorer
+    from polytrader.data.clob_client import ClobClient
+    from polytrader.data.gamma_client import GammaClient
+    from polytrader.data.http_client import HttpClient
+    from polytrader.strategies.llm_book import LLMBookStrategy
+
+    cfg = load_config()
+    http = HttpClient(proxy=args.proxy or cfg.effective_proxy())
+    gamma = GammaClient(http=http)
+    clob = ClobClient(http=http)
+    scorer = LLMScorer(api_key=cfg.llm_api_key, base_url=cfg.llm_base_url,
+                       model=cfg.llm_model, timeout=60)
+    strategy = LLMBookStrategy(scorer, min_edge=args.min_edge,
+                               min_liquidity_usd=args.min_liquidity,
+                               max_markets=args.max_markets)
+    if not strategy.enabled:
+        print("LLM not configured (LLM_API_KEY missing); abort")
+        return 1
+
+    print(f"LLM book scan | model={scorer.model} min_edge={args.min_edge} "
+          f"max_markets={args.max_markets}")
+    markets = gamma.get_markets(limit=args.markets, active=True)
+    binary = [m for m in markets if m.is_binary and m.liquidity >= args.min_liquidity]
+    # 只评估带内市场（longshot 无交易意义且会浪费 LLM 额度）
+    in_band = [m for m in binary
+               if 0.03 <= _gamma_yes_price(m) <= 0.97]
+    in_band.sort(key=lambda m: m.liquidity, reverse=True)
+    print(f"markets={len(markets)} binary_liquid={len(binary)} in_band={len(in_band)}")
+
+    # 拉订单簿
+    books = {}
+    for m in in_band[: args.max_markets * 2]:
+        for o in m.outcomes:
+            try:
+                book = clob.get_book(o.token_id)
+                if book and book.best_ask():
+                    books[o.token_id] = book
+            except Exception as exc:  # noqa: BLE001
+                log.debug("book fetch failed %s: %s", o.token_id, exc)
+
+    signals = strategy.scan(in_band, books)
+    print(f"\nLLM signals: {len(signals)}")
+    for s in signals:
+        print(f"  - {s.market.slug[:44]:46s} p={s.probability:.3f} "
+              f"ref={s.market_price:.3f} edge={s.edge:+.3f} [{s.extra.get('side')}]")
+    if args.verbose:
+        print("\n[verbose] per-market LLM assessment:")
+        print(f"  [diag] books fetched: {len(books)}")
+        scanned = 0
+        for m in in_band:
+            if scanned >= args.max_markets:
+                break
+            yes = m.outcomes[0]
+            book = books.get(yes.token_id)
+            if book is None or book.best_ask() is None:
+                print(f"  - {m.slug[:44]:46s} NO_BOOK")
+                continue
+            scanned += 1
+            from polytrader.strategies.llm_book import build_book_prompt
+            prompt = build_book_prompt(m, book)
+            p = scorer.score(m.question, prompt, m.category)
+            ref = _gamma_yes_price(m)
+            print(f"  - {m.slug[:44]:46s} p={p if p is not None else float('nan'):.3f} "
+                  f"ref={ref:.3f} edge={(p - ref) if p else float('nan'):+.3f}")
+
+    # 保留输出
+    out_dir = Path("backtest_results")
+    out_dir.mkdir(exist_ok=True)
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+    path = out_dir / f"llm_signals_{ts}.json"
+    path.write_text(json.dumps({
+        "model": scorer.model, "min_edge": args.min_edge,
+        "markets_scanned": len(in_band),
+        "signals": [
+            {"slug": s.market.slug, "question": s.market.question,
+             "llm_p": s.extra.get("llm_p"), "side": s.extra.get("side"),
+             "ref_price": s.market_price, "edge": round(s.edge, 4),
+             "reason": s.reason}
+            for s in signals
+        ],
+    }, indent=2, ensure_ascii=False))
+    print(f"\n  saved: {path}")
+    return 0
+
+
+def _gamma_yes_price(market) -> float:
+    """市场 YES 的 Gamma 参考价（0-1），解析失败返回 0.5。"""
+    try:
+        return float(market.outcomes[0].price)
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def cmd_smart_money(args) -> int:
+    """聪明钱回测：滚动钱包评估 → 跟随盈利钱包买入 → 收益率 + 交易单。"""
+    import csv
+    import json
+    import time as _time
+
+    from polytrader.ai.backtest import _end_ts
+    from polytrader.copytrade.smart_money import run_smart_money_backtest
+    from polytrader.data.data_api import DataApiClient
+    from polytrader.data.gamma_client import GammaClient
+    from polytrader.data.http_client import HttpClient
+
+    cfg = load_config()
+    http = HttpClient(proxy=args.proxy or cfg.effective_proxy())
+    gamma = GammaClient(http=http)
+    data = DataApiClient(http=http)
+
+    import datetime
+    since = (datetime.datetime.now(datetime.timezone.utc)
+             - datetime.timedelta(days=args.since_months * 30)).strftime("%Y-%m-%d")
+    print(f"Smart money backtest | samples={args.samples} since={since} "
+          f"top_k={args.top_k} min_profit={args.min_profit}")
+
+    labeled: list = []
+    offset = 0
+    while len(labeled) < args.samples and offset < args.samples * 4:
+        batch = gamma.get_markets(limit=100, offset=offset, active=False, closed=True,
+                                  end_date_min=since)
+        if not batch:
+            break
+        for m in batch:
+            try:
+                prices = [float(o.price) for o in m.outcomes]
+                if len(prices) == 2 and any(p >= 0.999 for p in prices):
+                    labeled.append(m)
+            except (TypeError, ValueError):
+                pass
+        offset += 100
+    labeled = labeled[: args.samples]
+    print(f"labeled={len(labeled)}")
+
+    # 拉原始成交（含钱包地址）
+    trades_by_market = {}
+    for i, m in enumerate(labeled):
+        try:
+            trades_by_market[m.condition_id] = data.get_trades(m.condition_id,
+                                                               limit=args.trade_limit)
+        except Exception:  # noqa: BLE001
+            pass
+        if (i + 1) % 50 == 0:
+            print(f"  ... {i + 1}/{len(labeled)} trades")
+    with_trades = sum(1 for v in trades_by_market.values() if v)
+    print(f"  markets with trades: {with_trades}/{len(labeled)}")
+    labeled = [m for m in labeled if trades_by_market.get(m.condition_id)]
+    print(f"  labeled with trades: {len(labeled)}")
+
+    result = run_smart_money_backtest(
+        labeled, trades_by_market,
+        lookback_days=args.lookback_days, top_k=args.top_k,
+        min_trades=args.min_trades, min_profit_usd=args.min_profit,
+        train_frac=args.train_frac, size_usd=args.size_usd,
+        follow_window_h=args.follow_h,
+    )
+    s = result.to_dict()["summary"]
+    print("\n" + "=" * 60)
+    print("SMART MONEY BACKTEST RESULT")
+    print("=" * 60)
+    print(f"  markets        : preheat={s['n_preheat']} test={s['n_test']}")
+    print(f"  trades         : {s['n_trades']} (wallets={s['top_wallets_used']})")
+    print(f"  win rate       : {s['win_rate']:.1%}")
+    print(f"  total return   : {s['total_return_pct']:+.2f}%  "
+          f"(${s['total_pnl_usd']:+.2f})")
+    print(f"  max drawdown   : {s['max_drawdown_pct']:.1f}%")
+    print("=" * 60)
+
+    out_dir = Path("backtest_results")
+    out_dir.mkdir(exist_ok=True)
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+    report_path = out_dir / f"smart_report_{ts}.json"
+    trades_path = out_dir / f"smart_trades_{ts}.csv"
+    report_path.write_text(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    with open(trades_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["market_slug", "condition_id", "side", "wallet", "entry_time",
+                         "entry_price", "settle_price", "size_usd", "pnl_usd", "pnl_pct"])
+        for t in result.trades:
+            writer.writerow([t.market_slug, t.condition_id, t.side, t.wallet,
+                             t.entry_time, t.entry_price, t.settle_price,
+                             t.size_usd, round(t.pnl_usd, 2), round(t.pnl_pct, 4)])
+    print(f"\n  saved: {report_path}")
+    print(f"  saved: {trades_path}")
+    return 0
+
+
 def main() -> int:
     setup_logging()
     ap = argparse.ArgumentParser(description="PolyTrader")
@@ -311,6 +503,27 @@ def main() -> int:
     b.add_argument("--size-usd", type=float, default=100.0, help="每笔名义金额")
     b.add_argument("--train-frac", type=float, default=0.7, help="时间切分训练集比例")
 
+    l = sub.add_parser("llm", help="LLM 盘口策略实盘扫描（DeepSeek 评分盘口概率）")
+    l.add_argument("--proxy", default=None)
+    l.add_argument("--markets", type=int, default=50, help="拉取活跃市场数")
+    l.add_argument("--max-markets", type=int, default=15, help="LLM 最多评估市场数")
+    l.add_argument("--min-edge", type=float, default=0.05)
+    l.add_argument("--min-liquidity", type=float, default=2000.0)
+    l.add_argument("--verbose", action="store_true", help="打印每个市场的 LLM 评分 vs 盘口")
+
+    sm = sub.add_parser("smart", help="聪明钱回测（跟随盈利钱包）")
+    sm.add_argument("--proxy", default=None)
+    sm.add_argument("--samples", type=int, default=300)
+    sm.add_argument("--since-months", type=int, default=3)
+    sm.add_argument("--trade-limit", type=int, default=500)
+    sm.add_argument("--top-k", type=int, default=5, help="跟随钱包数")
+    sm.add_argument("--min-trades", type=int, default=3)
+    sm.add_argument("--min-profit", type=float, default=50.0, help="钱包最低已实现盈利")
+    sm.add_argument("--lookback-days", type=int, default=90)
+    sm.add_argument("--follow-h", type=float, default=24.0, help="跟随窗口（结算前 N 小时）")
+    sm.add_argument("--size-usd", type=float, default=100.0)
+    sm.add_argument("--train-frac", type=float, default=0.7)
+
     args = ap.parse_args()
     if args.cmd == "offline" or args.cmd is None:
         return cmd_offline()
@@ -318,6 +531,10 @@ def main() -> int:
         return cmd_paper(args)
     if args.cmd == "backtest":
         return cmd_backtest(args)
+    if args.cmd == "llm":
+        return cmd_llm_scan(args)
+    if args.cmd == "smart":
+        return cmd_smart_money(args)
     return 1
 
 
