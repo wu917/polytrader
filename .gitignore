@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时产物
+logs/
+models/
+*.pkl
+*.log
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 密钥与环境变量（绝不提交）
+.env
+.env.local
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/

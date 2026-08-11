@@ -1,0 +1,62 @@
+# PolyTrader 主配置
+# 运行模式: dry-run(不联网纯模拟) / paper(联网取数+模拟下单) / live(真实下单)
+
+mode: dry-run
+
+network:
+  # 留空表示直连；中国大陆环境建议 socks5h://127.0.0.1:7890
+  proxy: ""
+  request_timeout: 15
+  max_retries: 3
+
+clob:
+  api_base: "https://clob.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com"
+  # 下单时的价格滑点容忍（%），0.02 = 2%
+  slippage_tolerance: 0.02
+
+gamma:
+  api_base: "https://gamma-api.polymarket.com"
+
+data_api:
+  api_base: "https://data-api.polymarket.com"
+
+strategies:
+  arbitrage:
+    enabled: true
+    # 同一市场 YES/NO 价格和 < 1 - 阈值 才报信号（跨手续费摩擦）
+    min_edge: 0.02
+    max_position_usd: 1000
+  ai_probability:
+    enabled: true
+    min_edge: 0.05        # 模型概率 vs 市场价格的期望边际
+    min_liquidity_usd: 500
+    kelly_fraction: 0.25  # Kelly 仓位乘数（保守）
+    llm_weight: 0.3       # LLM 评分融合权重（0 = 纯模型）
+    llm_enabled: false
+  copytrade:
+    enabled: true
+    min_profit_usd: 5000          # 目标钱包最低累计盈利
+    min_trades: 30                # 最低交易数（防止幸存者偏差小样本）
+    lookback_days: 90
+    max_slippage: 0.03
+    mirror_yes_only: true         # 只镜像 YES 买入，不镜像卖出
+
+risk:
+  max_position_usd: 500           # 单标的单方向最大敞口
+  max_total_exposure_usd: 3000    # 总敞口上限
+  max_daily_loss_usd: 100         # 日亏损熔断
+  max_drawdown_pct: 0.15          # 回撤 15% 停止
+  max_open_positions: 10
+  min_price: 0.03                 # 价格低于此不买（手续费占比过高）
+  max_price: 0.97                 # 价格高于此不买
+  cooldown_seconds: 300           # 同一标的两笔交易最小间隔
+
+execution:
+  order_timeout_seconds: 30
+  cancel_on_timeout: true
+  fill_check_interval: 2
+
+logging:
+  level: INFO
+  file: "logs/polytrader.log"
