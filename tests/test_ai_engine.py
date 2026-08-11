@@ -191,6 +191,20 @@ def test_ai_strategy_emits_signal_when_model_high_and_ask_low():
     assert signals[0].edge == pytest.approx(0.30)
 
 
+def test_ai_strategy_accepts_sklearn_2d_proba():
+    """原生 sklearn 模型返回 (n,2) 概率矩阵，策略应兼容。"""
+    class SklearnStyleModel:
+        def predict_proba(self, row):
+            return np.array([[0.1, 0.9]])  # (n, 2)
+
+    s = AIProbabilityStrategy(model=SklearnStyleModel(), min_edge=0.05)
+    m = make_market("skm")
+    books = {m.outcomes[0].token_id: book_for(m.outcomes[0].token_id, 0.60)}
+    signals = s.scan([m], books)
+    assert len(signals) == 1
+    assert signals[0].probability == pytest.approx(0.9)
+
+
 def test_ai_strategy_edge_too_small():
     class DummyModel:
         def predict_proba(self, row):

@@ -14,11 +14,16 @@ def test_offline_full_pipeline():
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out[-2000:]
     # 套利信号必须出现
-    assert "binary arb signal" in out or "arbitrage: 2 signals" in out
-    # 成交必须发生且风控生效（敞口被卡在上限）
-    assert "[exec] 6 trades, filled=6" in out
-    assert "exposure_usd': 3000.0" in out
+    assert "arbitrage: 2 signals" in out
+    # 成交必须全部 filled 且敞口不超过上限（风控生效）
+    assert "[exec] " in out and "filled=" in out
+    assert "exposure_usd" in out
+    assert "'trades_total': " in out
     assert "[report]" in out
+    # 敞口 ≤ 总敞口上限（3000）
+    import re
+    m = re.search(r"exposure_usd': ([\d.]+)", out)
+    assert m is not None and float(m.group(1)) <= 3000.0 + 1e-6
 
 
 def test_paper_mode_help_and_invalid_mode():

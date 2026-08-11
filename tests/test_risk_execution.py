@@ -82,9 +82,10 @@ def test_risk_max_open_positions():
     rm = RiskManager(mode="dry-run", max_open_positions=2, max_position_usd=1000.0,
                      max_total_exposure_usd=5000.0)
     for i in range(2):
-        t = rm_trade(100.0)
+        t = rm_trade(100.0, token_id=f"tok{i}")
         t.condition_id = f"0xc{i}"
         rm.record_trade(t)
+    assert rm.open_position_count == 2
     ok, reason = rm.check(make_signal(cid="0xcnew", price=0.50, size=100.0))
     assert not ok and "max open positions" in reason
 
@@ -113,10 +114,10 @@ def test_mark_to_market_updates_equity():
     assert rm.state.peak_equity == pytest.approx(1120.0)
 
 
-def rm_trade(usd_value, shares=100.0, price=0.5) -> "Trade":
+def rm_trade(usd_value, shares=100.0, price=0.5, token_id="tokA") -> "Trade":
     from polytrader.models import Trade
     return Trade(signal=SignalType.AI_PROBABILITY, market_slug="m", condition_id="0xcond",
-                 token_id="tokA", side=Side.BUY, price=price, shares=shares,
+                 token_id=token_id, side=Side.BUY, price=price, shares=shares,
                  usd_value=usd_value, status="filled", mode="dry-run")
 
 
@@ -194,3 +195,62 @@ def test_order_manager_kelly_zero_skips():
     om = OrderManager(DryRunBroker(), rm, bankroll_usd=10000.0, kelly_fraction=1.0)
     sig = make_signal(price=0.50, prob=0.45)  # Kelly=0
     assert om.execute([sig]) == []
+
+
+class RejectingBroker(DryRunBroker):
+    """第 2 笔起的信号全部拒绝（模拟滑点/缺 ask）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def place(self, signal):
+        self.calls += 1
+        if self.calls >= 2:
+            from polytrader.models import Trade
+            return Trade(signal=signal.type, market_slug=signal.market.slug,
+                         condition_id=signal.market.condition_id,
+                         token_id=signal.outcome.token_id if signal.outcome else "",
+                         side=signal.side, price=signal.market_price, shares=0.0,
+                         usd_value=0.0, status="rejected", mode=self.mode,
+                         reason="simulated rejection")
+        return super().place(signal)
+
+
+def test_order_manager_rolls_back_partial_group_fill():
+    """组内第 2 笔被 broker 拒绝 → 已成交的第 1 笔回滚，无残留敞口。"""
+    rm = RiskManager(mode="dry-run", max_position_usd=1000.0,
+                     max_total_exposure_usd=5000.0, cooldown_seconds=0)
+    om = OrderManager(RejectingBroker(), rm, bankroll_usd=10000.0, kelly_fraction=1.0)
+    sig1 = make_signal(cid="0xcond", slug="m1", price=0.48, prob=0.6,
+                       group_id="g1", stype=SignalType.ARBITRAGE)
+    sig2 = make_signal(cid="0xcond", slug="m2", price=0.48, prob=0.6,
+                       group_id="g1", stype=SignalType.ARBITRAGE)
+    trades = om.execute([sig1, sig2])
+    assert [t.status for t in trades] == ["rolled_back", "rejected"]
+    assert om.trades == []                       # 已成交记录被移除
+    assert rm.total_exposure == 0.0              # 风控状态干净
+    assert rm.open_position_count == 0
+
+
+def test_risk_exposure_marked_to_market():
+    """敞口按市值重估：价格下跌后敞口同步下降。"""
+    rm = RiskManager(mode="dry-run", max_position_usd=500.0)
+    t = rm_trade(200.0, shares=400.0, price=0.5)
+    t.token_id = "tokA"
+    rm.record_trade(t)
+    assert rm.exposure_of("0xcond") == pytest.approx(200.0)  # 无价格时按成本
+
+    rm.update_prices({"tokA": 0.30})                       # 价格跌到 0.30
+    assert rm.exposure_of("0xcond") == pytest.approx(120.0)  # 400 * 0.30
+
+
+def test_risk_remove_trade_rollback():
+    rm = RiskManager(mode="dry-run")
+    t = rm_trade(200.0, shares=400.0, price=0.5)
+    t.token_id = "tokA"
+    rm.record_trade(t)
+    rm.remove_trade(t)
+    assert rm.total_exposure == 0.0
+    assert rm.open_position_count == 0
+    assert "tokA" not in rm.state.open_positions

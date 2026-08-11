@@ -40,7 +40,8 @@ class DataApiClient:
 
         history: list[dict] = []
         cursor = start
-        while cursor < end:
+        chunks = 0
+        while cursor < end and chunks < 64:  # 上限防 API 异常导致空转
             chunk_end = min(cursor + MAX_HISTORY_WINDOW, end)
             params = {"market": condition_id, "startTs": cursor, "endTs": chunk_end}
             if fidelity:
@@ -49,6 +50,7 @@ class DataApiClient:
             rows = data.get("history", []) if isinstance(data, dict) else []
             history.extend(rows)
             cursor = chunk_end
+            chunks += 1
             if len(rows) < 2:
                 break  # 空窗口提前结束
         return history

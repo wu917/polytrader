@@ -1,4 +1,8 @@
-"""风控管理器：敞口、日损熔断、回撤熔断、冷却、价格带。"""
+"""风控管理器：敞口、日损熔断、回撤熔断、冷却、价格带。
+
+敞口语义：按持仓市值（shares × 当前价）计算，而非买入成本。
+外部通过 update_prices() 注入最新价格；价格未知的持仓回退到成本估算。
+"""
 from __future__ import annotations
 
 import logging
@@ -18,10 +22,10 @@ class RiskState:
     realized_pnl_today: float = 0.0
     peak_equity: float = 0.0
     current_equity: float = 0.0
-    exposure: dict[str, float] = field(default_factory=dict)   # condition_id -> 敞口 USD
-    open_positions: dict[str, float] = field(default_factory=dict)  # token_id -> shares
-    last_trade_ts: dict[str, float] = field(default_factory=dict)   # condition_id -> ts
-    day: str = ""
+    open_positions: dict[str, float] = field(default_factory=dict)      # token_id -> shares
+    token_condition: dict[str, str] = field(default_factory=dict)       # token_id -> condition_id
+    cost_basis: dict[str, float] = field(default_factory=dict)          # token_id -> 累计成本 USD
+    last_trade_ts: dict[str, float] = field(default_factory=dict)       # condition_id -> ts
 
 
 class RiskManager:
@@ -51,11 +55,37 @@ class RiskManager:
         self.cooldown_seconds = cooldown_seconds
         self.initial_equity = initial_equity
         self.state = RiskState(current_equity=initial_equity, peak_equity=initial_equity)
+        self.prices: dict[str, float] = {}   # token_id -> 最新价（外部注入）
 
     # ---- 查询 ----
+    def update_prices(self, prices: dict[str, float]) -> None:
+        """注入最新市场价格，用于市值重估。"""
+        self.prices.update({k: float(v) for k, v in prices.items() if v is not None})
+
+    def exposure_of(self, condition_id: str) -> float:
+        """单 condition 敞口（市值，价格未知时按成本估算）。"""
+        total = 0.0
+        for token_id, shares in self.state.open_positions.items():
+            if self.state.token_condition.get(token_id) != condition_id:
+                continue
+            price = self.prices.get(token_id)
+            if price is None:
+                cost = self.state.cost_basis.get(token_id, 0.0)
+                total += cost if shares > 0 else 0.0
+            else:
+                total += shares * price
+        return total
+
     @property
     def total_exposure(self) -> float:
-        return sum(self.state.exposure.values())
+        return sum(self.exposure_of(cid) for cid in self._condition_ids())
+
+    def _condition_ids(self) -> set[str]:
+        return {cid for cid in self.state.token_condition.values() if cid}
+
+    @property
+    def open_position_count(self) -> int:
+        return len(self._condition_ids())
 
     @property
     def drawdown_pct(self) -> float:
@@ -87,14 +117,14 @@ class RiskManager:
             return False, (f"drawdown circuit breaker: {self.drawdown_pct:.1%} "
                            f">= {self.max_drawdown_pct:.1%}")
 
-        if len(self.state.exposure) >= self.max_open_positions and cid not in self.state.exposure:
+        if self.open_position_count >= self.max_open_positions and cid not in self._condition_ids():
             return False, f"max open positions reached ({self.max_open_positions})"
 
         if self.total_exposure + size > self.max_total_exposure_usd:
             return False, (f"total exposure {self.total_exposure:.2f} + {size:.2f} "
                            f"> {self.max_total_exposure_usd:.2f}")
 
-        cur = self.state.exposure.get(cid, 0.0)
+        cur = self.exposure_of(cid)
         if cur + size > self.max_position_usd:
             return False, (f"per-market exposure {cur:.2f} + {size:.2f} "
                            f"> {self.max_position_usd:.2f}")
@@ -107,27 +137,42 @@ class RiskManager:
 
     # ---- 状态更新 ----
     def record_trade(self, trade: Trade) -> None:
-        cid = trade.condition_id
-        self.state.exposure[cid] = self.state.exposure.get(cid, 0.0) + trade.usd_value
-        self.state.open_positions[trade.token_id] = (
-            self.state.open_positions.get(trade.token_id, 0.0) + trade.shares
-        )
-        self.state.last_trade_ts[cid] = time.time()
+        """记录一笔成交（增加持仓与成本）。"""
+        if trade.shares <= 0:
+            return
+        token_id = trade.token_id
+        if not token_id:
+            return
+        self.state.open_positions[token_id] = self.state.open_positions.get(token_id, 0.0) + trade.shares
+        self.state.token_condition[token_id] = trade.condition_id
+        self.state.cost_basis[token_id] = self.state.cost_basis.get(token_id, 0.0) + trade.usd_value
+        self.state.last_trade_ts[trade.condition_id] = time.time()
+
+    def remove_trade(self, trade: Trade) -> None:
+        """回滚一笔成交（套利组部分成交时撤销已成交 leg）。"""
+        token_id = trade.token_id
+        if not token_id or token_id not in self.state.open_positions:
+            return
+        shares = self.state.open_positions[token_id] - trade.shares
+        if shares <= 1e-9:
+            self.state.open_positions.pop(token_id, None)
+            self.state.token_condition.pop(token_id, None)
+            self.state.cost_basis.pop(token_id, None)
+        else:
+            self.state.open_positions[token_id] = shares
+            self.state.cost_basis[token_id] = max(0.0, self.state.cost_basis.get(token_id, 0.0) - trade.usd_value)
 
     def record_pnl(self, realized_usd: float) -> None:
+        """记录已实现盈亏（equity 由 mark_to_market 统一推导）。"""
         self.state.realized_pnl_today += realized_usd
-        self.state.current_equity += realized_usd
-        if self.state.current_equity > self.state.peak_equity:
-            self.state.peak_equity = self.state.current_equity
-        log.info("PnL update: today=%+.2f equity=%.2f drawdown=%.2f%%",
-                 self.state.realized_pnl_today, self.state.current_equity,
-                 self.drawdown_pct * 100)
+        log.info("PnL update: today=%+.2f", self.state.realized_pnl_today)
 
-    def mark_to_market(self, prices: dict[str, float]) -> float:
+    def mark_to_market(self, prices: dict[str, float] | None = None) -> float:
         """按当前价格重估持仓，更新权益与回撤。返回未实现盈亏。"""
+        self.update_prices(prices or {})
         unrealized = 0.0
         for token_id, shares in self.state.open_positions.items():
-            price = prices.get(token_id)
+            price = self.prices.get(token_id)
             if price is None:
                 continue
             unrealized += shares * price

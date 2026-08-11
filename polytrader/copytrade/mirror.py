@@ -144,8 +144,10 @@ def _trade_id(t: dict) -> str:
 
 
 def _is_yes_token(asset: str, markets: list[Market]) -> bool:
-    """判断 token 是否为市场的 YES（第一个 outcome）。无法判定时放行。"""
+    """判断 token 是否为市场的 YES（第一个 outcome）。无法判定时保守拒绝。"""
     for m in markets:
         if m.outcomes and m.outcomes[0].token_id == asset:
             return True
-    return True  # 无市场信息时保守放行（由 slippage 与风控把关）
+    log.warning("mirror: token %s not found in known markets, skipping (unknown token)",
+                asset[:16])
+    return False

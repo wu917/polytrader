@@ -90,7 +90,14 @@ class AIProbabilityStrategy(Strategy):
             # 无显式列顺序时按特征字典的规范顺序
             row = np.asarray([[feats.get(c, 0.0) for c in sorted(feats)]], dtype=float)
         try:
-            model_p = float(self.model.predict_proba(row)[0])
+            raw = self.model.predict_proba(row)
+            # ProbabilityModel 接口返回 (n,)；原生 sklearn 返回 (n,2)
+            p = np.asarray(raw, dtype=float)
+            if p.ndim == 2:
+                model_p = float(p[0, 1]) if p.shape[1] >= 2 else float(p[0, 0])
+            else:
+                model_p = float(p[0])
+            model_p = float(np.clip(model_p, 0.0, 1.0))
         except Exception as exc:  # noqa: BLE001
             log.warning("model predict failed for %s: %s", market.slug, exc)
             return None

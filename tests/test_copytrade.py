@@ -176,6 +176,14 @@ def test_mirror_target_qualification():
     assert targets == []
 
 
+def test_mirror_skips_unknown_token_when_yes_only():
+    """mirror_yes_only 时未知 token 保守拒绝（评审修复）。"""
+    trades = [t("BUY", "unknown-token-xyz", 50, 0.55, 2100000000, wallet="0xpro")]
+    engine = _mirror_engine(FakeDataApiMirror({"0xpro": trades}))
+    m, books = _market_with_book(ask=0.56)
+    assert engine.scan([m], books) == []
+
+
 def test_trade_id_stability():
     a = t("BUY", "tokA", 50, 0.55, 2100000000, wallet="0xpro")
     b = dict(a)

@@ -56,24 +56,28 @@ class ArbitrageStrategy(Strategy):
             return []
 
         group_id = f"arb:{market.condition_id}"
+        # 单 leg 胜率 = 互补 outcome 的隐含概率（1 - ask_other），
+        # 而非 1.0——保证 Kelly 语义正确（组整体胜率才接近 1）
+        p_yes = 1.0 - ask_no.price
+        p_no = 1.0 - ask_yes.price
         signals = [
             Signal(
                 type=SignalType.ARBITRAGE,
                 market=market, outcome=market.outcomes[0],
-                side=Side.BUY, probability=1.0, fair_price=1.0 - ask_no.price,
+                side=Side.BUY, probability=p_yes, fair_price=p_yes,
                 edge=edge, market_price=ask_yes.price,
                 size_usd=self.max_position_usd,  # 风控层再收敛
                 reason=f"binary arb: YES@${ask_yes.price:.3f}+NO@${ask_no.price:.3f}=${cost:.3f}, edge={edge:.3f}",
-                extra={"group_id": group_id, "pair_price": cost},
+                extra={"group_id": group_id, "pair_price": cost, "leg_p": p_yes},
             ),
             Signal(
                 type=SignalType.ARBITRAGE,
                 market=market, outcome=market.outcomes[1],
-                side=Side.BUY, probability=1.0, fair_price=1.0 - ask_yes.price,
+                side=Side.BUY, probability=p_no, fair_price=p_no,
                 edge=edge, market_price=ask_no.price,
                 size_usd=self.max_position_usd,
                 reason=f"binary arb: YES@${ask_yes.price:.3f}+NO@${ask_no.price:.3f}=${cost:.3f}, edge={edge:.3f}",
-                extra={"group_id": group_id, "pair_price": cost},
+                extra={"group_id": group_id, "pair_price": cost, "leg_p": p_no},
             ),
         ]
         log.info("binary arb signal: %s edge=%.3f (YES %.3f + NO %.3f)",
@@ -107,10 +111,12 @@ class ArbitrageStrategy(Strategy):
         signals = []
         for market, ask in asks:
             yes = market.outcomes[0]
+            # 单候选隐含概率 = ask/总和（归一化，总和为 1），Kelly 语义正确
+            p = ask / total if total > 0 else 1.0 / len(asks)
             signals.append(Signal(
                 type=SignalType.ARBITRAGE,
                 market=market, outcome=yes,
-                side=Side.BUY, probability=1.0, fair_price=1.0,
+                side=Side.BUY, probability=p, fair_price=p,
                 edge=edge, market_price=ask,
                 size_usd=self.max_position_usd,
                 reason=f"categorical arb: sum(asks)={total:.3f}, edge={edge:.3f}, {len(asks)} candidates",
