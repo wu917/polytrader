@@ -176,73 +176,116 @@ def cmd_paper(args) -> int:
 
 
 def cmd_backtest(args) -> int:
-    """AI 回测：已解决市场的模型质量评估（区分度/校准）。
+    """可交易回测：时间切分训练/测试 + 模拟交易 + 收益率统计。
 
-    注意：使用历史价格做特征 + 结算结果做标签，评估的是模型区分度，
-    不是真实可交易回测（真实回测需时间切片滚动，见 README 局限说明）。
+    结果保留到 backtest_results/（trades CSV + report JSON）：
+      backtest_results/report_<ts>.json   汇总 + 完整交易单
+      backtest_results/trades_<ts>.csv    逐笔交易单（Excel 友好）
+
+    注意（诚实披露）：
+    - 单次 walk-forward 切分（训练全部早于测试），非滚动回测
+    - 未计滑点/手续费；订单簿深度不可用；入场价用结算前 24h 历史价
+    - 收益率仅供参考，不构成盈利保证
     """
-    from polytrader.ai.features import feature_matrix
+    import csv
+    import json
+    import time as _time
+
+    from polytrader.ai.backtest import run_backtest
     from polytrader.ai.train import extract_label
     from polytrader.data.data_api import DataApiClient
     from polytrader.data.gamma_client import GammaClient
     from polytrader.data.http_client import HttpClient
-    from polytrader.ai.models import get_default_model
 
     cfg = load_config()
     http = HttpClient(proxy=args.proxy or cfg.effective_proxy())
     gamma = GammaClient(http=http)
     data = DataApiClient(http=http)
 
-    print(f"AI backtest | samples={args.samples}")
-    closed: list = []
+    print(f"AI backtest | samples={args.samples} min_edge={args.min_edge} "
+          f"entry_lookback={args.lookback_h}h train_frac={args.train_frac}")
+    from polytrader.ai.backtest import _end_ts
+
+    # 只回测最近 N 个月结算的市场：CLOB /prices-history 保留期有限，
+    # 过旧市场无历史数据。默认 3 个月。
+    import datetime
+
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.since_months * 30)
+    CLOB_EPOCH_DATE = since.strftime("%Y-%m-%d")
+    labeled: list = []
     offset = 0
-    while len(closed) < args.samples:
-        batch = gamma.get_markets(limit=100, offset=offset, active=False, closed=True)
+    while len(labeled) < args.samples and offset < args.samples * 4:
+        batch = gamma.get_markets(limit=100, offset=offset, active=False, closed=True,
+                                  end_date_min=CLOB_EPOCH_DATE)
         if not batch:
             break
-        closed.extend(batch)
+        for m in batch:
+            if extract_label(m) is not None:
+                labeled.append(m)
         offset += 100
-    labeled = [m for m in closed if extract_label(m) is not None]
     labeled = labeled[: args.samples]
-    print(f"closed={len(closed)} labeled={len(labeled)}")
+    print(f"closed_fetched={offset} labeled_recent={len(labeled)} (since {CLOB_EPOCH_DATE})")
 
-    if len(labeled) < 20:
-        print("too few labeled markets")
+    if len(labeled) < 40:
+        print("too few labeled markets (need >= 40 for a meaningful split)")
         return 1
 
+    # 拉成交历史：CLOB /prices-history 对已解决市场不返回数据，
+    # 用 data-api /trades 成交账本构造价格序列（保留完整历史）
     histories = {}
-    for i, m in enumerate(labeled[: args.history_limit]):
+    for i, m in enumerate(labeled):
         try:
-            histories[m.condition_id] = data.price_history(m.condition_id, interval="1h")
+            token_id = m.outcomes[0].token_id if m.outcomes else ""
+            if not token_id:
+                continue
+            histories[m.condition_id] = data.market_trade_history(
+                m.condition_id, token_id, limit=args.trade_limit)
         except Exception:  # noqa: BLE001
             pass
+        if (i + 1) % 50 == 0:
+            print(f"  ... {i + 1}/{len(labeled)} histories")
+    with_hist = sum(1 for h in histories.values() if h)
+    print(f"  markets with trade history: {with_hist}/{len(labeled)}")
+    # 只保留有成交历史的市场（长尾无成交市场无法回测）
+    labeled = [m for m in labeled if histories.get(m.condition_id)]
+    print(f"  labeled with history: {len(labeled)}")
 
-    X, cols = feature_matrix(labeled, histories=histories)
-    y = [extract_label(m) for m in labeled]
-    valid = [(i, yy) for i, yy in enumerate(y) if yy is not None]
-    idx = [i for i, _ in valid]
-    y_arr = [yy for _, yy in valid]
-    Xv = X[idx]
-    print(f"features X={X.shape} labeled_y={len(y_arr)} yes_rate={sum(y_arr) / len(y_arr):.2f}")
+    result = run_backtest(
+        labeled, histories,
+        min_edge=args.min_edge, entry_lookback_h=args.lookback_h,
+        size_usd=args.size_usd, train_frac=args.train_frac,
+    )
+    s = result.to_dict()["summary"]
+    print("\n" + "=" * 60)
+    print("BACKTEST RESULT")
+    print("=" * 60)
+    print(f"  markets        : train={s['n_trained']} test={s['n_test']}")
+    print(f"  trades         : {s['n_trades']}")
+    print(f"  win rate       : {s['win_rate']:.1%}")
+    print(f"  avg edge       : {s['avg_edge']:.3f}")
+    print(f"  total return   : {s['total_return_pct']:+.2f}%  "
+          f"(${s['total_pnl_usd']:+.2f} on ${s['n_trades'] * args.size_usd} notional)")
+    print(f"  max drawdown   : {s['max_drawdown_pct']:.1f}%")
+    print("=" * 60)
 
-    from sklearn.model_selection import cross_val_score
-    import numpy as np
-    model_cls = get_default_model()
-    model_cls.fit(Xv, np.asarray(y_arr))
-    probs = model_cls.predict_proba(Xv)
-    preds = (probs > 0.5).astype(int)
-    acc = float((preds == np.asarray(y_arr)).mean())
-    print(f"in-sample accuracy: {acc:.3f}")
-
-    # 按概率分桶看校准（粗略）
-    import collections
-    buckets = collections.defaultdict(list)
-    for p, yy in zip(probs, y_arr):
-        buckets[round(p * 10) / 10].append(yy)
-    print("bucket  p_avg   n   y_rate")
-    for k in sorted(buckets):
-        vals = buckets[k]
-        print(f"  {k:.1f}   {sum(vals) / len(vals):.3f}  {len(vals):3d}  {sum(vals) / len(vals):.3f}")
+    # ---- 保留输出 ----
+    out_dir = Path("backtest_results")
+    out_dir.mkdir(exist_ok=True)
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+    report_path = out_dir / f"report_{ts}.json"
+    trades_path = out_dir / f"trades_{ts}.csv"
+    report_path.write_text(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    with open(trades_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["market_slug", "condition_id", "side", "entry_time", "entry_price",
+                         "model_p", "edge", "settle_price", "size_usd", "pnl_usd", "pnl_pct"])
+        for t in result.trades:
+            writer.writerow([t.market_slug, t.condition_id, t.side, t.entry_time,
+                             t.entry_price, round(t.model_p, 4), round(t.edge, 4),
+                             t.settle_price, t.size_usd, round(t.pnl_usd, 2),
+                             round(t.pnl_pct, 4)])
+    print(f"\n  saved: {report_path}")
+    print(f"  saved: {trades_path}")
     return 0
 
 
@@ -257,10 +300,16 @@ def main() -> int:
     p.add_argument("--markets", type=int, default=50)
     p.add_argument("--book-limit", type=int, default=10)
 
-    b = sub.add_parser("backtest", help="AI 回测（模型质量评估）")
+    b = sub.add_parser("backtest", help="可交易回测（收益率 + 交易单保留输出）")
     b.add_argument("--proxy", default=None)
-    b.add_argument("--samples", type=int, default=200)
-    b.add_argument("--history-limit", type=int, default=100)
+    b.add_argument("--samples", type=int, default=300)
+    b.add_argument("--history-limit", type=int, default=150)
+    b.add_argument("--trade-limit", type=int, default=500, help="每市场拉取的成交条数（回测价格数据源）")
+    b.add_argument("--since-months", type=int, default=3, help="只回测最近 N 个月结算的市场")
+    b.add_argument("--min-edge", type=float, default=0.03, help="最小期望边际")
+    b.add_argument("--lookback-h", type=float, default=24.0, help="入场取结算前 N 小时价格")
+    b.add_argument("--size-usd", type=float, default=100.0, help="每笔名义金额")
+    b.add_argument("--train-frac", type=float, default=0.7, help="时间切分训练集比例")
 
     args = ap.parse_args()
     if args.cmd == "offline" or args.cmd is None:

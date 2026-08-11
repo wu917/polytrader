@@ -80,11 +80,17 @@ def feature_matrix(
     markets: list[Market],
     books: dict[str, OrderBook] | None = None,
     histories: dict[str, list[dict]] | None = None,
+    categories: list[str] | None = None,
 ) -> tuple[np.ndarray, list[str]]:
-    """批量特征提取 → (X, columns)。books/histories 按 token_id / condition_id 索引。"""
+    """批量特征提取 → (X, columns)。books/histories 按 token_id / condition_id 索引。
+
+    categories：显式传入类别全集（保证训练/预测列一致）；
+    缺省时从 markets 推导。
+    """
     books = books or {}
     histories = histories or {}
-    categories = sorted({_cat_key(m.category) for m in markets})
+    if categories is None:
+        categories = sorted({_cat_key(m.category) for m in markets})
     cols = FEATURE_COLS + [f"cat_{c}" for c in categories]
     rows = []
     for m in markets:
@@ -140,18 +146,32 @@ def _volatility(pts: np.ndarray, window_s: float) -> float:
 
 
 def _parse_ts(iso_or_num: str) -> float | None:
+    """解析时间戳：13 位毫秒数字 / 10 位秒数字 / ISO8601（含 Z）。"""
+    from datetime import datetime
+
     if not iso_or_num:
         return None
-    s = str(iso_or_num)
+    s = str(iso_or_num).strip()
+    if not s:
+        return None
+    # 纯数字：毫秒或秒
+    digits_only = s.lstrip("-").isdigit()
+    if digits_only:
+        try:
+            v = float(s)
+            return v / 1000.0 if v > 1e12 else v
+        except ValueError:
+            return None
+    # ISO8601（兼容 Z 后缀）
     try:
-        return float(s)
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
     except ValueError:
         pass
-    # ISO8601 兼容解析（简化：取 13 位毫秒时间戳数字）
-    digits = re.sub(r"\D", "", s)
-    if len(digits) >= 13:
+    # 兜底：提取数字（13 位毫秒时间戳）
+    m = re.sub(r"\D", "", s)
+    if len(m) >= 13:
         try:
-            return float(digits[:13]) / 1000.0
+            return float(m[:13]) / 1000.0
         except ValueError:
             return None
     return None

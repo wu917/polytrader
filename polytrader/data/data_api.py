@@ -16,7 +16,8 @@ from polytrader.logging_setup import get_logger
 log = get_logger("data.dataapi")
 
 # CLOB /prices-history 单次请求允许的最大时间窗口（秒）
-MAX_HISTORY_WINDOW = 7 * 24 * 3600  # 7 天
+# 实测：7 天 OK、30 天 400 "interval too long" → 取 7 天分块
+MAX_HISTORY_WINDOW = 7 * 24 * 3600
 
 
 class DataApiClient:
@@ -28,14 +29,16 @@ class DataApiClient:
         self.http = http or HttpClient()
 
     # ---- 历史价格（CLOB /prices-history）----
-    def price_history(self, condition_id: str, interval: str = "1h",
+    def price_history(self, token_id: str, interval: str = "1h",
                       start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
-        """历史价格序列，返回 [{"t": 秒, "p": 价格}]。
+        """某 outcome token 的历史价格序列，返回 [{"t": 秒, "p": 价格}]。
 
+        market 参数需要 token_id（clobTokenId）而非 condition_id——
+        实测 condition_id 恒返回空。
         自动按 7 天窗口分块请求。interval 为 fidelity（秒）：60/300/900/3600/86400 等。
         """
-        end = end_ts or int(time.time())
-        start = start_ts or (end - 7 * 24 * 3600)
+        end = int(end_ts) if end_ts else int(time.time())
+        start = int(start_ts) if start_ts else (end - 7 * 24 * 3600)
         fidelity = _interval_to_fidelity(interval)
 
         history: list[dict] = []
@@ -43,7 +46,7 @@ class DataApiClient:
         chunks = 0
         while cursor < end and chunks < 64:  # 上限防 API 异常导致空转
             chunk_end = min(cursor + MAX_HISTORY_WINDOW, end)
-            params = {"market": condition_id, "startTs": cursor, "endTs": chunk_end}
+            params = {"market": token_id, "startTs": cursor, "endTs": chunk_end}
             if fidelity:
                 params["fidelity"] = fidelity
             data = self.http.get_json(f"{self.clob_api_base}/prices-history", params=params)
@@ -55,9 +58,9 @@ class DataApiClient:
                 break  # 空窗口提前结束
         return history
 
-    def price_now(self, condition_id: str) -> float | None:
+    def price_now(self, token_id: str) -> float | None:
         """取最近一笔历史价格作为当前价（容错实现）。"""
-        rows = self.price_history(condition_id, interval="1h")
+        rows = self.price_history(token_id, interval="1h")
         if not rows:
             return None
         last = rows[-1]
@@ -81,6 +84,36 @@ class DataApiClient:
         data = self.http.get_json(f"{self.api_base}/trades",
                                   params={"user": address, "limit": min(limit, 500)})
         return data if isinstance(data, list) else []
+
+    def trades_to_history(self, trades: list[dict], token_id: str,
+                          bucket_s: int = 3600) -> list[dict]:
+        """把成交记录聚合成价格序列 [{t: 秒, p: 价格}]。
+
+        CLOB /prices-history 对已解决市场不返回历史，回测需用成交账本
+        （/trades 保留完整历史）。按 bucket_s 时间桶取桶内最后成交价。
+        """
+        rows = []
+        for t in trades:
+            if str(t.get("asset", "")) != token_id:
+                continue
+            try:
+                rows.append((float(t["timestamp"]), float(t["price"])))
+            except (TypeError, ValueError, KeyError):
+                continue
+        rows.sort()
+        out: list[dict] = []
+        for t, p in rows:
+            if out and t - out[-1]["t"] < bucket_s:
+                out[-1] = {"t": t, "p": p}  # 桶内更新为最新价
+            else:
+                out.append({"t": t, "p": p})
+        return out
+
+    def market_trade_history(self, condition_id: str, token_id: str,
+                             limit: int = 500) -> list[dict]:
+        """市场的成交价格序列（回测数据源）。"""
+        trades = self.get_trades(condition_id, limit=limit)
+        return self.trades_to_history(trades, token_id)
 
 
 def _interval_to_fidelity(interval: str) -> int | None:

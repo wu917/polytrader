@@ -73,6 +73,8 @@ class GammaClient:
         closed: bool | None = None,
         category: str | None = None,
         liquidity_min: float | None = None,
+        end_date_min: str | None = None,
+        end_date_max: str | None = None,
     ) -> list[Market]:
         """发现市场列表，返回解析后的 Market 对象。"""
         params: dict[str, Any] = {
@@ -86,6 +88,10 @@ class GammaClient:
             params["category"] = category
         if liquidity_min:
             params["liquidity_num_min"] = liquidity_min
+        if end_date_min:
+            params["end_date_min"] = end_date_min
+        if end_date_max:
+            params["end_date_max"] = end_date_max
         data = self.http.get_json(f"{self.api_base}/markets", params=params)
         items = data if isinstance(data, list) else data.get("data", [])
         return [self._market_from_json(m) for m in items if isinstance(m, dict)]

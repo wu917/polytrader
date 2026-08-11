@@ -53,11 +53,22 @@ def main() -> int:
         print("[train] too few labeled markets, abort")
         return 1
 
-    # 拉历史价格（限制数量，避免过慢）
+    # 拉历史价格（限制数量，避免过慢；已解决市场需按结算时间回看，
+    # CLOB /prices-history 默认只返回最近 7 天）
+    from polytrader.ai.backtest import _end_ts
+
     histories = {}
     for i, m in enumerate(labeled[:200]):
         try:
-            histories[m.condition_id] = data.price_history(m.condition_id, interval="1h")
+            end_ts = _end_ts(m)
+            if end_ts == float("inf"):
+                end_ts = None
+            start_ts = (end_ts - 30 * 86400) if end_ts else None
+            token_id = m.outcomes[0].token_id if m.outcomes else ""
+            if not token_id:
+                continue
+            histories[m.condition_id] = data.price_history(
+                token_id, interval="1h", start_ts=start_ts, end_ts=end_ts)
         except Exception as exc:  # noqa: BLE001
             print(f"  [warn] price-history failed for {m.slug}: {exc}")
         if (i + 1) % 50 == 0:

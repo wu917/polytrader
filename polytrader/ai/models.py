@@ -63,7 +63,15 @@ class HistGBProbabilityModel(ProbabilityModel):
         self.model = HistGradientBoostingClassifier(**params)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HistGBProbabilityModel":
-        self.model.fit(np.asarray(X, dtype=float), np.asarray(y, dtype=int))
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=int)
+        # 小样本自适应：min_samples_leaf 过大（如默认 20）会让 <40 样本
+        # 的数据集完全无法分裂（每叶子需 >=20），导致模型退化为均值预测。
+        n = len(y)
+        leaf = max(2, min(int(self.model.min_samples_leaf), n // 10))
+        if leaf != self.model.min_samples_leaf:
+            self.model.set_params(min_samples_leaf=leaf)
+        self.model.fit(X, y)
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -93,7 +101,14 @@ class LGBMProbabilityModel(ProbabilityModel):
         self.model = _lgb.LGBMClassifier(**params)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "LGBMProbabilityModel":
-        self.model.fit(np.asarray(X, dtype=float), np.asarray(y, dtype=int))
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=int)
+        # 小样本自适应（同 HistGB）：min_child_samples 默认 20
+        n = len(y)
+        leaf = max(2, min(int(self.model.min_child_samples), n // 10))
+        if leaf != self.model.min_child_samples:
+            self.model.set_params(min_child_samples=leaf)
+        self.model.fit(X, y)
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
