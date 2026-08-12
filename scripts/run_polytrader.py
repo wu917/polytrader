@@ -449,6 +449,8 @@ def cmd_smart_money(args) -> int:
         min_trades=args.min_trades, min_profit_usd=args.min_profit,
         train_frac=args.train_frac, size_usd=args.size_usd,
         follow_window_h=args.follow_h,
+        min_market_volume_usd=args.min_volume,
+        smart_money_confirmation=not args.no_confirm,
     )
     s = result.to_dict()["summary"]
     print("\n" + "=" * 60)
@@ -521,6 +523,10 @@ def main() -> int:
     sm.add_argument("--min-profit", type=float, default=50.0, help="钱包最低已实现盈利")
     sm.add_argument("--lookback-days", type=int, default=90)
     sm.add_argument("--follow-h", type=float, default=24.0, help="跟随窗口（结算前 N 小时）")
+    sm.add_argument("--min-volume", type=float, default=1000.0,
+                    help="市场交易额门槛（$，成交名义额 Σ size×price）")
+    sm.add_argument("--no-confirm", action="store_true",
+                    help="关闭聪明钱确认（不需要 top 钱包在该市场有成交）")
     sm.add_argument("--size-usd", type=float, default=100.0)
     sm.add_argument("--train-frac", type=float, default=0.7)
 

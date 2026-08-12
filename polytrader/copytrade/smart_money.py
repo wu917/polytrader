@@ -86,6 +86,8 @@ def run_smart_money_backtest(
     train_frac: float = 0.7,
     size_usd: float = 100.0,
     follow_window_h: float = 24.0,
+    min_market_volume_usd: float = 1000.0,
+    smart_money_confirmation: bool = True,
 ) -> SmartMoneyResult:
     """执行聪明钱回测。trades_by_market: condition_id -> /trades 行。"""
     labeled = [m for m in markets if _is_labeled(m)]
@@ -118,15 +120,34 @@ def run_smart_money_backtest(
         if t_m == 0.0:
             continue
         m_trades = trades_by_market.get(m.condition_id, [])
-        # 跟随窗口基于市场最后成交时间 t_last（多数市场在结算前很早
-        # 就停止交易——结果提前确定；基于 t_m 的窗口内无成交可跟）
+        if not m_trades:
+            continue
+        # 盘口条件 1：市场交易额 >= min_market_volume_usd
+        # （用成交记录的名义额 Σ(size×price) 作为可交易的流动性代理）
+        m_volume = sum((float(t.get("size", 0)) * float(t.get("price", 0))
+                        for t in m_trades
+                        if t.get("size") is not None and t.get("price") is not None),
+                       start=0.0)
+        if m_volume < min_market_volume_usd:
+            continue
+        # 市场最后成交时间（跟随窗口上界；多数市场结算前早已停止交易）
         t_last = max((float(t["timestamp"]) for t in m_trades
-                      if t.get("timestamp")), default=0.0)
+                      if t.get("timestamp") is not None), default=0.0)
         if t_last <= 0:
             continue
-        follow_from = t_last - follow_window_h * 3600.0
-        # 1) 用 T_m 之前全部成交评估钱包（严格无泄漏）
-        past = [t for t in timeline if t[0] < follow_from]
+        # 跟随窗口：follow_window_h > 0 为"结算前 N 小时"（严格）；
+        # <= 0 为全生命周期（跟 top 钱包最后一笔 BUY——盈利钱包往往
+        # 在市场早期交易、临近结算已离场，24h 窗口内无 BUY）
+        if follow_window_h > 0:
+            follow_from = t_last - follow_window_h * 3600.0
+        else:
+            follow_from = 0.0
+        # 钱包评估窗口：严格模式用跟随窗口前（避免用窗口内成交评估）；
+        # 生命周期模式用该市场最后成交前（跟随的是最后一笔 BUY，
+        # 更早的成交用于评估无泄漏）
+        eval_cutoff = follow_from if follow_window_h > 0 else t_last
+        # 1) 评估钱包（严格无泄漏：只用 eval_cutoff 之前的成交）
+        past = [t for t in timeline if t[0] < eval_cutoff]
         by_wallet: dict[str, list[dict]] = {}
         for ts, wallet, asset, price, side, size, cid in past:
             if not wallet:
@@ -143,9 +164,22 @@ def run_smart_money_backtest(
         top = [w for _, w in ranked[:top_k]]
         if not top:
             continue
+        # 盘口条件 2：聪明钱确认——top 钱包须在该市场"持续参与"
+        # （跟随窗口之前已有该钱包的成交）。全生命周期模式下
+        # 跟随的 BUY 本身即是该钱包的市场活动，无需额外确认。
+        if smart_money_confirmation and follow_window_h > 0:
+            early_wallets = {
+                str(t.get("proxyWallet", "")) for t in m_trades
+                if t.get("timestamp") is not None
+                and float(t["timestamp"]) < follow_from
+            }
+            top = [w for w in top if w in early_wallets]
+            if not top:
+                continue
 
-        # 2) 跟随：m 在最后成交窗口内 top 钱包的 BUY
-        followed = 0
+        # 2) 跟随：top 钱包的 BUY（每钱包每市场只跟最后一笔——
+        #    生命周期模式下多笔 BUY 以最后成交价为准）
+        last_buys: dict[str, dict] = {}
         for t in m_trades:
             try:
                 ts = float(t["timestamp"])
@@ -157,10 +191,18 @@ def run_smart_money_backtest(
             wallet = str(t.get("proxyWallet", ""))
             if wallet not in top or str(t.get("side", "")).upper() != "BUY":
                 continue
-            # 每钱包每市场只跟一次
+            last_buys[wallet] = t  # 覆盖取最后
+
+        followed = 0
+        for wallet, t in last_buys.items():
             if (m.condition_id, wallet) in wallets_used:
                 continue
             wallets_used.add((m.condition_id, wallet))
+            try:
+                ts = float(t["timestamp"])
+                price = float(t["price"])
+            except (TypeError, ValueError, KeyError):
+                continue
             settle = 1.0 if _label_of(m) == 1 else 0.0
             pnl = size_usd * (settle - price)
             equity += pnl
@@ -188,6 +230,8 @@ def run_smart_money_backtest(
         meta={"lookback_days": lookback_days, "top_k": top_k,
               "min_trades": min_trades, "min_profit_usd": min_profit_usd,
               "follow_window_h": follow_window_h, "size_usd": size_usd,
+              "min_market_volume_usd": min_market_volume_usd,
+              "smart_money_confirmation": smart_money_confirmation,
               "note": "wallet ranking uses trades strictly before the follow window (no look-ahead); "
                       "entry at target wallet's own fill price; no slippage/fees"},
     )

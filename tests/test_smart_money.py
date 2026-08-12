@@ -16,9 +16,9 @@ def make_market(slug, end_ts, label_yes) -> Market:
     )
 
 
-def trade(wallet, side, asset, price, ts, cid="0xm"):
+def trade(wallet, side, asset, price, ts, cid="0xm", size=100.0):
     return {"proxyWallet": wallet, "side": side, "asset": asset,
-            "price": price, "size": 100.0, "timestamp": ts}
+            "price": price, "size": size, "timestamp": ts}
 
 
 def _synthetic():
@@ -38,12 +38,14 @@ def _synthetic():
         trade("0xB", "BUY", "m0-yes", 0.80, t0 + 3600, "0xm0"),
         trade("0xB", "SELL", "m0-yes", 0.30, t0 + 7200, "0xm0"),   # -50
     ]
-    # 测试期：m5/m6（label YES），A 在临近结算时 BUY YES（低价）
+    # 测试期：m5/m6（label YES），A 持续参与（early 成交）并在临近结算 BUY
+    # size=5000 → 每市场名义额 >= 1000 门槛
     for i, cid in enumerate(["0xm5", "0xm6"]):
         end_ts = 1_700_000_000.0 + (5 + i) * 7 * 86400.0
         trades[cid] = [
-            trade("0xA", "BUY", f"m{5 + i}-yes", 0.40, end_ts - 7200, cid),   # 最后成交 2h 前
-            trade("0xOther", "BUY", f"m{5 + i}-yes", 0.45, end_ts - 1800, cid),  # 最后成交
+            trade("0xA", "SELL", f"m{5 + i}-yes", 0.30, end_ts - 100 * 3600, cid, size=5000),
+            trade("0xA", "BUY", f"m{5 + i}-yes", 0.40, end_ts - 7200, cid, size=5000),
+            trade("0xOther", "BUY", f"m{5 + i}-yes", 0.45, end_ts - 1800, cid, size=5000),
         ]
     return markets, trades
 
@@ -105,3 +107,74 @@ def test_smart_money_to_dict_serializable():
     d = result.to_dict()
     assert d["summary"]["n_trades"] == len(d["trades"])
     assert "meta" in d
+
+
+def test_smart_money_volume_threshold():
+    """市场交易额低于门槛时跳过（盘口条件 1）。"""
+    markets, trades = _synthetic()
+    # 门槛 10000 > 市场名义额 ~4250 → 0 交易
+    result = run_smart_money_backtest(
+        markets, trades, top_k=2, min_trades=2, min_profit_usd=10.0,
+        train_frac=0.5, size_usd=100.0, follow_window_h=48,
+        min_market_volume_usd=10000.0,
+    )
+    assert result.n_trades == 0
+    # 门槛 1000 < 4250 → 正常跟随
+    result2 = run_smart_money_backtest(
+        markets, trades, top_k=2, min_trades=2, min_profit_usd=10.0,
+        train_frac=0.5, size_usd=100.0, follow_window_h=48,
+        min_market_volume_usd=1000.0,
+    )
+    assert result2.n_trades == 2
+
+
+def test_smart_money_confirmation_filter():
+    """聪明钱确认：top 钱包须在市场早期已有成交（持续参与）才跟随。
+
+    m6：窗口外只有 Other 成交（无 A）、窗口内 A 有 BUY →
+    confirm=True 时 A 非"持续参与者"→ m6 跳过（只跟 m5）；
+    confirm=False 时跟随 A 的 BUY（2 笔）。
+    """
+    markets, trades = _synthetic()
+    end6 = 1_700_000_000.0 + 6 * 7 * 86400.0
+    trades["0xm6"] = [
+        trade("0xOther", "SELL", "m6-yes", 0.50, end6 - 100 * 3600, "0xm6", size=5000),
+        trade("0xA", "BUY", "m6-yes", 0.40, end6 - 7200, "0xm6", size=5000),
+    ]
+    result = run_smart_money_backtest(
+        markets, trades, top_k=2, min_trades=2, min_profit_usd=10.0,
+        train_frac=0.5, size_usd=100.0, follow_window_h=48,
+        smart_money_confirmation=True,
+    )
+    assert result.n_trades == 1
+    assert result.trades[0].market_slug == "m5"
+    # 关闭确认 → 跟随 m6 的 A BUY → 2 笔
+    result2 = run_smart_money_backtest(
+        markets, trades, top_k=2, min_trades=2, min_profit_usd=10.0,
+        train_frac=0.5, size_usd=100.0, follow_window_h=48,
+        smart_money_confirmation=False,
+    )
+    assert result2.n_trades == 2
+
+
+def test_smart_money_lifetime_follow():
+    """生命周期模式（follow_window_h<=0）：跟随 top 钱包最后一笔 BUY。
+
+    m6 中 A 有两笔 BUY（早期 0.30 + 晚期 0.40）→ 只跟最后一笔（0.40）。
+    """
+    markets, trades = _synthetic()
+    end6 = 1_700_000_000.0 + 6 * 7 * 86400.0
+    trades["0xm6"] = [
+        trade("0xA", "SELL", "m6-yes", 0.30, end6 - 100 * 3600, "0xm6", size=5000),
+        trade("0xA", "BUY", "m6-yes", 0.30, end6 - 96 * 3600, "0xm6", size=5000),
+        trade("0xA", "BUY", "m6-yes", 0.40, end6 - 7200, "0xm6", size=5000),
+    ]
+    result = run_smart_money_backtest(
+        markets, trades, top_k=2, min_trades=2, min_profit_usd=10.0,
+        train_frac=0.5, size_usd=100.0, follow_window_h=0,   # 全生命周期
+    )
+    # m5（1 笔）+ m6（1 笔，取最后 BUY 0.40）
+    assert result.n_trades == 2
+    m6_trades = [t for t in result.trades if t.market_slug == "m6"]
+    assert len(m6_trades) == 1
+    assert m6_trades[0].entry_price == 0.40
