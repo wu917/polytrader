@@ -187,6 +187,29 @@ def test_parse_response_extracts_reason():
     assert _parse_probability('{"probability": 0.3, "reason": "r"}') == 0.3
 
 
+def test_http_client_audit_logs_requests(tmp_path):
+    """HttpClient 审计：每次请求写 JSONL（URL/状态/耗时/响应摘要）。"""
+    from polytrader.data.http_client import HttpClient
+
+    audit_file = tmp_path / "audit.jsonl"
+    http = HttpClient(proxy=None, timeout=5, audit_path=str(audit_file))
+    try:
+        # 用本地 mock：直接验证 _audit 写入路径
+        http._audit({"event": "http_request", "method": "GET",
+                     "url": "https://example.com/x", "status": 200,
+                     "ms": 12, "resp_preview": "{}"})
+        http._audit({"event": "http_failed", "method": "GET",
+                     "url": "https://example.com/x", "error": "boom"})
+    finally:
+        http.close()
+    lines = audit_file.read_text().strip().splitlines()
+    assert len(lines) == 2
+    import json as _json
+    first = _json.loads(lines[0])
+    assert first["event"] == "http_request" and first["status"] == 200
+    assert _json.loads(lines[1])["event"] == "http_failed"
+
+
 def test_llm_scorer_rejects_non_https_base_url():
     """安全：LLM base_url 必须 https，防止 key 明文传输。"""
     with pytest.raises(ValueError):

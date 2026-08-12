@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from polytrader.data.http_client import HttpClient
@@ -27,10 +28,11 @@ class LLMScorer:
 
     def __init__(self, api_key: str = "", base_url: str = "https://api.openai.com/v1",
                  model: str = "gpt-4o-mini", http: HttpClient | None = None,
-                 timeout: int = 30, use_proxy: bool = False):
+                 timeout: int = 30, use_proxy: bool = False, audit_path: str | None = None):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.audit_path = audit_path
         # 安全：LLM API key 只应发给目标 API 服务商。默认不走代理
         # （代理可能为第三方，能截获 Authorization header）。
         if not self.base_url.startswith("https://"):
@@ -51,6 +53,7 @@ class LLMScorer:
         if not self.enabled:
             return None, None
         user = f"Market: {question}\nCategory: {market_category}\nDetails: {(description or '')[:1500]}"
+        t0 = time.time()
         for attempt in range(2):  # 推理模型偶发超时/限流，重试一次
             try:
                 resp = self.http.post(
@@ -67,14 +70,41 @@ class LLMScorer:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 )
                 resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"]
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
                 parsed = _parse_response(content)
+                usage = data.get("usage") or {}
+                self._audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                             "event": "llm_call",
+                             "model": self.model, "attempt": attempt + 1,
+                             "question": question[:200],
+                             "prompt_preview": (description or "")[:300],
+                             "content_preview": content[:300],
+                             "p": parsed[0], "reason": parsed[1],
+                             "ms": int((time.time() - t0) * 1000),
+                             "usage": usage})
                 if parsed[0] is not None:
                     return parsed
                 log.warning("LLM content unparsable (attempt %d): %.100r", attempt + 1, content)
             except Exception as exc:  # noqa: BLE001
                 log.warning("LLM score failed (attempt %d): %s", attempt + 1, exc)
+                self._audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                             "event": "llm_failed", "model": self.model,
+                             "attempt": attempt + 1, "question": question[:200],
+                             "error": str(exc)[:300]})
         return None, None
+
+    def _audit(self, rec: dict):
+        """LLM 调用审计（JSONL）。"""
+        if not self.audit_path:
+            return
+        try:
+            from pathlib import Path
+            Path(self.audit_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(self.audit_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001 审计失败不影响业务
+            pass
 
     def score_many(self, questions: list[tuple[str, str, str]],
                    max_parallel: int = 5) -> list[float | None]:

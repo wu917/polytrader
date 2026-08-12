@@ -23,6 +23,7 @@ def main() -> int:
     ap.add_argument("--wait", type=int, default=330)
     ap.add_argument("--size", type=float, default=1.0,
                     help="每笔固定仓位 USD（透传 simulate，默认 $1）")
+    ap.add_argument("--audit-dir", type=str, default="backtest_results")
     args = ap.parse_args()
 
     generated: list[Path] = []
@@ -32,7 +33,7 @@ def main() -> int:
         proc = subprocess.run(
             [sys.executable, "scripts/simulate_llm_updown.py",
              "--wait", str(args.wait), "--min-edge", str(args.min_edge),
-             "--size", str(args.size)],
+             "--size", str(args.size), "--audit-dir", args.audit_dir],
             cwd=ROOT, capture_output=True, text=True, timeout=args.wait + 240,
         )
         for line in proc.stdout.splitlines():

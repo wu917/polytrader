@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,6 +25,17 @@ from polytrader.strategies.llm_updown import LLMUpdownStrategy
 
 COINS = ["btc", "eth", "sol", "xrp", "doge", "hype", "bnb"]
 SIZE_USD = 1.0  # 每笔固定仓位（--size 可覆盖）
+
+
+def audit(rec: dict, path: str | None):
+    """写审计 JSONL（与 HTTP/LLM 审计同文件）。"""
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def fetch_windows(http, coin_map):
@@ -97,17 +109,22 @@ def main() -> int:
     ap.add_argument("--loop", type=int, default=1, help="连续轮数（每 5m 窗口一轮）")
     ap.add_argument("--size", type=float, default=SIZE_USD,
                     help="每笔固定仓位 USD（默认 $1）")
+    ap.add_argument("--audit-dir", type=str, default="backtest_results",
+                    help="审计 JSONL 输出目录")
     args = ap.parse_args()
     size_usd = args.size
+    audit_path = str(Path(args.audit_dir) /
+                     f"audit_llm_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
     coins = [c for c in args.coins.split(",") if c]
     coin_map = {c: c for c in coins}
 
-    http = HttpClient(proxy=args.proxy, timeout=15)
+    http = HttpClient(proxy=args.proxy, timeout=15, audit_path=audit_path)
     clob = ClobClient(http=http)
     from polytrader.config import load_config
     cfg = load_config()
     scorer = LLMScorer(
-        api_key=cfg.llm_api_key, base_url=cfg.llm_base_url, model=cfg.llm_model)
+        api_key=cfg.llm_api_key, base_url=cfg.llm_base_url, model=cfg.llm_model,
+        audit_path=audit_path)
     if not scorer.enabled:
         print("LLM not configured (LLM_API_KEY missing)")
         return 1
@@ -131,7 +148,9 @@ def main() -> int:
     print(f"signals: {len(signals)}")
     trades = []
     for s in signals:
-        trades.append({"slug": s.market.slug, "condition_id": s.market.condition_id,
+        trade_id = str(uuid.uuid4())[:8]
+        trades.append({"trade_id": trade_id,
+                       "slug": s.market.slug, "condition_id": s.market.condition_id,
                        "coin": s.market.slug.split("-")[0],
                        "window": "5m" if "-5m-" in s.market.slug else "15m",
                        "side": s.extra.get("side"), "llm_p": round(s.extra.get("llm_p", 0), 4),
@@ -140,6 +159,14 @@ def main() -> int:
                        "reason": s.reason,
                        "llm_reason": s.extra.get("llm_reason"),
                        "book": books.get(s.market.condition_id)})
+        audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+               "event": "trade_open", "trade_id": trade_id,
+               "slug": trades[-1]["slug"], "coin": trades[-1]["coin"],
+               "window": trades[-1]["window"], "side": trades[-1]["side"],
+               "llm_p": trades[-1]["llm_p"], "ref": trades[-1]["ref"],
+               "edge": trades[-1]["edge"], "size_usd": size_usd,
+               "entry_price": trades[-1]["entry_price"],
+               "llm_reason": trades[-1]["llm_reason"]}, audit_path)
         print(f"  {trades[-1]['slug']:34s} {trades[-1]['side']:3s} "
               f"llm_p={trades[-1]['llm_p']:.3f} ref={trades[-1]['ref']:.3f} "
               f"edge={trades[-1]['edge']:+.3f} book={trades[-1]['book']}")
@@ -163,6 +190,12 @@ def main() -> int:
                     t["settle_yes"] = settle
                     t["pnl"] = round((size_usd / t["entry_price"]) * (1.0 if win else 0.0)
                                      - size_usd, 2)
+                    audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                           "event": "trade_settled", "trade_id": t.get("trade_id"),
+                           "slug": slug, "side": t["side"],
+                           "settle_yes": settle, "win": win,
+                           "entry_price": t["entry_price"],
+                           "size_usd": size_usd, "pnl": t["pnl"]}, audit_path)
                     print(f"  settled {t['slug']}: {t['side']} win={win} "
                           f"pnl=${t['pnl']:+.2f}")
         for cid, t in remaining.items():
