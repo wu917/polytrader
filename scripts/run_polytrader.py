@@ -489,6 +489,90 @@ def cmd_smart_money(args) -> int:
     return 0
 
 
+def cmd_convergence(args) -> int:
+    """收敛/确定性折价策略回测：最后成交价高度确定侧买入。"""
+    import csv
+    import json
+    import time as _time
+
+    from polytrader.ai.convergence import run_convergence_backtest
+    from polytrader.data.data_api import DataApiClient
+    from polytrader.data.gamma_client import GammaClient
+    from polytrader.data.http_client import HttpClient
+
+    cfg = load_config()
+    http = HttpClient(proxy=args.proxy or cfg.effective_proxy())
+    gamma = GammaClient(http=http)
+    data = DataApiClient(http=http)
+
+    import datetime
+    since = (datetime.datetime.now(datetime.timezone.utc)
+             - datetime.timedelta(days=args.since_days or args.since_months * 30)).strftime("%Y-%m-%d")
+    print(f"Convergence backtest | since={since} threshold={args.threshold}")
+
+    labeled: list = []
+    offset = 0
+    while len(labeled) < args.samples and offset < args.samples * 4:
+        batch = gamma.get_markets(limit=100, offset=offset, active=False, closed=True,
+                                  end_date_min=since)
+        if not batch:
+            break
+        for m in batch:
+            try:
+                prices = [float(o.price) for o in m.outcomes]
+                if len(prices) == 2 and any(p >= 0.999 for p in prices):
+                    labeled.append(m)
+            except (TypeError, ValueError):
+                pass
+        offset += 100
+    labeled = labeled[: args.samples]
+    print(f"labeled={len(labeled)}")
+
+    trades_by_market = {}
+    for i, m in enumerate(labeled):
+        try:
+            trades_by_market[m.condition_id] = data.get_trades(m.condition_id,
+                                                               limit=args.trade_limit)
+        except Exception:  # noqa: BLE001
+            pass
+        if (i + 1) % 50 == 0:
+            print(f"  ... {i + 1}/{len(labeled)} trades")
+    with_trades = sum(1 for v in trades_by_market.values() if v)
+    labeled = [m for m in labeled if trades_by_market.get(m.condition_id)]
+    print(f"  with trades: {with_trades}/{len(labeled)}")
+
+    result = run_convergence_backtest(labeled, trades_by_market,
+                                      threshold=args.threshold, size_usd=args.size_usd)
+    s = result.to_dict()["summary"]
+    print("\n" + "=" * 60)
+    print("CONVERGENCE BACKTEST RESULT")
+    print("=" * 60)
+    print(f"  markets        : {s['n_markets']} (with trades)")
+    print(f"  trades         : {s['n_trades']}")
+    print(f"  win rate       : {s['win_rate']:.1%}")
+    print(f"  avg entry price: {s['avg_entry_price']:.3f}")
+    print(f"  total return   : {s['total_return_pct']:+.2f}%  (${s['total_pnl_usd']:+.2f})")
+    print("=" * 60)
+
+    out_dir = Path("backtest_results")
+    out_dir.mkdir(exist_ok=True)
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+    report_path = out_dir / f"convergence_report_{ts}.json"
+    trades_path = out_dir / f"convergence_trades_{ts}.csv"
+    report_path.write_text(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    with open(trades_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["market_slug", "condition_id", "side", "last_trade_time",
+                         "entry_price", "settle_price", "size_usd", "pnl_usd", "pnl_pct"])
+        for t in result.trades:
+            writer.writerow([t.market_slug, t.condition_id, t.side, t.last_trade_time,
+                             t.entry_price, t.settle_price, t.size_usd,
+                             round(t.pnl_usd, 2), round(t.pnl_pct, 4)])
+    print(f"\n  saved: {report_path}")
+    print(f"  saved: {trades_path}")
+    return 0
+
+
 def main() -> int:
     setup_logging()
     ap = argparse.ArgumentParser(description="PolyTrader")
@@ -538,6 +622,16 @@ def main() -> int:
     sm.add_argument("--size-usd", type=float, default=100.0)
     sm.add_argument("--train-frac", type=float, default=0.7)
 
+    cv = sub.add_parser("convergence", help="收敛/确定性折价策略回测（尾段确定侧买入）")
+    cv.add_argument("--proxy", default=None)
+    cv.add_argument("--samples", type=int, default=400)
+    cv.add_argument("--since-months", type=int, default=3)
+    cv.add_argument("--since-days", type=int, default=0)
+    cv.add_argument("--trade-limit", type=int, default=500)
+    cv.add_argument("--threshold", type=float, default=0.90,
+                    help="确定性阈值：最后成交价 ≥ 阈值或 ≤ 1-阈值才入场")
+    cv.add_argument("--size-usd", type=float, default=100.0)
+
     args = ap.parse_args()
     if args.cmd == "offline" or args.cmd is None:
         return cmd_offline()
@@ -549,6 +643,8 @@ def main() -> int:
         return cmd_llm_scan(args)
     if args.cmd == "smart":
         return cmd_smart_money(args)
+    if args.cmd == "convergence":
+        return cmd_convergence(args)
     return 1
 
 

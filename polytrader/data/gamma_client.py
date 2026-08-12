@@ -51,11 +51,14 @@ class GammaClient:
                 ))
         liquidity = _safe_float(m.get("liquidity"))
         volume = _safe_float(m.get("volume24hr")) or _safe_float(m.get("volume"))
+        # category 在 Gamma 里位于 event 级（events[0].category），
+        # market 自身无 category 字段（此前解析恒为空导致特征失效）
+        category = str(m.get("category") or "") or _event_category(m)
         return Market(
             condition_id=str(m.get("conditionId") or m.get("condition_id") or ""),
             question=str(m.get("question", "")),
             slug=str(m.get("slug", "")),
-            category=str(m.get("category", "")),
+            category=category,
             description=str(m.get("description", ""))[:2000],
             end_date=str(m.get("endDate", "")),
             liquidity=liquidity,
@@ -130,6 +133,14 @@ class GammaClient:
                 break
             yield from batch_markets
             offset += batch
+
+
+def _event_category(m: dict) -> str:
+    """从 market JSON 的 events[0].category 提取分类（Gamma 的 category 在 event 级）。"""
+    events = m.get("events") or []
+    if events and isinstance(events[0], dict):
+        return str(events[0].get("category") or "")
+    return ""
 
 
 def _safe_float(v: Any) -> float:
