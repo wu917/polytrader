@@ -573,6 +573,121 @@ def cmd_convergence(args) -> int:
     return 0
 
 
+def cmd_paper_arb(args) -> int:
+    """真实市场二元套利模拟：循环扫描活跃二元市场 → 订单簿 → 套利信号 → 模拟成交。
+
+    说明：Polymarket 当前无 5/15 分钟 up-or-down 快速市场（2025-12-19 实验后
+    未再上线），本模拟基于全部活跃二元市场；updown 回归后同一命令直接可用。
+    结果保留到 backtest_results/paper_arb_<ts>.json。
+    """
+    import json
+    import time as _time
+
+    from polytrader.data.clob_client import ClobClient
+    from polytrader.data.gamma_client import GammaClient
+    from polytrader.data.http_client import HttpClient
+    from polytrader.execution.broker import PaperBroker
+    from polytrader.strategies.arbitrage import ArbitrageStrategy
+
+    cfg = load_config()
+    http = HttpClient(proxy=args.proxy or cfg.effective_proxy())
+    gamma = GammaClient(http=http)
+    clob = ClobClient(http=http)
+    strategy = ArbitrageStrategy(min_edge=args.min_edge,
+                                 max_position_usd=args.size_usd)
+    broker = PaperBroker(clob, slippage_tolerance=args.slippage)
+
+    print(f"Paper-arb simulator | rounds={args.rounds} interval={args.interval}s "
+          f"min_edge={args.min_edge} markets={args.markets} "
+          f"note: no updown markets live; scanning all active binary markets")
+
+    rounds_log = []
+    all_signals = []
+    all_trades = []
+    done_conditions: set[str] = set()
+
+    for rnd in range(1, args.rounds + 1):
+        markets = gamma.get_markets(limit=args.markets, active=True)
+        binary = [m for m in markets if m.is_binary and m.liquidity >= args.min_liquidity
+                  and m.condition_id not in done_conditions]
+        # 拉订单簿
+        books = {}
+        for m in binary:
+            for o in m.outcomes:
+                try:
+                    book = clob.get_book(o.token_id)
+                    if book and book.best_ask():
+                        books[o.token_id] = book
+                except Exception:  # noqa: BLE001
+                    pass
+        signals = strategy.scan(binary, books)
+        # near-miss 报告：YES+NO 共识价和（Gamma outcomePrices）最小的市场。
+        # 不用 best_ask：无合理流动性的市场 ask=0.999 会污染计算
+        near = []
+        for m in binary:
+            try:
+                ref_yes = float(m.outcomes[0].price)
+                ref_no = float(m.outcomes[1].price)
+            except (TypeError, ValueError):
+                continue
+            if not (0.01 <= ref_yes <= 0.99 and 0.01 <= ref_no <= 0.99):
+                continue
+            near.append((ref_yes + ref_no, m.slug, round(ref_yes, 3), round(ref_no, 3)))
+        near.sort()
+        near_miss = [{"sum": round(s, 4), "slug": slug, "yes_ref": y, "no_ref": n}
+                     for s, slug, y, n in near[:5]]
+        trades = []
+        for s in signals:
+            t = broker.place(s)
+            trades.append(t)
+            if t.status == "filled":
+                done_conditions.add(s.market.condition_id)
+        all_signals.extend(signals)
+        all_trades.extend(trades)
+        filled = [t for t in trades if t.status == "filled"]
+        print(f"  round {rnd}: markets={len(binary)} books={len(books)} "
+              f"signals={len(signals)} filled={len(filled)} "
+              f"near-miss={[n['sum'] for n in near_miss]}")
+        rounds_log.append({"round": rnd, "markets": len(binary), "signals": len(signals),
+                           "filled": len(filled), "near_miss": near_miss})
+        if rnd < args.rounds:
+            _time.sleep(args.interval)
+
+    # 保留输出
+    out_dir = Path("backtest_results")
+    out_dir.mkdir(exist_ok=True)
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+    path = out_dir / f"paper_arb_{ts}.json"
+    path.write_text(json.dumps({
+        "meta": {"rounds": args.rounds, "interval_s": args.interval,
+                 "min_edge": args.min_edge, "min_liquidity": args.min_liquidity,
+                 "size_usd": args.size_usd,
+                 "note": "no live 5/15min updown markets; scanned all active binary markets"},
+        "rounds": rounds_log,
+        "signals": [
+            {"slug": s.market.slug, "condition_id": s.market.condition_id,
+             "yes_price": s.market_price, "edge": round(s.edge, 4), "reason": s.reason}
+            for s in all_signals
+        ],
+        "trades": [
+            {"slug": t.market_slug, "condition_id": t.condition_id,
+             "side": t.side.value, "price": t.price, "usd": t.usd_value,
+             "status": t.status, "reason": t.reason}
+            for t in all_trades
+        ],
+        "summary": {
+            "rounds": args.rounds,
+            "signals_total": len(all_signals),
+            "filled_total": sum(1 for t in all_trades if t.status == "filled"),
+            "rejected_total": sum(1 for t in all_trades if t.status != "filled"),
+        },
+    }, indent=2, ensure_ascii=False))
+    print(f"\n  summary: signals={len(all_signals)} filled="
+          f"{sum(1 for t in all_trades if t.status == 'filled')}")
+    print(f"  saved: {path}")
+    return 0
+
+
 def main() -> int:
     setup_logging()
     ap = argparse.ArgumentParser(description="PolyTrader")
@@ -632,6 +747,16 @@ def main() -> int:
                     help="确定性阈值：最后成交价 ≥ 阈值或 ≤ 1-阈值才入场")
     cv.add_argument("--size-usd", type=float, default=100.0)
 
+    pa = sub.add_parser("paper-arb", help="真实市场二元套利模拟（循环扫描 + 模拟成交）")
+    pa.add_argument("--proxy", default=None)
+    pa.add_argument("--rounds", type=int, default=5, help="扫描轮数")
+    pa.add_argument("--interval", type=float, default=30, help="轮间隔秒数")
+    pa.add_argument("--markets", type=int, default=50, help="每轮拉取市场数")
+    pa.add_argument("--min-liquidity", type=float, default=2000.0)
+    pa.add_argument("--min-edge", type=float, default=0.01, help="套利最小边缘")
+    pa.add_argument("--size-usd", type=float, default=100.0)
+    pa.add_argument("--slippage", type=float, default=0.02)
+
     args = ap.parse_args()
     if args.cmd == "offline" or args.cmd is None:
         return cmd_offline()
@@ -645,6 +770,8 @@ def main() -> int:
         return cmd_smart_money(args)
     if args.cmd == "convergence":
         return cmd_convergence(args)
+    if args.cmd == "paper-arb":
+        return cmd_paper_arb(args)
     return 1
 
 
