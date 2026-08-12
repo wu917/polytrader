@@ -48,10 +48,12 @@ def main() -> int:
 
     # 汇总
     all_trades = []
+    all_evals = []
     for p in generated:
         try:
             d = json.loads(p.read_text())
             all_trades.extend(d.get("trades", []))
+            all_evals.extend(d.get("evaluations", []))
         except Exception:
             continue
     settled = [t for t in all_trades if t.get("pnl") is not None]
@@ -71,6 +73,15 @@ def main() -> int:
             print(f"  r{t.get('round', '?')} {t['slug']:34s} {t['side']:3s} "
                   f"llm_p={t['llm_p']:.3f} ref={t['ref']:.3f} "
                   f"pnl=${t['pnl']:+.2f}")
+            if t.get("llm_reason"):
+                print(f"      llm reason: {t['llm_reason']}")
+    # 汇总落盘（复盘用）
+    out_path = Path("backtest_results") / \
+        f"llm_summary_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    out_path.write_text(json.dumps(
+        {"rounds_files": [str(p.name) for p in generated],
+         "trades": all_trades, "evaluations": all_evals}, indent=2, ensure_ascii=False))
+    print(f"\n  summary saved: {out_path}")
     return 0
 
 

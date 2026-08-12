@@ -168,6 +168,23 @@ def test_llm_scorer_disabled_without_key():
     scorer = LLMScorer(api_key="")
     assert scorer.enabled is False
     assert scorer.score("Q?") is None
+    assert scorer.score_with_reason("Q?") == (None, None)
+
+
+def test_parse_response_extracts_reason():
+    """LLM 输出同时提取 probability 与 reason（复盘用）。"""
+    from polytrader.ai.llm_scorer import _parse_response
+    p, r = _parse_response('{"probability": 0.62, "reason": "momentum up"}')
+    assert p == 0.62 and r == "momentum up"
+    p, r = _parse_response('{"probability":0.9999,"reason":"x"}')
+    assert p == 0.999  # clamp 到 [0.001, 0.999]
+    p, r = _parse_response("0.45")
+    assert p == 0.45 and r is None
+    p, r = _parse_response("")
+    assert p is None and r is None
+    # 兼容旧接口
+    from polytrader.ai.llm_scorer import _parse_probability
+    assert _parse_probability('{"probability": 0.3, "reason": "r"}') == 0.3
 
 
 def test_llm_scorer_rejects_non_https_base_url():

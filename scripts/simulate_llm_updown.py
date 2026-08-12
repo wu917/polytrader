@@ -128,17 +128,21 @@ def main() -> int:
     print(f"signals: {len(signals)}")
     trades = []
     for s in signals:
-        yes = s.outcome
         trades.append({"slug": s.market.slug, "condition_id": s.market.condition_id,
                        "coin": s.market.slug.split("-")[0],
                        "window": "5m" if "-5m-" in s.market.slug else "15m",
                        "side": s.extra.get("side"), "llm_p": round(s.extra.get("llm_p", 0), 4),
                        "ref": round(s.market_price, 4), "edge": round(s.edge, 4),
                        "size_usd": SIZE_USD, "entry_price": round(s.market_price, 4),
-                       "reason": s.reason, "book": books.get(s.market.condition_id)})
+                       "reason": s.reason,
+                       "llm_reason": s.extra.get("llm_reason"),
+                       "book": books.get(s.market.condition_id)})
         print(f"  {trades[-1]['slug']:34s} {trades[-1]['side']:3s} "
               f"llm_p={trades[-1]['llm_p']:.3f} ref={trades[-1]['ref']:.3f} "
               f"edge={trades[-1]['edge']:+.3f} book={trades[-1]['book']}")
+        if trades[-1]["llm_reason"]:
+            print(f"      llm reason: {trades[-1]['llm_reason']}")
+    evaluations = [dict(e, round=round_no) for e in strat.last_evaluations]
 
     # 等待结算并验证
     if args.wait > 0 and trades:
@@ -166,7 +170,11 @@ def main() -> int:
     out_dir = Path("backtest_results")
     out_dir.mkdir(exist_ok=True)
     path = out_dir / f"llm_updown_sim_{time.strftime('%Y%m%d_%H%M%S')}.json"
-    path.write_text(json.dumps({"signals": len(signals), "trades": trades}, indent=2))
+    path.write_text(json.dumps(
+        {"signals": len(signals), "trades": trades, "evaluations": evaluations,
+         "config": {"min_edge": args.min_edge, "wait": args.wait,
+                    "size_usd_per_trade": SIZE_USD}},
+        indent=2, ensure_ascii=False))
     settled = [t for t in trades if t.get("pnl") is not None]
     if settled:
         total = sum(t["pnl"] for t in settled)

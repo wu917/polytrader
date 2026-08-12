@@ -85,6 +85,7 @@ class LLMUpdownStrategy(LLMBookStrategy):
                          min_price=min_price, max_price=max_price,
                          max_markets=max_markets)
         self.coin_map = coin_map or {}
+        self.last_evaluations: list[dict] = []  # 本轮所有评估（含未下单原因）
 
     def score_updown(self, market: Market, coin: str, window_s: int) -> dict | None:
         """单市场：行情上下文 + LLM 判断 + 双侧 edge。返回 None 表示无法评估。"""
@@ -103,15 +104,15 @@ class LLMUpdownStrategy(LLMBookStrategy):
                                                "%Y-%m-%dT%H:%M:%S"))) if "T" in market.end_date else 0
         secs_left = max(0, end_ts - int(time.time())) if end_ts else 0
         prompt = build_updown_prompt(coin, ctx, market, ref_yes, secs_left)
-        p = self.scorer.score(f"{coin.upper()} {window_s // 60}min up or down",
-                              prompt, "crypto")
+        p, reason = self.scorer.score_with_reason(
+            f"{coin.upper()} {window_s // 60}min up or down", prompt, "crypto")
         if p is None:
             return None
         yes_edge = p - ref_yes
         no_edge = (1.0 - p) - ref_no
         return {"llm_p": p, "ref_yes": ref_yes, "ref_no": ref_no,
                 "yes_edge": yes_edge, "no_edge": no_edge,
-                "ctx": ctx, "secs_left": secs_left}
+                "reason": reason, "ctx": ctx, "secs_left": secs_left}
 
     def scan(self, markets: list[Market],
              books: dict | None = None) -> list[Signal]:
@@ -120,6 +121,7 @@ class LLMUpdownStrategy(LLMBookStrategy):
             log.warning("LLMUpdownStrategy disabled: no LLM_API_KEY")
             return []
         signals: list[Signal] = []
+        self.last_evaluations = []
         for market in markets:
             if len(signals) >= self.max_markets:
                 break
@@ -129,8 +131,21 @@ class LLMUpdownStrategy(LLMBookStrategy):
             window_s = 300 if "-5m-" in market.slug else 900
             r = self.score_updown(market, coin, window_s)
             if r is None:
+                self.last_evaluations.append({"slug": market.slug, "evaluated": False,
+                                              "skip_reason": "llm/context failed"})
                 continue
             yes, no = market.outcomes[0], market.outcomes[1]
+            best_edge = max(r["yes_edge"], r["no_edge"])
+            self.last_evaluations.append({
+                "slug": market.slug, "evaluated": True,
+                "llm_p": round(r["llm_p"], 4), "ref_yes": round(r["ref_yes"], 4),
+                "ref_no": round(r["ref_no"], 4),
+                "yes_edge": round(r["yes_edge"], 4), "no_edge": round(r["no_edge"], 4),
+                "best_edge": round(best_edge, 4),
+                "signal": best_edge >= self.min_edge,
+                "reason": r.get("reason"),
+                "ctx5m": round(r["ctx"]["last5_chg"], 5),
+            })
             if r["yes_edge"] >= self.min_edge and r["yes_edge"] >= r["no_edge"]:
                 signals.append(Signal(
                     type=SignalType.AI_PROBABILITY, market=market, outcome=yes,
@@ -140,7 +155,8 @@ class LLMUpdownStrategy(LLMBookStrategy):
                     reason=f"llm_updown: p={r['llm_p']:.3f} yes_ref={r['ref_yes']:.3f} "
                            f"edge={r['yes_edge']:+.3f} ctx5m={r['ctx']['last5_chg']:+.2%}",
                     extra={"llm_p": r["llm_p"], "side": "YES",
-                           "model": self.scorer.model, "ctx": r["ctx"]},
+                           "model": self.scorer.model, "ctx": r["ctx"],
+                           "llm_reason": r.get("reason")},
                 ))
             elif r["no_edge"] >= self.min_edge:
                 signals.append(Signal(
@@ -151,6 +167,7 @@ class LLMUpdownStrategy(LLMBookStrategy):
                     reason=f"llm_updown: p_no={1.0 - r['llm_p']:.3f} no_ref={r['ref_no']:.3f} "
                            f"edge={r['no_edge']:+.3f} ctx5m={r['ctx']['last5_chg']:+.2%}",
                     extra={"llm_p": r["llm_p"], "side": "NO",
-                           "model": self.scorer.model, "ctx": r["ctx"]},
+                           "model": self.scorer.model, "ctx": r["ctx"],
+                           "llm_reason": r.get("reason")},
                 ))
         return signals

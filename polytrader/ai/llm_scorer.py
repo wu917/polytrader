@@ -42,8 +42,14 @@ class LLMScorer:
 
     def score(self, question: str, description: str = "", market_category: str = "") -> float | None:
         """返回 P(YES) ∈ [0,1]；不可用时返回 None（自动重试 1 次）。"""
+        p, _ = self.score_with_reason(question, description, market_category)
+        return p
+
+    def score_with_reason(self, question: str, description: str = "",
+                          market_category: str = "") -> tuple[float | None, str | None]:
+        """返回 (P(YES), reason)；不可用时 (None, None)（自动重试 1 次）。"""
         if not self.enabled:
-            return None
+            return None, None
         user = f"Market: {question}\nCategory: {market_category}\nDetails: {(description or '')[:1500]}"
         for attempt in range(2):  # 推理模型偶发超时/限流，重试一次
             try:
@@ -62,13 +68,13 @@ class LLMScorer:
                 )
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"]
-                parsed = _parse_probability(content)
-                if parsed is not None:
+                parsed = _parse_response(content)
+                if parsed[0] is not None:
                     return parsed
                 log.warning("LLM content unparsable (attempt %d): %.100r", attempt + 1, content)
             except Exception as exc:  # noqa: BLE001
                 log.warning("LLM score failed (attempt %d): %s", attempt + 1, exc)
-        return None
+        return None, None
 
     def score_many(self, questions: list[tuple[str, str, str]],
                    max_parallel: int = 5) -> list[float | None]:
@@ -76,21 +82,29 @@ class LLMScorer:
         return [self.score(q, d, c) for q, d, c in questions[:max_parallel]]
 
 
-def _parse_probability(content: str) -> float | None:
-    """从 LLM 输出提取概率：优先 JSON，其次裸数字。"""
+def _parse_response(content: str) -> tuple[float | None, str | None]:
+    """从 LLM 输出提取 (probability, reason)：优先 JSON，其次裸数字。"""
     if not content:
-        return None
+        return None, None
     text = content.strip()
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "probability" in data:
-            return _clamp(float(data["probability"]))
+            p = _clamp(float(data["probability"]))
+            reason = data.get("reason")
+            return p, (str(reason) if reason else None)
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
     m = re.search(r"0?\.\d{2,4}|\b[01]\b", text)
     if m:
-        return _clamp(float(m.group(0)))
-    return None
+        return _clamp(float(m.group(0))), None
+    return None, None
+
+
+def _parse_probability(content: str) -> float | None:
+    """兼容旧接口：只取概率。"""
+    p, _ = _parse_response(content)
+    return p
 
 
 def _clamp(p: float) -> float:
