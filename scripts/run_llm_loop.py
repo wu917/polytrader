@@ -26,6 +26,8 @@ def main() -> int:
                     help="每笔固定仓位 USD（透传 simulate，默认 $1）")
     ap.add_argument("--out-dir", type=str, default="backtest_results",
                     help="所有输出目录（日志/结果/审计/临时轮次）")
+    ap.add_argument("--windows", type=str, default="5m,15m",
+                    help="参与的市场窗口（透传 simulate）")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -60,7 +62,8 @@ def main() -> int:
             [sys.executable, "scripts/simulate_llm_updown.py",
              "--wait", str(args.wait), "--min-edge", str(args.min_edge),
              "--size", str(args.size), "--audit-dir", str(run_dir),
-             "--seen-file", str(out_dir / "seen_slugs.txt")],
+             "--seen-file", str(out_dir / "seen_slugs.txt"),
+             "--windows", args.windows],
             cwd=ROOT, capture_output=True, text=True, timeout=args.wait + 240,
         )
         # 本轮输出全部写入日志文件

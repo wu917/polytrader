@@ -53,16 +53,19 @@ def audit(rec: dict, path: str | None):
         pass
 
 
-def fetch_windows(http, coin_map, min_secs_left: int = 30):
-    """当前 5m/15m 窗口市场 dict[slug] = Market + coin/window。
+def fetch_windows(http, coin_map, min_secs_left: int = 30,
+                  windows: tuple = ("5m", "15m")):
+    """当前窗口市场 dict[slug] = Market + coin/window。
 
     过滤已结束/即将结束的窗口（剩余 < min_secs_left 秒跳过——避免对
     已结束窗口评估导致 LLM"窗口已结束取默认值"的垃圾判断）。
+    windows: ("5m",) 仅 5 分钟市场；("15m",) 仅 15 分钟。
     """
     now = int(time.time())
     w5 = (now // 300) * 300
     w15 = (now // 900) * 900
-    slugs = [f"{c}-updown-{w}-{ts}" for c in COINS for w, ts in (("5m", w5), ("15m", w15))]
+    slugs = [f"{c}-updown-{w}-{ts}" for c in COINS
+             for w, ts in (("5m", w5), ("15m", w15)) if w in windows]
     resp = http.get_json("https://gamma-api.polymarket.com/events/keyset?" +
                          "&".join(f"slug={s}" for s in slugs) + "&limit=100&locale=en")
     events = resp if isinstance(resp, list) else resp.get("events", [])
@@ -147,7 +150,10 @@ def main() -> int:
                     help="已交易 slug 持久化文件（跨轮去重）")
     ap.add_argument("--settle-csv", type=str, default="",
                     help="结算 CSV 路径（默认 audit-dir/settlements_<ts>.csv）")
+    ap.add_argument("--windows", type=str, default="5m,15m",
+                    help="参与的市场窗口：5m / 15m / 5m,15m")
     args = ap.parse_args()
+    win_filter = tuple(w.strip() for w in args.windows.split(",") if w.strip())
     size_usd = args.size
     audit_path = str(Path(args.audit_dir) /
                      f"audit_llm_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
@@ -170,7 +176,7 @@ def main() -> int:
     strat = LLMUpdownStrategy(scorer, min_edge=args.min_edge, max_markets=20,
                               coin_map=coin_map)
 
-    markets = fetch_windows(http, coin_map)
+    markets = fetch_windows(http, coin_map, windows=win_filter)
     # 去重：过滤已交易盘口（跨轮持久）
     already = sum(1 for s in markets if s in seen)
     markets = {slug: m for slug, m in markets.items() if slug not in seen}
