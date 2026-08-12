@@ -23,92 +23,115 @@ def main() -> int:
     ap.add_argument("--wait", type=int, default=330)
     ap.add_argument("--size", type=float, default=1.0,
                     help="每笔固定仓位 USD（透传 simulate，默认 $1）")
-    ap.add_argument("--audit-dir", type=str, default="backtest_results")
+    ap.add_argument("--out-dir", type=str, default="backtest_results",
+                    help="所有输出目录（日志/结果/审计/临时轮次）")
     args = ap.parse_args()
 
-    generated: list[Path] = []
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts0 = time.strftime("%Y%m%d_%H%M%S")
+    # 单日志文件：本进程全部输出 + 每轮 subprocess stdout/stderr
+    log_file = out_dir / f"llm_loop_{ts0}.log"
+    # 单结果文件：JSONL 事件流（round / trade_settled / summary）
+    results_file = out_dir / f"llm_results_{ts0}.jsonl"
+    # 单审计文件：合并各轮调用级审计
+    audit_all = out_dir / f"audit_all_{ts0}.jsonl"
+    run_dir = out_dir / "rounds_tmp"
+    run_dir.mkdir(exist_ok=True)
+
+    def log(msg: str):
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+        print(line, flush=True)
+        with open(log_file, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+    def emit(rec: dict):
+        with open(results_file, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # 清空临时轮次目录
+    for p in run_dir.glob("*"):
+        p.unlink()
+
     for i in range(1, args.rounds + 1):
-        print(f"\n=== LOOP {i}/{args.rounds} ===", flush=True)
-        before = set(Path("backtest_results").glob("llm_updown_sim_*.json"))
+        log(f"=== LOOP {i}/{args.rounds} ===")
         proc = subprocess.run(
             [sys.executable, "scripts/simulate_llm_updown.py",
              "--wait", str(args.wait), "--min-edge", str(args.min_edge),
-             "--size", str(args.size), "--audit-dir", args.audit_dir],
+             "--size", str(args.size), "--audit-dir", str(run_dir),
+             "--seen-file", str(out_dir / "seen_slugs.txt")],
             cwd=ROOT, capture_output=True, text=True, timeout=args.wait + 240,
         )
+        # 本轮输出全部写入日志文件
         for line in proc.stdout.splitlines():
-            if line.startswith(("windows:", "signals:", "  btc", "  eth", "  sol",
-                                "  xrp", "  doge", "  bnb", "  hype", "settled",
-                                "cumulative", "FINAL", "saved:", "  unsettled")):
-                print("  " + line, flush=True)
+            log("  " + line)
+        if proc.stderr.strip():
+            for line in proc.stderr.splitlines()[-20:]:
+                log("  ERR " + line)
         if proc.returncode != 0:
-            print(f"  round failed rc={proc.returncode}: {proc.stderr[-300:]}")
+            log(f"  round failed rc={proc.returncode}")
             continue
-        new = set(Path("backtest_results").glob("llm_updown_sim_*.json")) - before
-        generated.extend(sorted(new, key=lambda p: p.stat().st_mtime))
-        if i < args.rounds:
-            print("  waiting for next 5m window...", flush=True)
-            time.sleep(30)
-
-    # 汇总
-    all_trades = []
-    all_evals = []
-    for p in generated:
-        try:
-            d = json.loads(p.read_text())
-            all_trades.extend(d.get("trades", []))
-            all_evals.extend(d.get("evaluations", []))
-        except Exception:
-            continue
-    settled = [t for t in all_trades if t.get("pnl") is not None]
-    print(f"\n=== SUMMARY ({len(generated)} rounds files) ===")
-    print(f"trades={len(all_trades)} settled={len(settled)}")
-    if settled:
-        wins = sum(1 for t in settled if t["pnl"] > 0)
-        total = sum(t["pnl"] for t in settled)
-        avg_p = sum(t["llm_p"] for t in settled) / len(settled)
-        avg_ref = sum(t["ref"] for t in settled) / len(settled)
-        print(f"win_rate={wins / len(settled):.1%} ({wins}/{len(settled)}) "
-              f"total_pnl=${total:+.2f}")
-        print(f"avg_llm_p={avg_p:.3f} avg_ref={avg_ref:.3f} "
-              f"(极端值占比: "
-              f"{sum(1 for t in settled if t['llm_p'] <= 0.02 or t['llm_p'] >= 0.98) / len(settled):.0%})")
-        for t in settled:
-            print(f"  r{t.get('round', '?')} {t['slug']:34s} {t['side']:3s} "
-                  f"llm_p={t['llm_p']:.3f} ref={t['ref']:.3f} "
-                  f"pnl=${t['pnl']:+.2f}")
-            if t.get("llm_reason"):
-                print(f"      llm reason: {t['llm_reason']}")
-    # 汇总落盘（复盘用）
-    out_path = Path("backtest_results") / \
-        f"llm_summary_{time.strftime('%Y%m%d_%H%M%S')}.json"
-    out_path.write_text(json.dumps(
-        {"rounds_files": [str(p.name) for p in generated],
-         "trades": all_trades, "evaluations": all_evals}, indent=2, ensure_ascii=False))
-    print(f"\n  summary saved: {out_path}")
-    # 合并各轮结算 CSV（独立输出，不与其他混）
-    import csv as _csv
-    settle_all = Path("backtest_results") / \
-        f"settlements_all_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-    header_written = False
-    with open(settle_all, "w", newline="", encoding="utf-8") as out_fh:
-        w = _csv.writer(out_fh)
-        for p in generated:
-            s_csv = p.with_name(p.name.replace("llm_updown_sim_", "settlements_")
-                                .replace(".json", ".csv"))
-            if not s_csv.exists():
+        # 收集本轮结果（simulate 写入 run_dir 的 JSON）
+        for sim in sorted(run_dir.glob("llm_updown_sim_*.json"),
+                          key=lambda p: p.stat().st_mtime):
+            try:
+                d = json.loads(sim.read_text())
+            except Exception:
                 continue
+            emit({"type": "round", "round": i,
+                  "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                  "trades": d.get("trades", []),
+                  "evaluations": d.get("evaluations", []),
+                  "config": d.get("config", {})})
+            sim.unlink()
+        # 结算 CSV 行并入结果文件（保留 CSV 原始文件）
+        for s_csv in sorted(run_dir.glob("settlements_*.csv")):
+            import csv as _csv
             with open(s_csv, newline="", encoding="utf-8") as fh:
                 for row in _csv.reader(fh):
-                    if not row or (header_written and row[0] == "ts"):
+                    if not row or row[0] == "ts":
                         continue
-                    if row[0] == "ts":
-                        if not header_written:
-                            w.writerow(row)
-                            header_written = True
-                        continue
-                    w.writerow(row)
-    print(f"  settlements all csv: {settle_all}")
+                    emit({"type": "trade_settled", "round": i,
+                          "ts": row[0], "trade_id": row[1], "slug": row[2],
+                          "coin": row[3], "window": row[4], "side": row[5],
+                          "entry_price": row[6], "size_usd": row[7],
+                          "settle_yes": row[8] or None, "win": row[9] or None,
+                          "pnl": row[10] or None})
+            s_csv.unlink()
+        # 审计合并到单审计文件
+        for a in sorted(run_dir.glob("audit_llm_*.jsonl")):
+            with open(a, encoding="utf-8") as fh, \
+                    open(audit_all, "a", encoding="utf-8") as out_fh:
+                for line in fh:
+                    out_fh.write(line)
+            a.unlink()
+        if i < args.rounds:
+            log("  waiting for next 5m window...")
+            time.sleep(30)
+
+    # 最终汇总（从结果文件统计）
+    trades = []
+    settled = []
+    for line in results_file.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("type") == "round":
+            trades.extend(rec.get("trades", []))
+        elif rec.get("type") == "trade_settled" and rec.get("pnl") is not None:
+            settled.append(rec)
+    wins = sum(1 for s in settled if float(s["win"] or 0) == 1)
+    total = sum(float(s["pnl"]) for s in settled)
+    log(f"\n=== SUMMARY: rounds={args.rounds} trades={len(trades)} "
+        f"settled={len(settled)} win_rate={wins / max(len(settled), 1):.1%} "
+        f"total_pnl=${total:+.2f}")
+    emit({"type": "summary", "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+          "rounds": args.rounds, "trades": len(trades), "settled": len(settled),
+          "wins": wins, "total_pnl": round(total, 2)})
+    log(f"log: {log_file}")
+    log(f"results: {results_file}")
+    log(f"audit: {audit_all}")
     return 0
 
 

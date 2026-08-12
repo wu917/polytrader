@@ -53,8 +53,12 @@ def audit(rec: dict, path: str | None):
         pass
 
 
-def fetch_windows(http, coin_map):
-    """当前 5m/15m 窗口市场 dict[slug] = Market + coin/window。"""
+def fetch_windows(http, coin_map, min_secs_left: int = 30):
+    """当前 5m/15m 窗口市场 dict[slug] = Market + coin/window。
+
+    过滤已结束/即将结束的窗口（剩余 < min_secs_left 秒跳过——避免对
+    已结束窗口评估导致 LLM"窗口已结束取默认值"的垃圾判断）。
+    """
     now = int(time.time())
     w5 = (now // 300) * 300
     w15 = (now // 900) * 900
@@ -68,6 +72,18 @@ def fetch_windows(http, coin_map):
             slug = m.get("slug", "")
             if "updown" not in slug:
                 continue
+            end_date = m.get("endDate", "")
+            end_ts = 0
+            if "T" in end_date:
+                try:
+                    import datetime as _dt
+                    end_ts = int(_dt.datetime.strptime(
+                        end_date[:19], "%Y-%m-%dT%H:%M:%S")
+                        .replace(tzinfo=_dt.timezone.utc).timestamp())  # endDate 为 UTC
+                except (ValueError, OSError):
+                    end_ts = 0
+            if end_ts and end_ts - now < min_secs_left:
+                continue  # 窗口已结束/即将结束，跳过
             prices = m.get("outcomePrices") or ""
             tokens = m.get("clobTokenIds") or ""
             try:
@@ -79,7 +95,7 @@ def fetch_windows(http, coin_map):
                 continue
             out[slug] = Market(
                 condition_id=m.get("conditionId", ""), question=m.get("question", ""),
-                slug=slug, end_date=m.get("endDate", ""),
+                slug=slug, end_date=end_date,
                 liquidity=float(m.get("liquidity") or 0), closed=False, active=True,
                 outcomes=[Outcome(outcome_id="o0", token_id=tokens[0],
                                   price=str(prices[0]), name="Yes"),
@@ -252,7 +268,7 @@ def main() -> int:
         csv_fh.close()
         print(f"  settlements csv: {settle_csv}")
 
-    out_dir = Path("backtest_results")
+    out_dir = Path(args.audit_dir)
     out_dir.mkdir(exist_ok=True)
     path = out_dir / f"llm_updown_sim_{time.strftime('%Y%m%d_%H%M%S')}.json"
     path.write_text(json.dumps(

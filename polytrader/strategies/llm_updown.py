@@ -24,17 +24,34 @@ HTTP = HttpClient(proxy="socks5h://127.0.0.1:7890", timeout=10)
 
 
 def fetch_market_context(coin: str, window_s: int = 300) -> dict | None:
-    """Binance 实时行情上下文：当前价 + 近 6 根 1m 走势 + 波动率。"""
+    """实时行情上下文：当前价 + 近 6 根 1m 走势 + 波动率。
+
+    Binance 无 HYPEUSDT → fallback OKX（HYPE-USDT）。
+    """
     symbol = f"{coin.upper()}USDT"
+    k = None
+    ticker = None
     try:
         k = HTTP.get_json("https://api.binance.com/api/v3/klines",
                           params={"symbol": symbol, "interval": "1m", "limit": 6})
         ticker = HTTP.get_json("https://api.binance.com/api/v3/ticker/price",
                                params={"symbol": symbol})
     except Exception as e:
-        log.warning("binance context failed for %s: %s", coin, e)
-        return None
-    if not k:
+        log.info("binance context failed for %s (%s) — trying okx", coin, e)
+    if k is None or not k:
+        try:
+            ok = HTTP.get_json(
+                f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=1m&limit=6")
+            if ok and ok.get("code") == "0":
+                rows = sorted(ok["data"], key=lambda r: r[0])  # 时间升序
+                k = [[r[0], r[1], r[2], r[3], r[4]] for r in rows]
+                t = HTTP.get_json(
+                    f"https://www.okx.com/api/v5/market/ticker?instId={symbol}")
+                if t and t.get("code") == "0":
+                    ticker = {"price": t["data"][0]["last"]}
+        except Exception as e2:
+            log.warning("okx context failed for %s: %s", coin, e2)
+    if not k or ticker is None:
         return None
     closes = [float(b[4]) for b in k]
     opens = [float(b[1]) for b in k]
@@ -100,9 +117,20 @@ class LLMUpdownStrategy(LLMBookStrategy):
         ctx = fetch_market_context(coin, window_s)
         if ctx is None:
             return None
-        end_ts = int(time.mktime(time.strptime(market.end_date[:19],
-                                               "%Y-%m-%dT%H:%M:%S"))) if "T" in market.end_date else 0
+        end_ts = 0
+        if "T" in market.end_date:
+            import datetime as _dt
+            try:
+                end_ts = int(_dt.datetime.strptime(
+                    market.end_date[:19], "%Y-%m-%dT%H:%M:%S")
+                    .replace(tzinfo=_dt.timezone.utc).timestamp())  # endDate 为 UTC
+            except (ValueError, OSError):
+                end_ts = 0
         secs_left = max(0, end_ts - int(time.time())) if end_ts else 0
+        if secs_left < 20:
+            log.warning("skip %s: window ended or too close (secs_left=%d)",
+                        market.slug, secs_left)
+            return None  # 窗口已结束/过近，不评估
         prompt = build_updown_prompt(coin, ctx, market, ref_yes, secs_left)
         p, reason = self.scorer.score_with_reason(
             f"{coin.upper()} {window_s // 60}min up or down", prompt, "crypto")
