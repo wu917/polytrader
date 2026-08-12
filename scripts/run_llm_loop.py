@@ -21,6 +21,8 @@ def main() -> int:
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--min-edge", type=float, default=0.04)
     ap.add_argument("--wait", type=int, default=330)
+    ap.add_argument("--size", type=float, default=1.0,
+                    help="每笔固定仓位 USD（透传 simulate，默认 $1）")
     args = ap.parse_args()
 
     generated: list[Path] = []
@@ -29,7 +31,8 @@ def main() -> int:
         before = set(Path("backtest_results").glob("llm_updown_sim_*.json"))
         proc = subprocess.run(
             [sys.executable, "scripts/simulate_llm_updown.py",
-             "--wait", str(args.wait), "--min-edge", str(args.min_edge)],
+             "--wait", str(args.wait), "--min-edge", str(args.min_edge),
+             "--size", str(args.size)],
             cwd=ROOT, capture_output=True, text=True, timeout=args.wait + 240,
         )
         for line in proc.stdout.splitlines():

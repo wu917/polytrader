@@ -23,7 +23,7 @@ from polytrader.models import Market, Outcome
 from polytrader.strategies.llm_updown import LLMUpdownStrategy
 
 COINS = ["btc", "eth", "sol", "xrp", "doge", "hype", "bnb"]
-SIZE_USD = 100.0
+SIZE_USD = 1.0  # 每笔固定仓位（--size 可覆盖）
 
 
 def fetch_windows(http, coin_map):
@@ -95,7 +95,10 @@ def main() -> int:
     ap.add_argument("--min-edge", type=float, default=0.05)
     ap.add_argument("--coins", default=",".join(COINS))
     ap.add_argument("--loop", type=int, default=1, help="连续轮数（每 5m 窗口一轮）")
+    ap.add_argument("--size", type=float, default=SIZE_USD,
+                    help="每笔固定仓位 USD（默认 $1）")
     args = ap.parse_args()
+    size_usd = args.size
     coins = [c for c in args.coins.split(",") if c]
     coin_map = {c: c for c in coins}
 
@@ -133,7 +136,7 @@ def main() -> int:
                        "window": "5m" if "-5m-" in s.market.slug else "15m",
                        "side": s.extra.get("side"), "llm_p": round(s.extra.get("llm_p", 0), 4),
                        "ref": round(s.market_price, 4), "edge": round(s.edge, 4),
-                       "size_usd": SIZE_USD, "entry_price": round(s.market_price, 4),
+                       "size_usd": size_usd, "entry_price": round(s.market_price, 4),
                        "reason": s.reason,
                        "llm_reason": s.extra.get("llm_reason"),
                        "book": books.get(s.market.condition_id)})
@@ -158,8 +161,8 @@ def main() -> int:
                     win = (t["side"] == "YES" and settle == 1.0) or \
                           (t["side"] == "NO" and settle == 0.0)
                     t["settle_yes"] = settle
-                    t["pnl"] = round((SIZE_USD / t["entry_price"]) * (1.0 if win else 0.0)
-                                     - SIZE_USD, 2)
+                    t["pnl"] = round((size_usd / t["entry_price"]) * (1.0 if win else 0.0)
+                                     - size_usd, 2)
                     print(f"  settled {t['slug']}: {t['side']} win={win} "
                           f"pnl=${t['pnl']:+.2f}")
         for cid, t in remaining.items():
@@ -173,7 +176,7 @@ def main() -> int:
     path.write_text(json.dumps(
         {"signals": len(signals), "trades": trades, "evaluations": evaluations,
          "config": {"min_edge": args.min_edge, "wait": args.wait,
-                    "size_usd_per_trade": SIZE_USD}},
+                    "size_usd_per_trade": size_usd}},
         indent=2, ensure_ascii=False))
     settled = [t for t in trades if t.get("pnl") is not None]
     if settled:
