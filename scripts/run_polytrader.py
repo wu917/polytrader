@@ -405,10 +405,16 @@ def cmd_smart_money(args) -> int:
     data = DataApiClient(http=http)
 
     import datetime
-    since = (datetime.datetime.now(datetime.timezone.utc)
-             - datetime.timedelta(days=args.since_months * 30)).strftime("%Y-%m-%d")
-    print(f"Smart money backtest | samples={args.samples} since={since} "
-          f"top_k={args.top_k} min_profit={args.min_profit}")
+    if args.since_days:
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(days=args.since_days)).strftime("%Y-%m-%d")
+        since_label = f"{args.since_days}d"
+    else:
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(days=args.since_months * 30)).strftime("%Y-%m-%d")
+        since_label = f"{args.since_months}m"
+    print(f"Smart money backtest | samples={args.samples} since={since} ({since_label}) "
+          f"top_k={args.top_k} min_profit={args.min_profit} confirm={not args.no_confirm}")
 
     labeled: list = []
     offset = 0
@@ -517,6 +523,8 @@ def main() -> int:
     sm.add_argument("--proxy", default=None)
     sm.add_argument("--samples", type=int, default=300)
     sm.add_argument("--since-months", type=int, default=3)
+    sm.add_argument("--since-days", type=int, default=0,
+                    help="只回测最近 N 天内结算的市场（覆盖 since-months）")
     sm.add_argument("--trade-limit", type=int, default=500)
     sm.add_argument("--top-k", type=int, default=5, help="跟随钱包数")
     sm.add_argument("--min-trades", type=int, default=3)
