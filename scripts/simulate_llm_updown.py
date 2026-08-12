@@ -23,8 +23,23 @@ from polytrader.data.http_client import HttpClient
 from polytrader.models import Market, Outcome
 from polytrader.strategies.llm_updown import LLMUpdownStrategy
 
-COINS = ["btc", "eth", "sol", "xrp", "doge", "hype", "bnb"]
+COINS = ["btc", "eth", "bnb", "sol", "hype"]  # 限定交易币种
 SIZE_USD = 1.0  # 每笔固定仓位（--size 可覆盖）
+
+
+def load_seen(seen_file: str | None) -> set:
+    """读取已交易 slug 集合（跨轮持久去重）。"""
+    if not seen_file or not Path(seen_file).exists():
+        return set()
+    return {line.strip() for line in Path(seen_file).read_text().splitlines() if line.strip()}
+
+
+def save_seen(seen_file: str | None, slugs: set):
+    """写回已交易 slug 集合。"""
+    if not seen_file:
+        return
+    Path(seen_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(seen_file).write_text("\n".join(sorted(slugs)) + "\n")
 
 
 def audit(rec: dict, path: str | None):
@@ -111,10 +126,18 @@ def main() -> int:
                     help="每笔固定仓位 USD（默认 $1）")
     ap.add_argument("--audit-dir", type=str, default="backtest_results",
                     help="审计 JSONL 输出目录")
+    ap.add_argument("--seen-file", type=str,
+                    default="backtest_results/seen_slugs.txt",
+                    help="已交易 slug 持久化文件（跨轮去重）")
+    ap.add_argument("--settle-csv", type=str, default="",
+                    help="结算 CSV 路径（默认 audit-dir/settlements_<ts>.csv）")
     args = ap.parse_args()
     size_usd = args.size
     audit_path = str(Path(args.audit_dir) /
                      f"audit_llm_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
+    settle_csv = args.settle_csv or str(
+        Path(args.audit_dir) / f"settlements_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    seen = load_seen(args.seen_file)
     coins = [c for c in args.coins.split(",") if c]
     coin_map = {c: c for c in coins}
 
@@ -132,7 +155,10 @@ def main() -> int:
                               coin_map=coin_map)
 
     markets = fetch_windows(http, coin_map)
-    print(f"windows: {len(markets)} markets")
+    # 去重：过滤已交易盘口（跨轮持久）
+    already = sum(1 for s in markets if s in seen)
+    markets = {slug: m for slug, m in markets.items() if slug not in seen}
+    print(f"windows: {len(markets)} markets (after dedup, already traded: {already})")
     # 盘口快照（记录，模拟成交用 ref 价近似——空壳盘口 taker 不可行）
     books = {}
     for m in markets.values():
@@ -167,6 +193,8 @@ def main() -> int:
                "edge": trades[-1]["edge"], "size_usd": size_usd,
                "entry_price": trades[-1]["entry_price"],
                "llm_reason": trades[-1]["llm_reason"]}, audit_path)
+        seen.add(trades[-1]["slug"])
+        save_seen(args.seen_file, seen)
         print(f"  {trades[-1]['slug']:34s} {trades[-1]['side']:3s} "
               f"llm_p={trades[-1]['llm_p']:.3f} ref={trades[-1]['ref']:.3f} "
               f"edge={trades[-1]['edge']:+.3f} book={trades[-1]['book']}")
@@ -175,8 +203,15 @@ def main() -> int:
     evaluations = [dict(e, round=round_no) for e in strat.last_evaluations]
 
     # 等待结算并验证
+    csv_fh = None
     if args.wait > 0 and trades:
         print(f"\nwaiting up to {args.wait}s for settlement...")
+        # 结算单独 CSV（不与审计/交易 JSON 混在一起）
+        import csv as _csv
+        csv_fh = open(settle_csv, "w", newline="", encoding="utf-8")
+        _csv.writer(csv_fh).writerow(
+            ["ts", "trade_id", "slug", "coin", "window", "side",
+             "entry_price", "size_usd", "settle_yes", "win", "pnl"])
         deadline = time.time() + args.wait
         remaining = {t["slug"]: t for t in trades}
         while remaining and time.time() < deadline:
@@ -196,12 +231,26 @@ def main() -> int:
                            "settle_yes": settle, "win": win,
                            "entry_price": t["entry_price"],
                            "size_usd": size_usd, "pnl": t["pnl"]}, audit_path)
+                    _csv.writer(csv_fh).writerow(
+                        [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                         t.get("trade_id"), slug, t["coin"], t["window"],
+                         t["side"], t["entry_price"], size_usd, settle,
+                         1 if win else 0, t["pnl"]])
+                    csv_fh.flush()
                     print(f"  settled {t['slug']}: {t['side']} win={win} "
                           f"pnl=${t['pnl']:+.2f}")
         for cid, t in remaining.items():
             t["settle_yes"] = None
             t["pnl"] = None
+            # 未结算也写入 CSV（settle_yes 空）
+            _csv.writer(csv_fh).writerow(
+                [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 t.get("trade_id"), cid, t["coin"], t["window"],
+                 t["side"], t["entry_price"], size_usd, "", "", ""])
+            csv_fh.flush()
             print(f"  unsettled: {t['slug']}")
+        csv_fh.close()
+        print(f"  settlements csv: {settle_csv}")
 
     out_dir = Path("backtest_results")
     out_dir.mkdir(exist_ok=True)

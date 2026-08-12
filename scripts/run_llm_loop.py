@@ -86,6 +86,29 @@ def main() -> int:
         {"rounds_files": [str(p.name) for p in generated],
          "trades": all_trades, "evaluations": all_evals}, indent=2, ensure_ascii=False))
     print(f"\n  summary saved: {out_path}")
+    # 合并各轮结算 CSV（独立输出，不与其他混）
+    import csv as _csv
+    settle_all = Path("backtest_results") / \
+        f"settlements_all_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    header_written = False
+    with open(settle_all, "w", newline="", encoding="utf-8") as out_fh:
+        w = _csv.writer(out_fh)
+        for p in generated:
+            s_csv = p.with_name(p.name.replace("llm_updown_sim_", "settlements_")
+                                .replace(".json", ".csv"))
+            if not s_csv.exists():
+                continue
+            with open(s_csv, newline="", encoding="utf-8") as fh:
+                for row in _csv.reader(fh):
+                    if not row or (header_written and row[0] == "ts"):
+                        continue
+                    if row[0] == "ts":
+                        if not header_written:
+                            w.writerow(row)
+                            header_written = True
+                        continue
+                    w.writerow(row)
+    print(f"  settlements all csv: {settle_all}")
     return 0
 
 
