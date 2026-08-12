@@ -20,7 +20,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--min-edge", type=float, default=0.04)
-    ap.add_argument("--wait", type=int, default=330)
+    ap.add_argument("--wait", type=int, default=480,
+                    help="开单后等待结算秒数（覆盖窗口剩余+结算延迟）")
     ap.add_argument("--size", type=float, default=1.0,
                     help="每笔固定仓位 USD（透传 simulate，默认 $1）")
     ap.add_argument("--out-dir", type=str, default="backtest_results",
