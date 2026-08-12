@@ -200,7 +200,7 @@ def main() -> int:
               f"edge={trades[-1]['edge']:+.3f} book={trades[-1]['book']}")
         if trades[-1]["llm_reason"]:
             print(f"      llm reason: {trades[-1]['llm_reason']}")
-    evaluations = [dict(e, round=round_no) for e in strat.last_evaluations]
+    evaluations = [dict(e, round=1) for e in strat.last_evaluations]
 
     # 等待结算并验证
     csv_fh = None
