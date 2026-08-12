@@ -55,19 +55,21 @@ def fetch_market_context(coin: str, window_s: int = 300) -> dict | None:
 
 def build_updown_prompt(coin: str, ctx: dict, market: Market, ref_yes: float,
                         secs_left: int) -> str:
-    """构造短期方向预测 prompt（真实行情数据 + 窗口信息）。"""
+    """构造短期方向预测 prompt（真实行情数据 + 窗口信息 + 概率锚定）。"""
     return (
         f"预测市场: {coin.upper()} 在未来 {secs_left} 秒内（窗口结算）是否上涨\n"
         f"窗口长度: {ctx['window_s']}s，剩余 {secs_left}s（已运行 {ctx['window_s'] - secs_left}s）\n"
-        f"市场隐含 P(涨): {ref_yes:.3f}\n"
+        f"市场隐含 P(涨): {ref_yes:.3f}（这是其他交易者的共识定价）\n"
         f"实时行情 ({ctx['symbol']}):\n"
         f"  当前价 {ctx['price']:.2f}\n"
         f"  近5分钟涨跌: {ctx['last5_chg']:+.2%}（分钟涨跌幅 {ctx['per_min']}，"
         f"涨{ctx['up_minutes']}根/跌{ctx['down_minutes']}根）\n"
         f"  5分钟振幅: {ctx['range5_pct']:.2%}\n"
-        f"市场状态: 问题={market.question} 结算={market.end_date}\n"
-        f"请判断窗口结算时上涨的概率（结合行情动量/振幅，可高于或低于市场隐含）。"
-        f"只输出 JSON: {{\"probability\": 0-1, \"reason\": \"一句话\"}}"
+        f"任务：结合行情动量给出你对结算时上涨的修正概率。\n"
+        f"约束（必须遵守）：\n"
+        f"1. 输出概率必须在 [0.02, 0.98] 区间内（极端确定性在短窗口不存在）\n"
+        f"2. 以市场隐含 {ref_yes:.3f} 为锚，你的修正幅度应在 ±0.25 以内\n"
+        f"3. 先给出理由再给概率，最后只输出 JSON: {{\"probability\": 0-1, \"reason\": \"一句话理由\"}}"
     )
 
 

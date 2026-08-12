@@ -94,6 +94,7 @@ def main() -> int:
     ap.add_argument("--wait", type=int, default=330, help="等待结算秒数（0=不等）")
     ap.add_argument("--min-edge", type=float, default=0.05)
     ap.add_argument("--coins", default=",".join(COINS))
+    ap.add_argument("--loop", type=int, default=1, help="连续轮数（每 5m 窗口一轮）")
     args = ap.parse_args()
     coins = [c for c in args.coins.split(",") if c]
     coin_map = {c: c for c in coins}
