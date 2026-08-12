@@ -5,9 +5,11 @@
 2. 每市场取 CLOB 订单簿 → 共识价（gamma ref）/ 盘口和 / 距结算秒数
 3. 事件检测：
    - ARB：YES+NO 共识价和 < 1 - min_edge（二元套利）
-   - DIP：价格相对上一轮跳变幅度 > dip_pct（DipArb 暴跌事件）
-   - TAIL：距结算 < tail_s 且价格动量 > tail_momentum（尾段动量）
-   - CROSS：同币 5m 与 15m 共识价差 > cross_diff（跨窗口分歧）
+   - DIP：价格相对上一轮跳变幅度 > dip_pct（价格跳变事件，仅观测）
+   - TAIL：距结算 < tail_s 且价格动量 > tail_momentum（尾段动量，仅观测）
+   注意：不再把 5m vs 15m 同币价差（CROSS）作为事件——两个窗口起点/终点
+   均不同，"涨"各自锚定各自窗口起点价，P(15m涨)>=P(5m涨) 不成立，
+   价差是窗口错位的正常定价差异，无套利含义。
 4. 累积记录追加到 CSV；事件写入 JSON
 
 结果保留: backtest_results/updown_monitor_<ts>.csv / .json
@@ -129,14 +131,15 @@ def main() -> int:
                         mom = (m["ref_yes"] - prev_t) / prev_t if prev_t else 0
                         if abs(mom) >= args.tail_momentum:
                             ev_flags.append(f"TAIL{mom:+.1%}")
-                # 4) 跨窗口价差
+                # 4) 跨窗口价差：仅记录数据（CSV 列），不再作为事件——
+                #    5m 与 15m 窗口起点/终点不同，价差无套利含义
                 pair = f"{coin}-updown-{'5m' if window == '15m' else '15m'}-"
                 other = [k for k in markets if k.startswith(pair)]
                 if other:
                     o = markets[other[0]]
                     diff = abs(m["ref_yes"] - o["ref_yes"])
                     if diff >= args.cross_diff:
-                        ev_flags.append(f"CROSS{diff:.2f}")
+                        ev_flags.append(f"CROSS{diff:.2f}")  # 仅观测标记，非交易信号
 
                 writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%SZ"), window, coin,
                                  slug, m["end_ts"], secs_left,
