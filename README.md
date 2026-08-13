@@ -103,23 +103,52 @@ scripts/
 .venv/bin/python scripts/run_polytrader.py llm --proxy socks5h://127.0.0.1:7890
 ```
 
-### 实盘交易（live）
+### 实盘交易（live / CLOB V2）
 
-> ⚠️ **真金白银**。启用前必须：① Polymarket **测试网**全链路验证签名/下单/成交；
-> ② 钱包备好 Polygon 上 **USDC**（支付）+ **POL**（gas）；③ 长期用 paper 验证策略有正期望。
+> ⚠️ **真金白银**。Polymarket 已于 2026 年迁移到 **CLOB V2**（pUSD 结算、deposit wallet
+> 账户模型、POLY_* L2 认证、ERC-7739 订单签名）。以下为已**实测打通**的完整链路。
+
+**账户模型（V2）**：用户 EOA（签名者）→ Polymarket 自动部署 **deposit wallet**
+（链上合约，`0x00000000000Fb5C9ADea0298D729A0CB3823Cc07` 工厂 CREATE2 部署，
+充值/下单资金都在 deposit wallet）。订单由 EOA 签 ERC-7739-wrapped 签名
+（signatureType=3 / POLY_1271），maker = signer = deposit wallet 地址。
 
 **启用步骤**：
-1. `.env` 填写 `POLYMARKET_PRIVATE_KEY`（Polygon 私钥）+ `POLYMARKET_API_KEY/SECRET/PASSPHRASE`
-   （官网 Portfolio 生成；也可留空三元组，代码支持用私钥自动派生）
-2. `config/config.yaml` 的 `live.enabled: true`（**env 无法覆盖，只能改文件**）
-3. 运行实盘（下单前终端会要求输入 `yes` 确认，且每笔有 `max_order_usd` 硬上限）
+1. `.env` 填写：
+   - `POLYMARKET_PRIVATE_KEY`（EOA 私钥，签名者）
+   - `POLYMARKET_DEPOSIT_WALLET`（deposit wallet 地址，从 polymarket.com Settings→Wallet 复制）
+   - `POLYMARKET_RELAYER_API_KEY` / `_ADDRESS`（settings?tab=api-keys 创建，gasless 钱包操作）
+2. 充值 pUSD 到 deposit wallet（三选一）：
+   - 官方桥 API：`POST https://bridge.polymarket.com/deposit`（BSC/ETH 等跨链，最小 $5，
+     自动兑换 pUSD）；或链上脚本 `scripts/fund_deposit.py`（Polygon USDC→pUSD 自动转入）
+3. 下单验证：`scripts/verify_live_order_v2.py`（自动取窗口/价格，FOK $1）
 
-**安全护栏（不可绕过）**：无凭证拒绝 / 单笔 > `live.max_order_usd`（默认 $10）拒绝 /
-价格不在 `[0.03, 0.97]` 拒绝 / 可用 USDC 不足拒绝 / 需交互确认 / 不自动重试下单 /
-实盘部分成交**不自动回滚**（真实成交不可撤销，告警人工处理）。
+**CLOB V2 认证（新协议）**：
+- L1：ClobAuth EIP-712 签名 → `GET /auth/derive-api-key`（POLY_ADDRESS/SIGNATURE/TIMESTAMP/NONCE 头）
+- L2：`POLY_*` 5 头 + HMAC-SHA256（message = timestamp + METHOD + path + body，
+  secret 为 urlsafe base64）
 
-**实现**：`execution/signer.py`（EIP-712 签名 + L1/L2 认证 + 凭证派生）、
-`data/clob_client.py`（place/cancel/get_order/balance）、`execution/broker.py`（LiveBroker）。
+**订单（V2）**：11 字段 signed struct（salt/maker/signer/tokenId/makerAmount/takerAmount/
+side/signatureType/timestamp/metadata/builder），domain version "2"，
+verifyingContract = CTF Exchange V2（`0xE111180000d2663C0091e4f400237545B87B996B`）。
+deposit wallet 订单签名 = ERC-7739 wrapped（EOA 签嵌套 TypedDataSign，636 hex 字符），
+与官方 `@polymarket/clob-client-v2` **逐字节一致**（单测交叉验证）。
+精度：USD ≤2 位小数、shares ≤4 位小数；FOK/marketable BUY 最小 $1；每单有手续费
+（fee estimate ~$0.03）。
+
+**已实测（2026-08-14，$1 真实成交）**：
+认证 → 签名 → 下单（200 matched）→ 链上成交（tx status=1）→ 持仓 2.2222 shares
+全链路打通。充值：`fund_deposit.py`（USDC→pUSD 经 Paraswap 聚合器，$1.10 → 1.0999 pUSD，
+几乎无损）。
+
+**实现**：`execution/order_v2.py`（V2 订单 + ERC-7739 签名）、`execution/chain.py`
+（链上广播：sign + eth_sendRawTransaction + RPC 轮换）、`execution/relayer.py`
+（gasless 钱包操作）、`execution/signer.py`（ClobAuth + POLY_* L2 HMAC）、
+`data/clob_client.py`（post/get/cancel order V2）、`scripts/fund_deposit.py`（充值）、
+`scripts/verify_live_order_v2.py`（下单验证）。
+
+**安全护栏**：凭证只存 `.env`（gitignore）；`SENSITIVE_FIELDS` 遮盖；链上交易
+（充值/swap）每次展示交易内容；真实下单前需确认。
 
 ### updown 5/15 分钟快速市场（专项工具链）
 

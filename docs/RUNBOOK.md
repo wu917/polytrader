@@ -218,3 +218,55 @@ grep '"event": "llm_call"' logs/llm_daemon_*/audit_all.jsonl | grep <trade_id �
 4. 浏览器打开 `http://127.0.0.1:8787` —— 确认面板数据在更新
 5. 若连续多轮 0 交易：检查 min_edge 是否过高或 LLM 服务异常（audit_all 中 llm_call 占比）
 6. 每周：跑 `summarize_rounds.py` 汇总收益率，评估策略是否继续
+
+## 9. 实盘（CLOB V2）充值 + 下单操作
+
+> 前提：`.env` 已配 `POLYMARKET_PRIVATE_KEY` / `POLYMARKET_DEPOSIT_WALLET` /
+> `POLYMARKET_RELAYER_API_KEY(_ADDRESS)`。所有操作均为**真实资金/链上交易**，
+> 执行前确认交易内容。
+
+### 9.1 查余额（只读）
+```bash
+PYTHONPATH=. .venv/bin/python -c "
+from polytrader.execution import chain
+print('EOA pUSD:', chain.call_balance(chain.PUSD, '0x<你的EOA>')/1e6)
+print('deposit pUSD:', chain.call_balance(chain.PUSD, '0x<deposit wallet>')/1e6)"
+```
+
+### 9.2 充值（Polygon USDC → pUSD 自动转入 deposit wallet）
+```bash
+PYTHONPATH=. .venv/bin/python scripts/fund_deposit.py --amount 1.10   # 充值 $1.10
+PYTHONPATH=. .venv/bin/python scripts/fund_deposit.py --dry-run       # 只报价不广播
+```
+流程：approve USDC → Paraswap swap（USDC→pUSD，几乎 1:1）→ transfer pUSD → deposit wallet。
+EOA 需留 ~1 POL 付 gas。官方桥 API（BSC 等跨链，最小 $5）：
+```bash
+curl -X POST https://bridge.polymarket.com/deposit -H "Content-Type: application/json" \
+  -d '{"address": "<deposit wallet>"}'        # 拿桥地址
+curl https://bridge.polymarket.com/supported-assets   # 确认支持链/最小额
+curl "https://bridge.polymarket.com/status/<桥地址>"   # 查到账进度
+```
+
+### 9.3 下单（FOK $1，自动取当前 btc 5m 窗口）
+```bash
+PYTHONPATH=. .venv/bin/python scripts/verify_live_order_v2.py
+```
+成功：HTTP 200 + `"status":"matched"` + `transactionsHashes`（链上成交）。
+注意：FOK 必须能立即全部成交；窗口临结束（盘口单边）会 400 "couldn't be fully filled"，
+等新窗口重试即可。余额不足会报 `not enough balance / allowance`（需先充值）。
+
+### 9.4 查订单/持仓/结算
+```bash
+# 持仓（只读，无需认证）
+curl "https://data-api.polymarket.com/positions?user=<deposit wallet>&limit=10"
+# 结算：gamma 该市场 outcomePrices 变 0.0/1.0 即定盘
+```
+
+### 9.5 关键坑位（已踩过）
+- tokenId 在 POST body 必须是**字符串**（大整数 int 序列化 → 400 Invalid order payload）
+- USD ≤2 位小数、shares ≤4 位小数；FOK BUY 最小 $1（$0.99 会被拒）
+- 每单有 ~$0.03 手续费（余额需覆盖 order + fee）
+- ERC-7739 签名必须由 **EOA** 签嵌套 TypedDataSign（maker=signer=deposit wallet，
+  verifyingContract=CTF Exchange V2）；与官方 SDK 逐字节一致（单测交叉验证）
+- 链上广播：raw tx 需 0x 前缀；swap 交易 gas 需 estimate（300k 默认会 out of gas）
+- RPC 走系统代理时偶发 SSL EOF → 已做多端点轮换容错

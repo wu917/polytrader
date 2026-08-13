@@ -4,7 +4,7 @@ import pytest
 from polytrader.execution import order_v2
 
 SK = "0x" + "22" * 32
-DEPOSIT = "0x0b6b3a3103747f8fdb6686c1443f55d6eb1bb4fd"
+DEPOSIT = "0x1111111111111111111111111111111111111111"   # 测试用地址
 EXCH = order_v2.CTF_EXCHANGE_V2
 TOKEN = str(int("0x" + "ab" * 32, 16))
 
