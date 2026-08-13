@@ -90,12 +90,16 @@ def cmd_stop():
         os.kill(pid, signal.SIGTERM)
         for _ in range(50):
             if not _alive(pid):
+                PID_FILE.unlink(missing_ok=True)
                 print(f"daemon stopped (pid {pid})")
                 return 0
             time.sleep(0.2)
         os.kill(pid, signal.SIGKILL)
+        PID_FILE.unlink(missing_ok=True)
         print(f"daemon killed (pid {pid})")
         return 0
+    if pid:
+        PID_FILE.unlink(missing_ok=True)   # 清理 stale pid 文件
     print("daemon not running")
     return 1
 
