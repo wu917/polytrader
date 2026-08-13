@@ -101,20 +101,42 @@ polytrader/
 # 3) LLM 模拟测算：最新盘口 → LLM 判断 → 模拟成交（$1/笔）→ 等结算 → 盈亏
 .venv/bin/python scripts/simulate_llm_updown.py --wait 480
 
-# 4) 连续挂机（每 5m 窗口一轮，单日志/单结果/单审计输出）
-.venv/bin/python scripts/run_llm_loop.py --rounds 20 --out-dir backtest_results
+# 4) 守护进程挂机（推荐）：持续后台执行 + 统一日志 + 崩溃自动重启
+.venv/bin/python scripts/run_daemon.py start   # 无限轮（每 5m 窗口一轮，窗口内 60s 高频扫描）
+.venv/bin/python scripts/run_daemon.py status  # 运行状态 + 最新统计
+.venv/bin/python scripts/run_daemon.py stop    # SIGTERM 优雅停止
 
-# 5) 补结算（等待期未结算的交易事后补查）
-.venv/bin/python scripts/backfill_settlements.py
+# 5) 补结算（等待期未结算的交易事后补查，幂等）
+.venv/bin/python scripts/backfill_settlements.py --results <results.jsonl>
+
+# 6) 旧版单会话挂机（测试/临时用，建议用 4）
+.venv/bin/python scripts/run_llm_loop.py --rounds 20 --out-dir backtest_results
 ```
 
-**挂机输出规范（单文件）**——`backtest_results/` 下：
-- `llm_loop_<ts>.log`：**单日志**（挂机自身输出 + 每轮 simulate stdout/stderr）
-- `llm_results_<ts>.jsonl`：**单结果**（`round` / `trade_settled` / `summary` 事件流）
-- `audit_all_<ts>.jsonl`：**单审计**（每次 HTTP/LLM 调用：URL、参数、状态、耗时、
-  响应摘要；LLM 的 probability + reason + usage）
-- `settlements_<ts>.csv`：结算明细（trade_id/slug/side/entry/settle/pnl，独立 CSV）
-- `seen_slugs.txt`：已交易盘口去重（跨轮持久，每盘口只开一单）
+### Web 统计面板
+
+```bash
+.venv/bin/python scripts/web_dashboard.py --port 8787   # 浏览器打开 http://127.0.0.1:8787
+```
+
+- **统一结果展示**：胜率 / 总盈亏 / 收益率 / 胜-负 / 投入 卡片 + 累计盈亏 SVG 曲线 +
+  分币种、分方向统计 + 交易明细表（5s 自动刷新，无外部依赖）
+- 数据源自动选择**最新守护会话**（`logs/llm_daemon_*/llm_results.jsonl`），回退到
+  `backtest_results/llm_results_*.jsonl`
+- 接口：`/`（页面）、`/api/stats`（聚合 JSON）、`/api/sessions`（会话列表）
+
+### 守护进程输出规范（单目录，一处看全部日志）
+
+```
+logs/llm_daemon_<ts>/          ← 每次 start 一个会话目录
+├── daemon.log                 ← 全部输出（轮次/扫描/信号/错误/心跳）集中查看
+├── llm_results.jsonl          ← 结果事件流（round / trade_settled / heartbeat / summary）
+├── audit_all.jsonl            ← 调用级审计（http_request / llm_call / trade_open）
+├── status.json                ← 实时快照（rounds/trades/win_rate/pnl），status 命令读取
+├── llm_loop_*.log             ← 每轮 run_llm_loop 明细
+├── seen_slugs.txt             ← 已交易盘口去重（跨轮持久，每盘口只开一单）
+└── rounds_tmp/                ← 每轮临时产物（合并后清理）
+```
 
 **关键行为约束**：
 - 每盘口只开一单（seen-file 持久去重）
@@ -138,7 +160,10 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
 
 ## 实测发现与结论（截至 2026-08-12）
 
-详见 `docs/updown-strategies-report.md`，要点：
+> 📖 日常运维请直接看 **[docs/RUNBOOK.md](docs/RUNBOOK.md)**（守护进程/面板/日志/故障排查完整手册）；
+> 策略调研详见 [docs/updown-strategies-report.md](docs/updown-strategies-report.md)。
+
+要点：
 
 1. **updown 市场已上线**：7 币 × 5M/15M 滚动窗口，数据在 `/events/keyset`；
    盘口为空壳（bid 0.001-0.01 / ask 0.99+），taker 不可行、只能 maker 限价单
@@ -148,8 +173,9 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
 4. **结算锚 = Chainlink 30s TWAP**（2026-08-07 升级，实测一致性 72.7% vs 瞬时 54.5%）：
    "Binance 瞬时价滞后套利"已失效，新 edge = TWAP 预测精度
 5. **结算推价操纵已关闭**（斯坦福论文 $8.2M 事件后 TWAP 生效）
-6. **LLM 判断无 alpha**：20 轮挂机 9 笔 8 结算 4W/4L（50%，$1/笔 -$0.55）；
-   首次 LLM 输出退化（全 0.001）经 prompt 加固后修复（极端值 100%→6%）
+6. **LLM 判断无稳定 alpha（诚实结论）**：早期 20 轮 9 笔 8 结算 4W/4L（50%，-$0.55）；
+   高频扫描后 10 轮 11 笔 7W4L 63.6% +$7.54、daemon 5 轮 3 笔 3W0L +$2.80——
+   样本仍小，盈亏在运气范围内波动（首次 LLM 输出退化经 prompt 加固后修复）
 7. **收敛/确定性折价无利可图**：尾段 ≥0.9 侧买入胜率 100% 但折价仅 0.1-0.2%
 
 ## 配置
