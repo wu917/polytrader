@@ -53,8 +53,10 @@ def main() -> int:
         results_path = sorted(Path("backtest_results").glob("llm_results_*.jsonl"))[-1]
     print(f"results: {results_path.name}")
 
-    # 收集未结算交易（round 事件里的 trades + pnl=null）
+    # 收集未结算交易（round 事件里的 trades + pnl=null），
+    # 跳过已 backfill 过的（results 中已有 trade_settled 事件）
     pending = {}
+    settled_ids = set()
     for line in results_path.read_text().splitlines():
         try:
             rec = json.loads(line)
@@ -64,6 +66,11 @@ def main() -> int:
             for t in rec.get("trades", []):
                 if t.get("pnl") is None:
                     pending[t["slug"]] = t
+        elif rec.get("type") == "trade_settled":
+            if rec.get("trade_id"):
+                settled_ids.add(rec["trade_id"])
+    pending = {s: t for s, t in pending.items()
+               if t.get("trade_id") not in settled_ids}
     print(f"pending unsettled trades: {len(pending)}")
 
     ts = time.strftime("%Y%m%d_%H%M%S")

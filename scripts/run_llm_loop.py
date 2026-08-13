@@ -28,6 +28,10 @@ def main() -> int:
                     help="所有输出目录（日志/结果/审计/临时轮次）")
     ap.add_argument("--windows", type=str, default="5m,15m",
                     help="参与的市场窗口（透传 simulate）")
+    ap.add_argument("--scan-interval", type=int, default=60,
+                    help="窗口内扫描间隔秒（0=每窗口仅扫 1 次）")
+    ap.add_argument("--settle-wait", type=int, default=180,
+                    help="窗口结束后等待结算秒数（再跑 backfill 补结算）")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -56,26 +60,19 @@ def main() -> int:
     for p in run_dir.glob("*"):
         p.unlink()
 
-    for i in range(1, args.rounds + 1):
-        log(f"=== LOOP {i}/{args.rounds} ===")
-        proc = subprocess.run(
+    def run_simulate(wait: int) -> subprocess.CompletedProcess:
+        """启动一轮 simulate（wait=0 快速扫描只开单；>0 等待结算）。"""
+        return subprocess.run(
             [sys.executable, "scripts/simulate_llm_updown.py",
-             "--wait", str(args.wait), "--min-edge", str(args.min_edge),
+             "--wait", str(wait), "--min-edge", str(args.min_edge),
              "--size", str(args.size), "--audit-dir", str(run_dir),
              "--seen-file", str(out_dir / "seen_slugs.txt"),
              "--windows", args.windows],
-            cwd=ROOT, capture_output=True, text=True, timeout=args.wait + 240,
+            cwd=ROOT, capture_output=True, text=True, timeout=max(wait, 60) + 240,
         )
-        # 本轮输出全部写入日志文件
-        for line in proc.stdout.splitlines():
-            log("  " + line)
-        if proc.stderr.strip():
-            for line in proc.stderr.splitlines()[-20:]:
-                log("  ERR " + line)
-        if proc.returncode != 0:
-            log(f"  round failed rc={proc.returncode}")
-            continue
-        # 收集本轮结果（simulate 写入 run_dir 的 JSON）
+
+    def collect_round(i: int):
+        """收集本轮 simulate 产物：结果 JSONL 事件 + 结算 CSV + 审计合并。"""
         for sim in sorted(run_dir.glob("llm_updown_sim_*.json"),
                           key=lambda p: p.stat().st_mtime):
             try:
@@ -88,7 +85,6 @@ def main() -> int:
                   "evaluations": d.get("evaluations", []),
                   "config": d.get("config", {})})
             sim.unlink()
-        # 结算 CSV 行并入结果文件（保留 CSV 原始文件）
         for s_csv in sorted(run_dir.glob("settlements_*.csv")):
             import csv as _csv
             with open(s_csv, newline="", encoding="utf-8") as fh:
@@ -102,16 +98,59 @@ def main() -> int:
                           "settle_yes": row[8] or None, "win": row[9] or None,
                           "pnl": row[10] or None})
             s_csv.unlink()
-        # 审计合并到单审计文件
         for a in sorted(run_dir.glob("audit_llm_*.jsonl")):
             with open(a, encoding="utf-8") as fh, \
                     open(audit_all, "a", encoding="utf-8") as out_fh:
                 for line in fh:
                     out_fh.write(line)
             a.unlink()
-        if i < args.rounds:
-            log("  waiting for next 5m window...")
-            time.sleep(30)
+
+    # ---- 主循环：每轮 = 一个 5m 窗口（窗口内按 scan_interval 多次扫描）----
+    win_secs = 300 if "5m" in args.windows else 900
+    for i in range(1, args.rounds + 1):
+        log(f"=== LOOP {i}/{args.rounds} ===")
+        # 对齐到下一个 5m 窗口开始（窗口时间戳变化后才开始扫描）
+        now = int(time.time())
+        w_start = ((now // 300) + 1) * 300
+        sleep_secs = w_start - now + 2
+        log(f"  waiting {sleep_secs}s for next window start ({w_start})")
+        time.sleep(sleep_secs)
+        w_end = w_start + win_secs
+        log(f"  window {w_start} -> {w_end}")
+
+        scans = 0
+        while True:
+            now = int(time.time())
+            if now > w_end - 30:          # 窗口结束前 30s 停止扫描
+                break
+            scans += 1
+            log(f"  scan {scans} @ {time.strftime('%H:%M:%S')}")
+            proc = run_simulate(0)        # 快速扫描：只开单不等待
+            for line in proc.stdout.splitlines():
+                log("  " + line)
+            if proc.stderr.strip():
+                for line in proc.stderr.splitlines()[-20:]:
+                    log("  ERR " + line)
+            if proc.returncode != 0:
+                log(f"  scan failed rc={proc.returncode}")
+            collect_round(i)
+            if args.scan_interval <= 0:
+                break
+            time.sleep(args.scan_interval)
+
+        # 窗口结束：等结算上链 + backfill 补结算
+        log(f"  window ended, waiting {args.settle_wait}s for settlement...")
+        time.sleep(args.settle_wait)
+        bf = subprocess.run(
+            [sys.executable, "scripts/backfill_settlements.py",
+             "--results", str(results_file)],
+            cwd=ROOT, capture_output=True, text=True, timeout=180,
+        )
+        for line in bf.stdout.splitlines():
+            log("  " + line)
+        if bf.stderr.strip():
+            for line in bf.stderr.splitlines()[-10:]:
+                log("  ERR " + line)
 
     # 最终汇总（从结果文件统计）
     trades = []
