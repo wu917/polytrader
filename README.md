@@ -102,14 +102,22 @@ polytrader/
 .venv/bin/python scripts/simulate_llm_updown.py --wait 480
 
 # 4) 守护进程挂机（推荐）：持续后台执行 + 统一日志 + 崩溃自动重启
-.venv/bin/python scripts/run_daemon.py start   # 无限轮（每 5m 窗口一轮，窗口内 60s 高频扫描）
+.venv/bin/python scripts/run_daemon.py start   # 无限轮（每 5m 窗口一轮，窗口内 30s 扫描）
 .venv/bin/python scripts/run_daemon.py status  # 运行状态 + 最新统计
 .venv/bin/python scripts/run_daemon.py stop    # SIGTERM 优雅停止
 
-# 5) 补结算（等待期未结算的交易事后补查，幂等）
+# 4.5) 常驻结算进程：主任务只开单，结算由它独立持续处理（任务退出后继续结算）
+#       run_llm_loop / run_daemon 启动时自动拉起，一般无需手动启动
+.venv/bin/python scripts/settle_worker.py status  # 查看运行状态 + pending 单数
+.venv/bin/python scripts/settle_worker.py stop    # 停止常驻结算（pending 会保留）
+# 待结算队列存于本地 MySQL：polytrader.pending_trades 表（多进程共享，不随任务删除）
+# MySQL 连接参数可用 POLY_DB_HOST/PORT/USER/PASS/NAME 环境变量覆盖（默认 127.0.0.1:3306 root 空密码）
+
+# 5) 补结算（仅当结算进程未运行时需要手动补查，幂等）
 .venv/bin/python scripts/backfill_settlements.py --results <results.jsonl>
 
-# 6) 旧版单会话挂机（测试/临时用，建议用 4）
+# 6) 多轮循环测试（不对齐整点、窗口内 30s 扫描、开单即交常驻结算，测试/临时用，长跑建议用 4）
+#    常用参数：--scan-interval 30（窗口内扫描间隔）--stop-before 40（窗口结束前停止秒数）
 .venv/bin/python scripts/run_llm_loop.py --rounds 20 --out-dir backtest_results
 ```
 

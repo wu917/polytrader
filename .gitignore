@@ -11,6 +11,9 @@ models/
 backtest_results/
 *.pkl
 *.log
+# 全局待结算队列与结算进程状态
+pending_trades.jsonl
+settle_worker.pid
 
 # 测试缓存
 .pytest_cache/

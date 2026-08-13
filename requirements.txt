@@ -10,3 +10,4 @@ lightgbm>=4.3.0
 scikit-learn>=1.3.0
 python-socks>=2.0.0     # websocket-client 的 socks 代理支持（python_socks 模块）
 pytest>=7.4.0
+pymysql>=1.1.0  # 已开单队列的 MySQL 存储

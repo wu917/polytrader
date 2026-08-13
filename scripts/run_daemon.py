@@ -189,11 +189,12 @@ def cmd_start(args) -> int:
         round_no += 1
         try:
             log(f"=== ROUND {round_no} ===")
-            # 复用 run_llm_loop（--rounds 1：等窗口开始→窗口内多次扫描→结算）
+            # 复用 run_llm_loop（--rounds 1：当前窗口内多次扫描→开单→收尾；
+            # 结算由常驻 settle_worker 处理，本 daemon 不等待结算）
             cmd = [sys.executable, "scripts/run_llm_loop.py",
                    "--rounds", "1", "--min-edge", str(args.min_edge),
                    "--windows", args.windows, "--scan-interval", str(args.scan_interval),
-                   "--settle-wait", str(args.settle_wait), "--size", str(args.size),
+                   "--size", str(args.size),
                    "--out-dir", str(session_dir)]
             proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                                   timeout=3600)
@@ -254,8 +255,9 @@ def main() -> int:
     ap.add_argument("action", choices=["start", "stop", "status"])
     ap.add_argument("--min-edge", type=float, default=0.04)
     ap.add_argument("--windows", type=str, default="5m")
-    ap.add_argument("--scan-interval", type=int, default=60)
-    ap.add_argument("--settle-wait", type=int, default=180)
+    ap.add_argument("--scan-interval", type=int, default=30)
+    ap.add_argument("--settle-wait", type=int, default=180,
+                    help="[已弃用] 结算已由常驻 settle_worker 处理，此参数不再生效")
     ap.add_argument("--size", type=float, default=1.0)
     ap.add_argument("--max-rounds", type=int, default=0,
                     help="0=无限（默认），>0 跑完自动退出（测试用）")
