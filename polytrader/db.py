@@ -36,10 +36,13 @@ def insert_pending(recs: list[dict]) -> int:
         return 0
     sql = ("INSERT IGNORE INTO pending_trades "
            "(trade_id, slug, coin, `window`, side, entry_price, size_usd, "
-           "round, results_file, mode, order_id, order_status) "
+           "round, results_file, mode, order_id, order_status, "
+           "fill_price, fill_tx, llm_p, ref_price, edge, llm_reason, llm_model) "
            "VALUES (%(trade_id)s, %(slug)s, %(coin)s, %(window)s, %(side)s, "
            "%(entry_price)s, %(size_usd)s, %(round)s, %(results_file)s, "
-           "%(mode)s, %(order_id)s, %(order_status)s)")
+           "%(mode)s, %(order_id)s, %(order_status)s, "
+           "%(fill_price)s, %(fill_tx)s, %(llm_p)s, %(ref_price)s, %(edge)s, "
+           "%(llm_reason)s, %(llm_model)s)")
     rows = []
     for r in recs:
         rows.append({
@@ -51,11 +54,33 @@ def insert_pending(recs: list[dict]) -> int:
             "mode": r.get("mode", "simulate"),
             "order_id": r.get("order_id"),
             "order_status": r.get("order_status"),
+            "fill_price": r.get("fill_price"),
+            "fill_tx": r.get("fill_tx"),
+            "llm_p": r.get("llm_p"),
+            "ref_price": r.get("ref_price"),
+            "edge": r.get("edge"),
+            "llm_reason": r.get("llm_reason"),
+            "llm_model": r.get("llm_model"),
         })
     conn = connect()
     try:
         with conn.cursor() as cur:
             cur.executemany(sql, rows)
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def mark_filled(trade_id: str, fill_price: float | None,
+                fill_tx: str | None = None) -> int:
+    """更新实盘单实际成交价/成交 tx（成交后回写）。"""
+    sql = ("UPDATE pending_trades SET fill_price=%(fp)s, fill_tx=%(tx)s "
+           "WHERE trade_id=%(tid)s")
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"fp": fill_price, "tx": fill_tx, "tid": trade_id})
+        conn.commit()
         return cur.rowcount
     finally:
         conn.close()

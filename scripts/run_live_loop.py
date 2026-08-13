@@ -31,6 +31,22 @@ from scripts.simulate_llm_updown import (  # noqa: E402
     COINS, LLMUpdownStrategy, fetch_windows)
 
 
+class _Tee:
+    """同时写 stdout 和日志文件（--log 时使用）。"""
+
+    def __init__(self, path: str):
+        self.fh = open(path, "a", encoding="utf-8")
+
+    def write(self, s: str):
+        sys.__stdout__.write(s)
+        self.fh.write(s)
+        self.fh.flush()
+
+    def flush(self):
+        sys.__stdout__.flush()
+        self.fh.flush()
+
+
 def _req(method: str, url: str, **kw):
     for i in range(4):
         try:
@@ -87,7 +103,13 @@ def main() -> int:
     ap.add_argument("--min-edge", type=float, default=0.04)
     ap.add_argument("--coins", type=str, default=",".join(COINS))
     ap.add_argument("--per-round", type=int, default=1, help="每轮最多开几笔")
+    ap.add_argument("--market", action="store_true",
+                    help="市价化：BUY 直接 0.99 激进吃单（FOK 全成或撤）")
+    ap.add_argument("--log", type=str, default="",
+                    help="日志文件路径（输出同时写文件，默认只输出到 stdout）")
     args = ap.parse_args()
+    if args.log:
+        sys.stdout = _Tee(args.log)  # type: ignore[assignment]
 
     pk = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit = os.environ.get("POLYMARKET_DEPOSIT_WALLET", "").strip()
@@ -148,10 +170,14 @@ def main() -> int:
                 m = s.market
                 idx = 0 if side_str == "YES" else 1
                 token_id = m.outcomes[idx].token_id
-                price = round(min(0.99, float(s.market_price) + 0.01), 3)
+                if args.market:
+                    # 市价化：直接 0.99 吃单（空壳盘口只有 0.99 有卖单）
+                    price = 0.99
+                else:
+                    price = round(min(0.99, float(s.market_price) + 0.01), 3)
                 print(f"  {m.slug} {side_str} llm_p={s.extra.get('llm_p',0):.3f} "
                       f"ref={s.market_price:.3f} edge={s.edge:+.3f} "
-                      f"BUY@{price} ${args.size}")
+                      f"BUY@{price} ${args.size} {'[市价]' if args.market else ''}")
                 resp = place_fok(creds, eoa, pk, deposit, token_id,
                                  order_v2.BUY, args.size, price)
                 print(f"    POST /order: {resp['status_code']}")
@@ -161,6 +187,17 @@ def main() -> int:
                 except Exception:
                     body = {}
                 if resp["status_code"] == 200 and body.get("success"):
+                    # 实际成交价：BUY 时 making(USD) / taking(shares)
+                    try:
+                        fill_price = round(
+                            float(body.get("makingAmount", 0)) /
+                            float(body.get("takingAmount", 1)), 4)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        fill_price = None
+                    tx_hash = None
+                    txs = body.get("transactionsHashes") or []
+                    if txs:
+                        tx_hash = txs[0]
                     rec = {
                         "trade_id": str(uuid.uuid4())[:8],
                         "slug": m.slug,
@@ -173,18 +210,28 @@ def main() -> int:
                         "mode": "live",
                         "order_id": body.get("orderID"),
                         "order_status": body.get("status"),
+                        "llm_p": round(float(s.extra.get("llm_p", 0)), 4),
+                        "ref_price": round(float(s.market_price), 4),
+                        "edge": round(float(s.edge), 4),
+                        "llm_reason": s.extra.get("llm_reason"),
+                        "llm_model": s.extra.get("model"),
                         "results_file": str(ROOT / "backtest_results"
                                             / f"llm_results_live_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"),
                     }
                     db.insert_pending([rec])
+                    if fill_price is not None:
+                        db.mark_filled(rec["trade_id"], fill_price, tx_hash)
                     results.append({"round": rnd, "slug": m.slug, "side": side_str,
                                     "llm_p": s.extra.get("llm_p"),
                                     "ref": s.market_price, "edge": s.edge,
                                     "orderID": body.get("orderID"),
-                                    "status": body.get("status")})
+                                    "status": body.get("status"),
+                                    "fill_price": fill_price,
+                                    "tx": tx_hash})
                     placed += 1
                     print(f"    ✅ 成交 {body.get('orderID','')[:20]}... "
-                          f"status={body.get('status')}")
+                          f"status={body.get('status')} "
+                          f"fill_price=${fill_price} tx={tx_hash[:18] if tx_hash else '?'}...")
                 else:
                     print(f"    ❌ 下单失败: {resp['body'][:200]}")
             if rnd < args.rounds:

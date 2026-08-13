@@ -181,7 +181,7 @@ def main() -> int:
     already = sum(1 for s in markets if s in seen)
     markets = {slug: m for slug, m in markets.items() if slug not in seen}
     print(f"windows: {len(markets)} markets (after dedup, already traded: {already})")
-    # 盘口快照（记录，模拟成交用 ref 价近似——空壳盘口 taker 不可行）
+    # 盘口快照（模拟市价单成交：吃单侧盘口价，总是成交——与实盘市价化一致）
     books = {}
     for m in markets.values():
         try:
@@ -192,20 +192,41 @@ def main() -> int:
         except Exception:
             pass
 
+    def sim_market_price(book: dict | None, side: str, ref: float) -> float:
+        """模拟市价单成交价：YES→ask；NO→1-bid（总成交，反映吃单成本）。
+        盘口无数据时回退 ref 价。
+        """
+        px = None
+        if book:
+            if side == "YES":
+                px = book.get("ask")
+            else:
+                bid = book.get("bid")
+                px = (1.0 - bid) if bid is not None else None
+        if px is None:
+            px = float(ref)
+        return round(min(px, 0.97), 4)
+
     signals = strat.scan(list(markets.values()))
     print(f"signals: {len(signals)}")
     trades = []
     for s in signals:
+        side = s.extra.get("side")
+        fill = sim_market_price(books.get(s.market.condition_id), side,
+                                s.market_price) if side else None
+        if fill is None:
+            continue
         trade_id = str(uuid.uuid4())[:8]
         trades.append({"trade_id": trade_id,
                        "slug": s.market.slug, "condition_id": s.market.condition_id,
                        "coin": s.market.slug.split("-")[0],
                        "window": "5m" if "-5m-" in s.market.slug else "15m",
-                       "side": s.extra.get("side"), "llm_p": round(s.extra.get("llm_p", 0), 4),
+                       "side": side, "llm_p": round(s.extra.get("llm_p", 0), 4),
                        "ref": round(s.market_price, 4), "edge": round(s.edge, 4),
-                       "size_usd": size_usd, "entry_price": round(s.market_price, 4),
+                       "size_usd": size_usd, "entry_price": fill,
                        "reason": s.reason,
                        "llm_reason": s.extra.get("llm_reason"),
+                       "model": s.extra.get("model"),
                        "book": books.get(s.market.condition_id)})
         audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
                "event": "trade_open", "trade_id": trade_id,

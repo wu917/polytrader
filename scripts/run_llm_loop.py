@@ -124,7 +124,14 @@ def main() -> int:
                 "trade_id", "slug", "coin", "window",
                 "side", "entry_price", "size_usd")} | {
                 "round": round_no,
-                "results_file": str(results_file)})
+                "results_file": str(results_file),
+                "mode": "simulate",
+                "llm_p": t.get("llm_p"),
+                "ref_price": t.get("ref"),
+                "edge": t.get("edge"),
+                "llm_reason": t.get("llm_reason") or t.get("reason"),
+                "llm_model": t.get("model"),
+            })
         if not new:
             return
         try:

@@ -37,14 +37,20 @@ class ChainError(RuntimeError):
 
 
 def _rpc(method: str, params: list, rpc: str | None = None) -> dict:
-    """RPC 调用，多端点轮换 + 代理抖动容错。"""
+    """RPC 调用，多端点轮换 + 代理抖动容错。
+
+    公共 RPC 直连（trust_env=False，不走系统代理）—— 实测代理对多数
+    Polygon RPC 域名不稳定（SSL EOF），直连 publicnode 反而稳定。
+    """
     candidates = [rpc] if rpc else POLYGON_RPCS
     last_err: Exception | None = None
     for rpc_url in candidates:
         try:
-            r = requests.post(rpc_url, json={"jsonrpc": "2.0", "id": 1,
-                                             "method": method,
-                                             "params": params}, timeout=20)
+            s = requests.Session()
+            s.trust_env = False  # 直连，绕过系统代理
+            r = s.post(rpc_url, json={"jsonrpc": "2.0", "id": 1,
+                                      "method": method,
+                                      "params": params}, timeout=20)
             j = r.json()
             if "error" in j:
                 raise ChainError(f"RPC {method}@{rpc_url}: {j['error']}")
