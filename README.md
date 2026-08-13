@@ -17,14 +17,20 @@ Polymarket 预测市场自动化交易系统（Python 3.11+）。模块化设计
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 离线全链路模拟（合成市场，无网络）
+# 前置：本地 MySQL 8.0.46（已开单队列存储），连接参数见 .env 的 POLY_DB_*
+# 启动: ../mysql-8.0.46/bin/mysqld --basedir=../mysql-8.0.46 --datadir=../mysql-8.0.46/data \
+#   --port=3306 --bind-address=127.0.0.1 --socket=../mysql-8.0.46/mysql.sock \
+#   --pid-file=../mysql-8.0.46/mysql.pid --log-error=../mysql-8.0.46/mysql.err --daemonize
+
+# 离线全链路模拟（合成市场，无网络，不依赖 MySQL）
 .venv/bin/python scripts/run_polytrader.py offline
 
 # 运行测试
 .venv/bin/python -m pytest tests/        # 127 个测试
 ```
 
-中国大陆网络环境需要代理（config.yaml 的 `network.proxy`，如 `socks5h://127.0.0.1:7890`）。
+网络说明：python requests 可直连 Polymarket/OKX（中国大陆环境实测可用，无需代理）；
+`curl` 对 Polymarket 返回 000 是 curl 自身问题，不代表网络不通。
 
 ## 架构
 
@@ -32,6 +38,7 @@ python3.11 -m venv .venv
 polytrader/
 ├── config.py            # 配置：config.yaml + POLY_ 环境变量 + .env 凭证
 ├── models.py            # Market / OrderBook / Signal / Trade / WalletProfile
+├── db.py                # 已开单队列的 MySQL 存储（pending_trades 表，POLY_DB_* 连接）
 ├── data/
 │   ├── gamma_client.py  # 市场发现（Gamma API，含 JSON 字符串数组兼容）
 │   ├── clob_client.py   # 订单簿 REST + WS 实时订阅
@@ -57,7 +64,17 @@ polytrader/
 └── execution/
     ├── broker.py        # dry-run（模拟）/ paper（真实取价模拟）/ live（安全拒绝）
     └── order_manager.py # Kelly 定仓 + 套利组原子性（组内全成或全弃）
+
+scripts/
+├── run_llm_loop.py      # 多轮循环主任务（窗口内扫描 + 开单写 MySQL）
+├── settle_worker.py     # 常驻结算进程（任务退出后结算不停止）
+├── run_daemon.py        # 无限挂机守护进程（复用 run_llm_loop --rounds 1）
+├── backfill_settlements.py # 兜底补结算（settle_worker 未运行时才需要）
+└── ...（scan/monitor/simulate/web_dashboard 等）
 ```
+
+**存储**：已开单队列存于本地 MySQL（`polytrader.pending_trades` 表）——
+`run_llm_loop`/`run_daemon` 开单写入，`settle_worker` 常驻轮询结算，多进程共享、不随任务删除。
 
 ## 使用
 
@@ -205,8 +222,13 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
   （`brew install libomp` 后仍需代理通畅）
 - Polymarket 私有排行榜 API 不可用，跟单数据源采用市场成交聚合替代
 - Binance 无 `HYPEUSDT`：HYPE 行情自动 fallback OKX
-- 本地代理 `127.0.0.1:7890` 偶发故障（Connection reset），请求自动重试，
-  挂机脚本有失败容忍；代理恢复后 `git push` 即可补推
+- gamma-api 偶发 `SSL EOF` 瞬时抖动（分钟级）：扫描失败不中断循环、settle_worker
+  自动重试，网络恢复即自愈，无需干预
+- 本机无本地代理：python requests 直连 Polymarket/OKX 实测可用；若将来需要代理，
+  可在 `HttpClient(proxy=...)` 处配置（注意 scripts 中 `socks5h://127.0.0.1:7890`
+  为历史默认值，无 PySocks 时实际静默直连）
+- MySQL 8.0.46 需手动启动（见快速开始）；机器重启后 `settle_worker status` 报
+  DB 错误时先启动 mysqld
 
 ## 测试
 

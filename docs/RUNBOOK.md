@@ -9,12 +9,19 @@
 | 启动守护挂机 | `.venv/bin/python scripts/run_daemon.py start` |
 | 查看运行状态 | `.venv/bin/python scripts/run_daemon.py status` |
 | 停止守护挂机 | `.venv/bin/python scripts/run_daemon.py stop` |
+| 常驻结算进程：查看状态 | `.venv/bin/python scripts/settle_worker.py status` |
+| 常驻结算进程：停止 | `.venv/bin/python scripts/settle_worker.py stop` |
+| 多轮循环测试 | `.venv/bin/python scripts/run_llm_loop.py --rounds 3 --windows 5m` |
 | 启动 Web 面板 | `.venv/bin/python scripts/web_dashboard.py --port 8787` |
 | 打开面板 | 浏览器 → `http://127.0.0.1:8787` |
 | 看全部日志 | `tail -f logs/llm_daemon_*/daemon.log` |
-| 补结算（幂等） | `.venv/bin/python scripts/backfill_settlements.py --results logs/llm_daemon_*/llm_results.jsonl` |
+| 补结算（仅 settle_worker 未运行时需要） | `.venv/bin/python scripts/backfill_settlements.py --results logs/llm_daemon_*/llm_results.jsonl` |
 | 收益率统计 | `.venv/bin/python scripts/summarize_rounds.py` |
+| 查询待结算队列 | `.venv/bin/python scripts/settle_worker.py status`（pending trades 数） |
 | 运行测试 | `.venv/bin/python -m pytest tests/`（127 个） |
+
+> **结算分工**：`run_llm_loop` / `run_daemon` 只负责开单（写入 MySQL `pending_trades`），
+> **结算由常驻进程 `settle_worker` 独立处理**——任务退出后结算不停止，一般无需手动 backfill。
 
 ## 2. 守护进程（run_daemon.py）
 
@@ -22,10 +29,10 @@
 
 ```bash
 .venv/bin/python scripts/run_daemon.py start \
-  --min-edge 0.04        # LLM 与市场隐含价最小分歧（开单门槛）
+  --min-edge 0.04        # LLM 与市场隐含价最小分歧（开单门槛，默认 0.04）
   --windows 5m           # 参与窗口：5m / 15m / 5m,15m
-  --scan-interval 60     # 窗口内扫描间隔秒（0=每窗口 1 次）
-  --settle-wait 180      # 窗口结束后等待结算秒数
+  --scan-interval 30     # 窗口内扫描间隔秒（默认 30；0=每窗口 1 次）
+  --settle-wait 180      # [已弃用] 结算由 settle_worker 常驻处理，此参数不再生效
   --size 1.0             # 每笔固定仓位 USD
   --max-rounds 0         # 0=无限（默认）；>0 跑完自动退出（测试用）
 ```
@@ -33,7 +40,8 @@
 ### 2.2 行为保证
 
 - **持续执行**：fork + setsid 真守护进程，无限循环；每轮 = 一个 5m 窗口
-  （对齐窗口起点 → 窗口内高频扫描 → 窗口结束后等待结算 → backfill 补结算）
+  （启动即扫描当前窗口、**不对齐整点**；窗口内每 30s 扫描一次，窗口结束前 40s 停止；
+  结算由常驻 `settle_worker` 处理，守护进程不等待结算）
 - **崩溃自愈**：轮次异常捕获 + 指数退避重试（10s → 300s 封顶），连续失败在
   `daemon.log` 可观测，不中断整体循环
 - **优雅停止**：`stop` 发 SIGTERM，当前轮结束（最多等一轮时长）后退出；
@@ -60,12 +68,20 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 
 | 文件 | 内容 | 用途 |
 |---|---|---|
-| `daemon.log` | 全部输出：轮次/扫描/信号/LLM 错误/结算/心跳 | **日常看这个** |
+| `daemon.log` | 全部输出：轮次/扫描/信号/LLM 错误/心跳 | **日常看这个** |
 | `llm_results.jsonl` | 事件流：`round`（每次扫描）/`trade_settled`/`heartbeat`/`summary` | 统计与复盘 |
 | `audit_all.jsonl` | 调用审计：`http_request`（URL/状态/耗时）/`llm_call`（prompt/概率/reason/usage）/`trade_open` | 排查问题 |
 | `status.json` | 最新快照（status 命令读取） | 面板/脚本读取 |
 | `llm_loop_*.log` | 每轮 run_llm_loop 明细（同目录，冗余） | 深入排查 |
 | `seen_slugs.txt` | 已交易盘口 | 去重记录 |
+
+**结算相关（不在会话目录）**：
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| 待结算队列 | MySQL `polytrader.pending_trades` 表 | 所有任务共享；`settle_worker status` 看 pending 数 |
+| settle_worker 日志 | `logs/settle_worker.log` | 结算进程的轮询与入账记录 |
+| settle_worker PID | `settle_worker.pid`（仓库根） | 常驻进程状态 |
 
 ### 3.1 事件格式（llm_results.jsonl）
 
@@ -78,7 +94,8 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 {"type": "summary", "rounds": 5, "trades": 3, "settled": 3, "wins": 3, "total_pnl": 2.8}
 ```
 
-`backfilled: true` = 等待期未结算、由 backfill 事后补查入账。
+`backfilled: true` = 由 settle_worker（或 backfill）事后补查入账——结算通常发生在
+主任务退出后，事件由常驻结算进程异步追加到结果文件。
 
 ### 3.2 审计事件格式（audit_all.jsonl）
 
@@ -107,18 +124,39 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 
 ## 5. 数据复盘
 
-### 5.1 补结算（重要）
+### 5.1 结算（常驻自动，一般无需手动）
 
-守护进程在窗口结束后等 `--settle-wait`（默认 180s）再查结算——绝大多数单子能查到；
-若某单结算延迟，会在 results 中保持 `pnl: null`。**事后**运行：
+- **自动**：常驻 `settle_worker` 每 30s 轮询 MySQL 待结算队列，结算完成即写回
+  结果文件并更新 DB 状态（`settle_worker status` 显示 `pending trades` 数）
+- **主任务退出后结算不停止**：run_llm_loop/run_daemon 退出不影响结算，单子一直在队列里
+- **何时需要手动 backfill**：仅当 settle_worker 未运行（如未启动/被停）且需要补结算时：
+  ```bash
+  .venv/bin/python scripts/backfill_settlements.py --results logs/llm_daemon_*/llm_results.jsonl
+  ```
+  幂等：已入账的 trade_id 不会重复结算（按 trade_id 去重）。输出 `backfill_<ts>.csv` 明细。
+
+### 5.2 待结算队列查询（MySQL）
 
 ```bash
-.venv/bin/python scripts/backfill_settlements.py --results logs/llm_daemon_*/llm_results.jsonl
+# 用 settle_worker status 看 pending 数量
+.venv/bin/python scripts/settle_worker.py status
+
+# 直接查库（密码见 .env 的 POLY_DB_PASS；中文操作务必加 --default-character-set=utf8mb4）
+../mysql-8.0.46/bin/mysql -h127.0.0.1 -P3306 -uroot -p"$POLY_DB_PASS" \
+  --default-character-set=utf8mb4 polytrader \
+  -e "SELECT trade_id, slug, side, entry_price, status, pnl FROM pending_trades;"
 ```
 
-幂等：已入账的 trade_id 不会重复结算（按 trade_id 去重）。输出 `backfill_<ts>.csv` 明细。
+> **MySQL 实例说明**：本机 MySQL 8.0.46 安装于 `../mysql-8.0.46/`（workspace 下），
+> 库 `polytrader` 表 `pending_trades`。机器重启后需手动启动：
+> ```bash
+> ../mysql-8.0.46/bin/mysqld --basedir=../mysql-8.0.46 --datadir=../mysql-8.0.46/data \
+>   --port=3306 --bind-address=127.0.0.1 --socket=../mysql-8.0.46/mysql.sock \
+>   --pid-file=../mysql-8.0.46/mysql.pid --log-error=../mysql-8.0.46/mysql.err --daemonize
+> ```
+> 连接参数统一在 `.env` 的 `POLY_DB_*`（代码经 `polytrader/db.py` 读取，凭证不入库）。
 
-### 5.2 收益率统计
+### 5.3 收益率统计
 
 ```bash
 .venv/bin/python scripts/summarize_rounds.py
@@ -126,7 +164,7 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 
 汇总所有已结束会话（$1 统一口径）：各轮交易数/结算数/胜率/投入/收益率。
 
-### 5.3 手工核对
+### 5.4 手工核对
 
 ```bash
 # 看某会话全部结算
@@ -141,20 +179,23 @@ grep '"event": "llm_call"' logs/llm_daemon_*/audit_all.jsonl | grep <trade_id �
 | 症状 | 原因 | 处理 |
 |---|---|---|
 | `status` 显示 stale pid | 守护被强杀（SIGKILL）| 直接重新 `start`（旧 pid 自动覆盖） |
-| daemon.log 大量 `ERR request ... Connection reset` | 本地代理 127.0.0.1:7890 故障 | 检查 Clash 节点；代理恢复后守护自动重试，无需干预 |
+| daemon.log 大量 `ERR request ... Connection reset` | 网络抖动/被墙 | 扫描失败不中断循环，自动重试；若持续，检查网络 |
 | `ERR LLM content unparsable` | DeepSeek 瞬时返回空 content | 正常现象（有重试）；若连续出现检查 `LLM_API_KEY` 余额 |
-| 结算一直 `still unsettled` | 结算延迟 > 查询窗口 | 等 5-10 分钟后重跑 backfill（幂等安全） |
+| `settle_worker status` 显示 `pending trades` 不降 | 结算延迟或 gamma-api 抖动 | 常驻进程每 30s 自动重试，网络恢复即入账；等待即可 |
+| `[db] insert_pending FAILED` / `[db] fetch_pending FAILED` | MySQL 未启动/连接参数错误 | 检查 mysqld 是否运行、`.env` 的 `POLY_DB_PASS` 是否与库一致 |
+| 结算一直 `still unsettled`（backfill 手动跑时） | 结算延迟 > 查询窗口 | 等 5-10 分钟后重跑 backfill（幂等安全） |
 | 面板显示"暂无结果数据" | 最新会话还没有任何轮次完成 | 等首个窗口轮次结束（≤8 分钟） |
 | lightgbm 加载失败（OSError/libomp）| macOS 缺 libomp | 自动 fallback sklearn，无需处理；装 `brew install libomp` 恢复 |
 | `windows: 0 markets` | 窗口刚创建 keyset 未返回/已结束窗口被过滤 | 正常（下一窗口自动重扫） |
 | 某轮 0 交易 | edge 全部 < min_edge（LLM 与市场无分歧）| 正常，非故障 |
 
-### 6.1 代理故障的完整恢复路径
+### 6.1 网络故障的完整恢复路径
 
-1. 修复代理（切换 Clash 节点等）
-2. 守护进程自动重试（每轮最多 3 次/请求），**无需重启守护**
-3. 若某窗口因代理失败未扫描/未结算：`backfill_settlements.py` 补结算；
-   错过的扫描窗口无法补（窗口已结算），属正常损耗
+1. 网络恢复后，扫描与结算**自动重试**，无需重启任何进程
+2. 结算由 settle_worker 常驻处理：即使 run_llm_loop/run_daemon 已退出，
+   待结算单仍在 MySQL 队列中，网络恢复即自动入账
+3. 若 settle_worker 也未运行：启动它（`settle_worker.py start`）即继续处理，
+   或手动跑 `backfill_settlements.py` 补结算；错过的扫描窗口无法补（窗口已结算），属正常损耗
 
 ## 7. 安全边界（务必遵守）
 
@@ -167,7 +208,8 @@ grep '"event": "llm_call"' logs/llm_daemon_*/audit_all.jsonl | grep <trade_id �
 ## 8. 例行巡检清单（每日）
 
 1. `.venv/bin/python scripts/run_daemon.py status` —— 确认 RUNNING、看 pnl 趋势
-2. `tail -30 logs/llm_daemon_*/daemon.log` —— 看最近轮次是否有异常
-3. 浏览器打开 `http://127.0.0.1:8787` —— 确认面板数据在更新
-4. 若连续多轮 0 交易：检查 min_edge 是否过高或 LLM 服务异常（audit_all 中 llm_call 占比）
-5. 每周：跑 `summarize_rounds.py` 汇总收益率，评估策略是否继续
+2. `.venv/bin/python scripts/settle_worker.py status` —— 确认 RUNNING、pending 数正常下降
+3. `tail -30 logs/llm_daemon_*/daemon.log` —— 看最近轮次是否有异常
+4. 浏览器打开 `http://127.0.0.1:8787` —— 确认面板数据在更新
+5. 若连续多轮 0 交易：检查 min_edge 是否过高或 LLM 服务异常（audit_all 中 llm_call 占比）
+6. 每周：跑 `summarize_rounds.py` 汇总收益率，评估策略是否继续
