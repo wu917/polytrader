@@ -80,7 +80,8 @@ ENV_PROTECTED_PATHS: tuple[tuple[str, ...], ...] = (
 
 # 凭证字段：__repr__ 时遮盖
 SENSITIVE_FIELDS = frozenset({
-    "private_key", "api_key", "api_secret", "api_passphrase", "llm_api_key",
+    "private_key", "api_key", "api_secret", "api_passphrase",
+    "relayer_api_key", "relayer_api_key_address", "llm_api_key",
 })
 
 
@@ -211,6 +212,8 @@ class Config:
     api_key: str = ""
     api_secret: str = ""
     api_passphrase: str = ""
+    relayer_api_key: str = ""
+    relayer_api_key_address: str = ""
     llm_api_key: str = ""
     llm_base_url: str = ""
     llm_model: str = "gpt-4o-mini"
@@ -285,6 +288,9 @@ def load_config(
     cfg.api_key = os.environ.get("POLYMARKET_API_KEY", "").strip()
     cfg.api_secret = os.environ.get("POLYMARKET_API_SECRET", "").strip()
     cfg.api_passphrase = os.environ.get("POLYMARKET_API_PASSPHRASE", "").strip()
+    cfg.relayer_api_key = os.environ.get("POLYMARKET_RELAYER_API_KEY", "").strip()
+    cfg.relayer_api_key_address = os.environ.get(
+        "POLYMARKET_RELAYER_API_KEY_ADDRESS", "").strip()
     cfg.llm_api_key = os.environ.get("LLM_API_KEY", "").strip()
     cfg.llm_base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").strip()
     cfg.llm_model = os.environ.get("LLM_MODEL", cfg.llm_model).strip()

@@ -123,6 +123,50 @@ class ClobClient:
         except (TypeError, ValueError):
             return 0.0
 
+    # ---- CLOB V2 下单（POLY_* L2 认证 + HMAC body）----
+    def _l2_headers_v2(self, method: str, path: str,
+                       serialized_body: str) -> dict:
+        """新版 L2 认证头（POLY_* 5 头，HMAC 覆盖序列化 body）。"""
+        from eth_account import Account
+        from polytrader.execution import signer
+        addr = Account.from_key(self.private_key).address
+        return signer.l2_headers_new(
+            addr, self.api_key, self.api_passphrase, self.api_secret,
+            method, path, body=serialized_body)
+
+    def post_order_v2(self, payload: dict, path: str = "/order") -> dict:
+        """提交 V2 订单（body 参与 HMAC 签名，必须用紧凑 JSON）。"""
+        if not self.auth_ready:
+            raise RuntimeError(
+                "CLOB auth not configured: need API_KEY/SECRET/PASSPHRASE + private key")
+        serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        headers = self._l2_headers_v2("POST", path, serialized)
+        headers["Content-Type"] = "application/json"
+        resp = self.http.post(f"{self.api_base}{path}", data=serialized,
+                              headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_order_v2(self, order_id: str) -> dict:
+        """查询订单（V2，L2 认证）。"""
+        path = f"/data/order/{order_id}"
+        headers = self._l2_headers_v2("GET", path, "")
+        resp = self.http.get(f"{self.api_base}{path}", headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    def cancel_order_v2(self, order_id: str) -> dict:
+        """取消订单（V2，L2 认证）。"""
+        payload = {"orderID": order_id}
+        path = "/cancel"
+        serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        headers = self._l2_headers_v2("POST", path, serialized)
+        headers["Content-Type"] = "application/json"
+        resp = self.http.post(f"{self.api_base}{path}", data=serialized,
+                              headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
     # ---- WebSocket 订阅 ----
     def stream_books(self, token_ids: list[str],
                      on_book: Callable[[OrderBook], None],

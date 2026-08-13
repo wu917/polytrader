@@ -57,6 +57,7 @@ def sign_typed_order(order: dict, private_key: str) -> str:
     """对 CLOB 订单做 EIP-712 签名，返回 0x 签名。
 
     order 字段：maker/taker/tokenId/makerAmount/takerAmount/id/feeRateBps/nonce/expiration
+    （deposit wallet 模式下额外含 funder；signatureType 由请求体携带，不进 EIP-712 message）
     """
     full = {
         "types": _ORDER_TYPES,
@@ -68,6 +69,97 @@ def sign_typed_order(order: dict, private_key: str) -> str:
     sig = Account.sign_message(msg, private_key)
     sig_hex = sig.signature.hex()
     return sig_hex if sig_hex.startswith("0x") else "0x" + sig_hex
+
+
+# ---- ClobAuth（现代 CLOB V2 的 L1 认证签名，用于派生 L2 API 凭证）----
+_CLOB_AUTH_TYPES = {
+    "EIP712Domain": [
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+    ],
+    "ClobAuth": [
+        {"name": "address", "type": "address"},
+        {"name": "timestamp", "type": "string"},
+        {"name": "nonce", "type": "uint256"},
+        {"name": "message", "type": "string"},
+    ],
+}
+
+_CLOB_AUTH_DOMAIN = {"name": "ClobAuthDomain", "version": "1", "chainId": CHAIN_ID}
+_CLOB_AUTH_MESSAGE = "This message attests that I control the given wallet"
+
+
+def sign_clob_auth(address: str, private_key: str,
+                   timestamp: int | None = None, nonce: int | None = None) -> str:
+    """ClobAuth L1 签名（EIP-712 ClobAuthDomain），用于派生/创建 L2 API 凭证。"""
+    ts = timestamp if timestamp is not None else int(time.time())
+    n = nonce if nonce is not None else int(time.time() * 1000) % (2 ** 63)
+    full = {
+        "types": _CLOB_AUTH_TYPES,
+        "primaryType": "ClobAuth",
+        "domain": _CLOB_AUTH_DOMAIN,
+        "message": {
+            "address": address,
+            "timestamp": str(ts),
+            "nonce": n,
+            "message": _CLOB_AUTH_MESSAGE,
+        },
+    }
+    msg = encode_typed_data(full_message=full)
+    sig = Account.sign_message(msg, private_key)
+    sig_hex = sig.signature.hex()
+    return sig_hex if sig_hex.startswith("0x") else "0x" + sig_hex
+
+
+def build_order_with_funder(order: dict, private_key: str,
+                            funder: str | None = None) -> dict:
+    """构建可提交订单；deposit wallet 模式下 funder 与 maker 不同。
+
+    signatureType 由调用方在请求体携带（3=deposit wallet），不参与 EIP-712 签名。
+    """
+    signed = dict(order)
+    if funder:
+        signed["funder"] = funder
+    signed["signature"] = sign_typed_order(order, private_key)
+    return signed
+
+
+# ---- CLOB V2 L2 认证（新协议：POLY_* 头 + HMAC-SHA256）----
+def derive_api_key_headers(address: str, signature: str,
+                           timestamp: int, nonce: int = 0) -> dict:
+    """GET /auth/derive-api-key 的请求头（POLY_* 4 头）。"""
+    return {
+        "POLY_ADDRESS": address,
+        "POLY_SIGNATURE": signature,
+        "POLY_TIMESTAMP": str(timestamp),
+        "POLY_NONCE": str(nonce),
+    }
+
+
+def l2_headers_new(address: str, api_key: str, passphrase: str,
+                   secret_b64: str, method: str, path: str,
+                   body: str = "") -> dict:
+    """新版 L2 认证头（5 个 POLY_* 头）。
+
+    message = timestamp + METHOD + path + body
+    signature = urlsafeBase64WithPadding(HMAC-SHA256(base64decode(secret), message))
+    """
+    import base64
+    import hashlib
+    import hmac
+    ts = int(time.time())
+    message = f"{ts}{method.upper()}{path}{body}"
+    key = base64.urlsafe_b64decode(secret_b64)   # secret 为 urlsafe base64
+    digest = hmac.new(key, message.encode(), hashlib.sha256).digest()
+    sig = base64.urlsafe_b64encode(digest).decode()
+    return {
+        "POLY_ADDRESS": address,
+        "POLY_SIGNATURE": sig,
+        "POLY_TIMESTAMP": str(ts),
+        "POLY_API_KEY": api_key,
+        "POLY_PASSPHRASE": passphrase,
+    }
 
 
 def derive_api_credentials(private_key: str) -> dict:

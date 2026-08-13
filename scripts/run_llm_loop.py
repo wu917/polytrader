@@ -93,16 +93,25 @@ def main() -> int:
     for p in run_dir.glob("*"):
         p.unlink()
 
-    def run_simulate(wait: int) -> subprocess.CompletedProcess:
-        """启动一轮 simulate（wait=0 快速扫描只开单；>0 等待结算）。"""
-        return subprocess.run(
-            [sys.executable, "scripts/simulate_llm_updown.py",
-             "--wait", str(wait), "--min-edge", str(args.min_edge),
-             "--size", str(args.size), "--audit-dir", str(run_dir),
-             "--seen-file", str(out_dir / "seen_slugs.txt"),
-             "--windows", args.windows],
-            cwd=ROOT, capture_output=True, text=True, timeout=max(wait, 60) + 240,
-        )
+    def run_simulate(wait: int) -> subprocess.CompletedProcess | None:
+        """启动一轮 simulate（wait=0 快速扫描只开单；>0 等待结算）。
+
+        超时（网络抖动导致子进程卡住）视为该次扫描失败返回 None，
+        由主循环跳过收集继续——不允许整体任务崩溃。
+        """
+        try:
+            return subprocess.run(
+                [sys.executable, "scripts/simulate_llm_updown.py",
+                 "--wait", str(wait), "--min-edge", str(args.min_edge),
+                 "--size", str(args.size), "--audit-dir", str(run_dir),
+                 "--seen-file", str(out_dir / "seen_slugs.txt"),
+                 "--windows", args.windows],
+                cwd=ROOT, capture_output=True, text=True,
+                timeout=max(wait, 60) + 240)
+        except subprocess.TimeoutExpired:
+            log(f"  simulate timed out after {max(wait, 60) + 240}s "
+                f"(network stall) — treated as failed scan")
+            return None
 
     def add_pending(round_no: int, trades: list[dict]):
         """开单入库（MySQL polytrader.pending_trades，INSERT IGNORE 天然幂等）。"""
@@ -183,6 +192,8 @@ def main() -> int:
             scans += 1
             log(f"  scan {scans} @ {time.strftime('%H:%M:%S')}")
             proc = run_simulate(0)                 # 快速扫描：只开单不等待
+            if proc is None:
+                continue                            # 超时视为本次扫描失败，继续下一轮
             for line in proc.stdout.splitlines():
                 log("  " + line)
             if proc.stderr.strip():
