@@ -13,7 +13,7 @@ from typing import Iterable
 
 from polytrader.execution.broker import Broker
 from polytrader.logging_setup import get_logger
-from polytrader.models import Signal, Trade
+from polytrader.models import Mode, Signal, Trade
 from polytrader.risk.kelly import kelly_size_usd
 from polytrader.risk.risk_manager import RiskManager
 
@@ -61,9 +61,9 @@ class OrderManager:
                 return []
             log.debug("risk ok: %s $%.2f", sig.market.slug, size)
 
-        # 3. 全部通过后依次执行；若组内任一笔被 broker 拒绝
-        #    （如 paper 模式滑点超限/缺 ask），回滚已成交的 leg，
-        #    避免套利对分裂成裸方向敞口
+        # 3. 全部通过后依次执行；若组内任一笔被 broker 拒绝：
+        #    - 模拟模式：回滚已成交的 leg，避免套利对分裂成裸方向敞口
+        #    - live 模式：真实成交**不可撤销**，保留敞口并告警人工处理
         trades: list[Trade] = []
         for sig, size in sized:
             sig.size_usd = size
@@ -74,14 +74,23 @@ class OrderManager:
             trades.append(trade)
 
         if any(t.status != "filled" for t in trades):
-            rolled = [t for t in trades if t.status == "filled"]
-            log.warning("group partially filled (%d/%d) — rolling back %d filled legs",
-                        len(rolled), len(trades), len(rolled))
-            for t in rolled:
-                self.risk.remove_trade(t)
-                if t in self.trades:
-                    self.trades.remove(t)
-                t.status = "rolled_back"
+            filled = [t for t in trades if t.status == "filled"]
+            if self.broker.mode == Mode.LIVE.value:
+                log.error("[live] group partially filled (%d/%d) — real fills "
+                          "CANNOT be rolled back; review exposure now",
+                          len(filled), len(trades))
+                for t in filled:
+                    log.error("[live]   FILLED %s %s $%.2f order_id=%s",
+                              t.side.value, t.market_slug, t.usd_value, t.order_id)
+            else:
+                rolled = filled
+                log.warning("group partially filled (%d/%d) — rolling back %d filled legs",
+                            len(rolled), len(trades), len(rolled))
+                for t in rolled:
+                    self.risk.remove_trade(t)
+                    if t in self.trades:
+                        self.trades.remove(t)
+                    t.status = "rolled_back"
         return trades
 
     def snapshot(self) -> dict:

@@ -96,3 +96,20 @@ class HttpClient:
         resp = self.get(url, params=params, **kwargs)
         resp.raise_for_status()
         return resp.json()
+
+    def post_json(self, url: str, json_body: dict | None = None,
+                  headers: dict | None = None, **kwargs: Any) -> Any:
+        resp = self.post(url, json=json_body, headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_json(self, url: str, params: dict | None = None,
+                    headers: dict | None = None, **kwargs: Any) -> Any:
+        resp = self._request("DELETE", url, params=params, headers=headers, **kwargs)
+        resp.raise_for_status()
+        if not resp.text:
+            return {}
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": resp.status_code, "raw": resp.text[:200]}

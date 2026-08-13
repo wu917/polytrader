@@ -7,8 +7,10 @@
 
 ## 1. 项目是什么
 
-Polymarket 预测市场的 **updown 5m/15m 快速市场模拟交易工具链**（LLM 方向判断 + 模拟成交 $1/笔 + 结算统计）。
-**绝不真实下单**（live 被安全闸拦截）；所有成交是 paper 级模拟。
+Polymarket 预测市场的 **updown 5m/15m 快速市场模拟交易工具链**（LLM 方向判断 + 成交 + 结算统计）。
+**默认以 dry-run/paper 模拟为主**（收益率回测必须用模拟模式）；live 实盘已实现
+（EIP-712 签名 + CLOB 下单）但**默认关闭**，启用需 `config.yaml` 显式 `live.enabled: true`，
+且有不可绕过的安全护栏（见第 5 节）。
 
 ## 2. 本机环境事实（实测确认，勿臆测）
 
@@ -19,8 +21,9 @@ Polymarket 预测市场的 **updown 5m/15m 快速市场模拟交易工具链**�
 | MySQL | 8.0.46 arm64，安装于 `../mysql-8.0.46/`（workspace 下，非 brew） |
 | MySQL 连接 | `127.0.0.1:3306`，user `root`，密码见 `.env` 的 `POLY_DB_PASS`，库 `polytrader` |
 | LLM | DeepSeek（`.env`：`LLM_API_KEY` / `LLM_BASE_URL=https://api.deepseek.com/v1` / `LLM_MODEL=deepseek-chat`） |
-| 网络 | 大陆直连可用：**python requests 能直连 Polymarket/OKX**；`curl` 对 Polymarket 返回 000 是 curl 问题，不代表网络不通 |
+| 网络 | **必须走 macOS 系统代理 `127.0.0.1:7897`**：requests 默认 `trust_env=True` 自动走系统代理；裸 TCP/curl 直连 Polymarket 全不通（000）。主网 CLOB/Gamma 经代理可达 |
 | 网络抖动 | gamma-api 偶发 `SSL EOF` 抖动（几分钟级），扫描失败**不中断循环**，重试即可 |
+| 测试网 | `clob-staging.polymarket.com` 经当前代理**不可达**（000）——测试网全链路验证需换可用代理节点 |
 
 **沙箱限制（重要）**：只能写 workspace（`~/.reasonix/global-workspace/`）与 `/tmp`；
 `/opt`、home 根目录、系统级命令（如 `ps`）被禁止。装软件只能在 workspace 内解压运行。
@@ -80,6 +83,9 @@ backfill_settlements.py（兜底补结算）：仅当 settle_worker 未运行时
 - 长任务（多轮窗口）用 `run_in_background` 后台跑，按每轮 5-10 分钟估算耗时
 - `run_llm_loop` 的 SUMMARY 是"已结算部分"——结算由 settle_worker 异步追加到结果文件，看完整收益率需 `settle_worker status` 显示 pending=0 后重读结果文件
 - 凭证/密钥只进 `.env`（已 gitignore），绝不写进代码或提交；`.env` 中已有：DeepSeek key、`POLY_DB_*`
+- **live 实盘规则**：`config.yaml` 的 `live.enabled` 默认 false 且**禁止 env 覆盖**
+  （在 ENV_PROTECTED_PATHS）；改 `execution/signer.py` / `clob_client.py` 下单逻辑后必须
+  跑 `tests/` 全量 + 新增/更新对应单测；任何实盘改动默认保持"默认关闭 + 护栏"语义
 
 ## 6. 常用命令速查
 

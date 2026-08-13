@@ -52,6 +52,11 @@ FIELD_MAP: dict[tuple[str, ...], str] = {    ("mode",): "mode",
     ("execution", "order_timeout_seconds"): "order_timeout_seconds",
     ("execution", "cancel_on_timeout"): "cancel_on_timeout",
     ("execution", "fill_check_interval"): "fill_check_interval",
+    ("live", "enabled"): "live_enabled",
+    ("live", "max_order_usd"): "live_max_order_usd",
+    ("live", "confirm"): "live_confirm",
+    ("live", "min_price"): "live_min_price",
+    ("live", "max_price"): "live_max_price",
     ("logging", "level"): "log_level",
     ("logging", "file"): "log_file",
 }
@@ -68,6 +73,9 @@ ENV_PROTECTED_PATHS: tuple[tuple[str, ...], ...] = (
     ("risk", "min_price"),
     ("risk", "max_price"),
     ("risk", "cooldown_seconds"),
+    ("live", "enabled"),
+    ("live", "max_order_usd"),
+    ("live", "confirm"),
 )
 
 # 凭证字段：__repr__ 时遮盖
@@ -187,6 +195,13 @@ class Config:
     order_timeout_seconds: int = 30
     cancel_on_timeout: bool = True
     fill_check_interval: int = 2
+
+    # ---- live 实盘（安全护栏，默认关闭）----
+    live_enabled: bool = False
+    live_max_order_usd: float = 10.0
+    live_confirm: bool = True
+    live_min_price: float = 0.03
+    live_max_price: float = 0.97
 
     log_level: str = "INFO"
     log_file: str = "logs/polytrader.log"

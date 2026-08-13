@@ -34,16 +34,36 @@ def _to_level(item) -> Optional[OrderBookLevel]:
 
 
 class ClobClient:
-    """CLOB REST：订单簿查询。下单能力在 execution 层（需要签名）。"""
+    """CLOB REST：订单簿查询 + live 下单（需签名凭证）。"""
 
     def __init__(self, api_base: str = "https://clob.polymarket.com",
                  ws_url: str = "wss://ws-subscriptions-clob.polymarket.com",
                  http: HttpClient | None = None,
-                 proxy: str | None = None):
+                 proxy: str | None = None,
+                 api_key: str = "", api_secret: str = "",
+                 api_passphrase: str = "", private_key: str = ""):
         self.api_base = api_base.rstrip("/")
         self.ws_url = ws_url
         self.http = http or HttpClient()
         self.proxy = proxy  # WS 代理（websocket-client 不读系统代理，需显式传入）
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
+        self.private_key = private_key
+
+    # ---- 认证 ----
+    @property
+    def auth_ready(self) -> bool:
+        return bool(self.api_key and self.api_secret and
+                    self.api_passphrase and self.private_key)
+
+    def _auth_headers(self) -> dict:
+        if not self.auth_ready:
+            raise RuntimeError(
+                "CLOB auth not configured: need API_KEY/SECRET/PASSPHRASE + private key")
+        from polytrader.execution import signer
+        return signer.l2_auth_headers(
+            self.api_key, self.api_secret, self.api_passphrase, self.private_key)
 
     # ---- REST ----
     def get_book(self, token_id: str) -> OrderBook | None:
@@ -71,6 +91,37 @@ class ClobClient:
             except (TypeError, ValueError):
                 return None
         return None
+
+    # ---- live 下单（需认证；order 需已含 EIP-712 signature）----
+    def place_order(self, order: dict) -> dict:
+        """提交已签名订单（POST /order），返回 CLOB 响应（含 orderID/status）。"""
+        headers = self._auth_headers()
+        return self.http.post_json(f"{self.api_base}/order",
+                                   json_body=order, headers=headers)
+
+    def cancel_order(self, order_id: str) -> dict:
+        """撤销订单（DELETE /order）。"""
+        headers = self._auth_headers()
+        return self.http.delete_json(f"{self.api_base}/order",
+                                     params={"order_id": order_id}, headers=headers)
+
+    def get_order(self, order_id: str) -> dict:
+        """查询订单状态（GET /data/order/<id>）。"""
+        return self.http.get_json(f"{self.api_base}/data/order/{order_id}")
+
+    def get_balance(self) -> dict:
+        """账户余额（需认证）：usdc / neg_risk 等。"""
+        headers = self._auth_headers()
+        return self.http.get_json(f"{self.api_base}/balance", headers=headers)
+
+    def get_usdc_balance(self) -> float:
+        """可用 USDC 余额（美元，用于下单资金预检）。"""
+        data = self.get_balance()
+        usdc = (data or {}).get("usdc", {}) or {}
+        try:
+            return float(usdc.get("available_balance") or usdc.get("balance") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     # ---- WebSocket 订阅 ----
     def stream_books(self, token_ids: list[str],

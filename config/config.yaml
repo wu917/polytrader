@@ -57,6 +57,16 @@ execution:
   cancel_on_timeout: true
   fill_check_interval: 2
 
+# 实盘（live）安全护栏 —— 默认关闭，仅显式开启
+# ⚠️ 开启前必须：1) testnet 全链路验证  2) 钱包备好 USDC + POL gas
+#    3) .env 填 POLYMARKET_PRIVATE_KEY + API_KEY/SECRET/PASSPHRASE
+live:
+  enabled: false           # 实盘总开关（false=安全拒绝；env 无法覆盖，只能在此改）
+  max_order_usd: 10.0      # 单笔硬上限（防误操作/风控失效）
+  confirm: true            # 下单前需在终端输入 yes 确认
+  min_price: 0.03          # 与策略一致的价格带护栏
+  max_price: 0.97
+
 logging:
   level: INFO
   file: "logs/polytrader.log"

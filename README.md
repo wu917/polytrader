@@ -29,8 +29,8 @@ python3.11 -m venv .venv
 .venv/bin/python -m pytest tests/        # 127 个测试
 ```
 
-网络说明：python requests 可直连 Polymarket/OKX（中国大陆环境实测可用，无需代理）；
-`curl` 对 Polymarket 返回 000 是 curl 自身问题，不代表网络不通。
+网络说明：本机访问 Polymarket **经 macOS 系统代理 127.0.0.1:7897**（requests 默认自动走系统
+代理；裸直连不通）。若在无代理环境运行，需在 `HttpClient(proxy=...)` 显式配置可用代理。
 
 ## 架构
 
@@ -91,10 +91,9 @@ scripts/
 ### 模式
 
 - **dry-run**：无网络，按信号价模拟成交（测试/演示）
-- **paper**：真实拉取市场/订单簿，模拟成交（策略验证）
-- **live**：真实下单 —— **当前被安全闸拦截**。需要实现 EIP-712 订单签名
-  （`POLYMARKET_PRIVATE_KEY` + API key/secret/passphrase 已支持配置读取，
-  签名逻辑待实现，绝不盲目下单）
+- **paper**：真实拉取市场/订单簿，模拟成交（策略验证）—— **默认推荐，收益率回测用它**
+- **live**：真实下单（EIP-712 签名 + CLOB 提交已实现，见下文"实盘交易（live）"）。
+  默认**关闭**且有多重安全护栏，绝不盲目下单
 
 ```bash
 # paper 模式真实扫描
@@ -103,6 +102,24 @@ scripts/
 # LLM 盘口扫描（DeepSeek 双侧评估，真实市场）
 .venv/bin/python scripts/run_polytrader.py llm --proxy socks5h://127.0.0.1:7890
 ```
+
+### 实盘交易（live）
+
+> ⚠️ **真金白银**。启用前必须：① Polymarket **测试网**全链路验证签名/下单/成交；
+> ② 钱包备好 Polygon 上 **USDC**（支付）+ **POL**（gas）；③ 长期用 paper 验证策略有正期望。
+
+**启用步骤**：
+1. `.env` 填写 `POLYMARKET_PRIVATE_KEY`（Polygon 私钥）+ `POLYMARKET_API_KEY/SECRET/PASSPHRASE`
+   （官网 Portfolio 生成；也可留空三元组，代码支持用私钥自动派生）
+2. `config/config.yaml` 的 `live.enabled: true`（**env 无法覆盖，只能改文件**）
+3. 运行实盘（下单前终端会要求输入 `yes` 确认，且每笔有 `max_order_usd` 硬上限）
+
+**安全护栏（不可绕过）**：无凭证拒绝 / 单笔 > `live.max_order_usd`（默认 $10）拒绝 /
+价格不在 `[0.03, 0.97]` 拒绝 / 可用 USDC 不足拒绝 / 需交互确认 / 不自动重试下单 /
+实盘部分成交**不自动回滚**（真实成交不可撤销，告警人工处理）。
+
+**实现**：`execution/signer.py`（EIP-712 签名 + L1/L2 认证 + 凭证派生）、
+`data/clob_client.py`（place/cancel/get_order/balance）、`execution/broker.py`（LiveBroker）。
 
 ### updown 5/15 分钟快速市场（专项工具链）
 

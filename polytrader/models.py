@@ -149,6 +149,28 @@ class Trade:
 
 
 @dataclass
+class Order:
+    """CLOB 订单（EIP-712 签名前的结构化数据）。
+
+    对应 Polymarket CLOB 协议的 Order 类型：maker 支付 maker_amount 的
+    USDC（6 位小数）换取 taker_amount 份的 outcome token（6 位小数）。
+    价格隐含于 maker/taker amount 之比。
+    """
+
+    maker: str                 # 下单地址（私钥派生）
+    taker: str                 # "0x0000000000000000000000000000000000000000" = 任意对手
+    token_id: str              # CLOB assetId（0x + 32 字节）
+    maker_amount: int          # 支付 USDC 数量（1e6 精度）
+    taker_amount: int          # 期望获得份额（1e6 精度）
+    fee_rate_bps: int = 0      # 手续费基点（taker 方）
+    nonce: int = 0             # 防重放（CLOB 或本地维护）
+    expiration: int = 0        # 过期时间戳（秒）
+    signature: str = ""        # EIP-712 签名（0x + 65 字节 r/s/v）
+    order_id: str = ""         # 下单后 CLOB 返回
+    status: str = "pending"    # pending | live | matched | canceled | expired
+
+
+@dataclass
 class WalletProfile:
     """跟单目标钱包画像。"""
 

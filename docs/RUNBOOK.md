@@ -199,8 +199,13 @@ grep '"event": "llm_call"' logs/llm_daemon_*/audit_all.jsonl | grep <trade_id �
 
 ## 7. 安全边界（务必遵守）
 
-- **live 真实下单被安全闸拦截**：`execution/broker.py` 的 `LiveBroker` 明确拒绝执行，
-  需要 EIP-712 订单签名实现后才能打开（当前全部为 dry-run/paper 模拟）
+- **live 实盘默认关闭**：EIP-712 签名 + CLOB 下单已实现，但 `config.yaml` 的
+  `live.enabled` 默认 `false`（env 无法覆盖，只能改文件）。启用前必须 testnet 验证 +
+  资金准备（见 README"实盘交易（live）"）
+- **实盘护栏（不可绕过）**：无凭证拒绝 / 单笔 > `live.max_order_usd`（默认 $10）拒绝 /
+  价格不在 [0.03, 0.97] 拒绝 / USDC 不足拒绝 / 下单前终端输入 `yes` 确认 /
+  不自动重试下单 / 实盘部分成交**不自动回滚**（真实成交不可撤销）
+- **paper 是默认推荐模式**：收益率回测、策略验证一律用 paper（真实取价模拟成交）
 - **仓位 $1/笔**：默认最小仓位验证信号，放大仓位前至少累积 100+ 结算样本
 - **`seen_slugs.txt` 勿删**：删除会导致已交易盘口重新开单（同一窗口重复交易）
 - **面板与守护进程的端口**：8787 默认；冲突时 `--port` 换端口

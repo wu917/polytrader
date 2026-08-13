@@ -1,6 +1,7 @@
 """风控与执行层测试：Kelly、RiskManager 熔断、Broker 三模式、OrderManager。"""
 import pytest
 
+from polytrader.data.clob_client import ClobClient
 from polytrader.execution.broker import DryRunBroker, LiveBroker, make_broker
 from polytrader.execution.order_manager import OrderManager
 from polytrader.models import Market, OrderBook, OrderBookLevel, Outcome, Side, Signal, SignalType
@@ -134,10 +135,19 @@ def test_dry_run_broker_fills():
 
 
 def test_live_broker_refuses():
-    broker = LiveBroker(credentials_present=False)
+    # 无凭证 / 无 clob 认证 → 拒绝；安全护栏默认生效
+    broker = LiveBroker(clob=ClobClient(), private_key="")
     trade = broker.place(make_signal(price=0.50, size=100.0))
     assert trade.status == "rejected"
-    assert "not implemented" in trade.reason
+    assert "credentials" in trade.reason
+
+
+def test_live_broker_rejects_size_over_cap():
+    # 单笔超过硬上限 → 拒绝（即使有私钥，凭证缺仍先拒绝）
+    broker = LiveBroker(clob=ClobClient(), private_key="0x" + "11" * 32,
+                        max_order_usd=10.0)
+    trade = broker.place(make_signal(price=0.50, size=100.0))
+    assert trade.status == "rejected"
 
 
 def test_make_broker_modes():
