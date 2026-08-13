@@ -36,13 +36,26 @@ def insert_pending(recs: list[dict]) -> int:
         return 0
     sql = ("INSERT IGNORE INTO pending_trades "
            "(trade_id, slug, coin, `window`, side, entry_price, size_usd, "
-           "round, results_file) "
+           "round, results_file, mode, order_id, order_status) "
            "VALUES (%(trade_id)s, %(slug)s, %(coin)s, %(window)s, %(side)s, "
-           "%(entry_price)s, %(size_usd)s, %(round)s, %(results_file)s)")
+           "%(entry_price)s, %(size_usd)s, %(round)s, %(results_file)s, "
+           "%(mode)s, %(order_id)s, %(order_status)s)")
+    rows = []
+    for r in recs:
+        rows.append({
+            "trade_id": r["trade_id"], "slug": r["slug"],
+            "coin": r.get("coin"), "window": r.get("window"),
+            "side": r["side"], "entry_price": r["entry_price"],
+            "size_usd": r["size_usd"], "round": r.get("round"),
+            "results_file": r.get("results_file"),
+            "mode": r.get("mode", "simulate"),
+            "order_id": r.get("order_id"),
+            "order_status": r.get("order_status"),
+        })
     conn = connect()
     try:
         with conn.cursor() as cur:
-            cur.executemany(sql, recs)
+            cur.executemany(sql, rows)
         return cur.rowcount
     finally:
         conn.close()
