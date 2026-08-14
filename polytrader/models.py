@@ -70,6 +70,8 @@ class OrderBook:
     bids: list[OrderBookLevel] = field(default_factory=list)
     asks: list[OrderBookLevel] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
+    min_order_size: float = 0.0      # CLOB 市场最小订单规模（份额），book API 返回
+    tick_size: float = 0.0           # 价格最小增量
 
     def best_bid(self) -> Optional[OrderBookLevel]:
         return self.bids[0] if self.bids else None

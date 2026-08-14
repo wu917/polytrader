@@ -72,6 +72,14 @@ class ClobClient:
         if not isinstance(data, dict):
             return None
         book = OrderBook(token_id=token_id)
+        try:
+            book.min_order_size = float(data.get("min_order_size") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            book.tick_size = float(data.get("tick_size") or 0)
+        except (TypeError, ValueError):
+            pass
         for level in data.get("bids", []) or []:
             parsed = _to_level(level)
             if parsed and parsed.price > 0:
