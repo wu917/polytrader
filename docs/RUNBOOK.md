@@ -281,6 +281,11 @@ curl "https://data-api.polymarket.com/positions?user=<deposit wallet>&limit=10"
 - 精度（官方规则）：tick=0.01 → 价格 ≤2 位小数、份额 ≤2 位小数（BUY 向上取整）、
   USD ≤4 位小数；FOK BUY 最小 $1（$0.99 会被拒）；5m 盘 orderMinSize=5 shares
   （<5 shares 会被拒）
+- **TODO（待办）**：`orderMinSize=5 shares` 意味着 `--size $1` 在价格 >0.2 时
+  份额必 <5，CLOB 直接拒单（实测 2026-08-14：Size (1.54) lower than minimum: 5）。
+  修法二选一：① `--size` 默认提高到 $5（@0.5 得 10 shares）；② place_maker 前
+  预检 `size/price < 5` → 跳过该信号并警告（避免每次拒单刷屏）。当前行为：
+  拒单打印 `❌ 下单失败` 且不进 pending（无脏数据，仅浪费一次下单尝试）
 - 每单有 ~$0.03 手续费（余额需覆盖 order + fee）
 - ERC-7739 签名必须由 **EOA** 签嵌套 TypedDataSign（maker=signer=deposit wallet，
   verifyingContract=CTF Exchange V2）；与官方 SDK 逐字节一致（单测交叉验证）
