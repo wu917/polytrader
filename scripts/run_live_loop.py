@@ -98,7 +98,8 @@ def derive_creds(eoa: str, pk: str) -> dict:
 def place_fok(creds: dict, eoa: str, pk: str, deposit: str,
               token_id: str, side: int, size_usd: float, price: float) -> dict:
     """FOK 真实下单，返回响应（成功含 orderID/status/transactionsHashes）。"""
-    maker_amt, taker_amt = order_v2.calc_amounts(side, size_usd, price)
+    maker_amt, taker_amt = order_v2.calc_amounts(side, size_usd, price,
+                                                 marketable=True)
     ts_ms = str(time.time_ns() // 1_000_000)
     td = order_v2.build_order_typed_data(
         maker=deposit, signer=deposit, token_id=token_id,

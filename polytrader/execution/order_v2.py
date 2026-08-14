@@ -95,15 +95,17 @@ def round_price_tick(price: float, tick_size: float = 0.01) -> float:
     return round(ticks * tick_size, 4)
 
 
-def calc_amounts(side: int, size: float, price: float) -> tuple[int, int]:
-    """limit order 的 (maker_amount, taker_amount)（6 decimals）。
+def calc_amounts(side: int, size: float, price: float,
+                 marketable: bool = False) -> tuple[int, int]:
+    """(maker_amount, taker_amount)（6 decimals）。
 
-    遵循官方文档精度规则（tick=0.01 → Price 2 位 / Size 2 位 / Amount 4 位）：
-    1. price 按 tick 取整（≤2 位小数）
-    2. 份额 round DOWN 到 2 位小数
-    3. USD 金额 round UP 到 6 位、再 DOWN 到 4 位（Amount decimals）
-    BUY:  maker=USD(price×shares)，taker=shares
-    SELL: maker=shares，taker=USD(price×shares)
+    精度规则分两类（CLOB 实测 + 官方文档）：
+    - limit (GTC/GTD)：tick=0.01 → Price 2 位 / Size(份额) 2 位 / Amount(USD) 4 位
+    - marketable (FOK/FAK)：**market buy 金额 ≤2 位、份额 ≤4 位**
+      （CLOB 拒绝消息：market buy orders maker amount max 2 decimals,
+       taker amount max 4 decimals）；market sell 对称（份额 4 位、金额 2 位）
+
+    BUY:  maker=USD，taker=shares；SELL: maker=shares，taker=USD
     """
     from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING
 
@@ -117,6 +119,22 @@ def calc_amounts(side: int, size: float, price: float) -> tuple[int, int]:
         return int((v * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
 
     price_d = Decimal(str(round_price_tick(price)))
+    if marketable:
+        # marketable：金额 ≤2 位、份额 ≤4 位（与 limit 相反）
+        if side == BUY:
+            usd = Decimal(str(size)).quantize(Decimal("0.01"),
+                                              rounding=ROUND_HALF_UP)
+            shares = (usd / price_d).quantize(Decimal("0.0001"),
+                                              rounding=ROUND_DOWN)
+            if shares == 0:
+                shares = Decimal("0.0001")
+            return _to_6(usd), _to_6(shares)
+        else:
+            shares = Decimal(str(size)).quantize(Decimal("0.0001"),
+                                                 rounding=ROUND_DOWN)
+            usd = (shares * price_d).quantize(Decimal("0.01"),
+                                              rounding=ROUND_HALF_UP)
+            return _to_6(shares), _to_6(usd)
     if side == BUY:
         # BUY: size = 美元金额；shares = ceil(usd/price, 2 位)（向上取整保证
         # 金额不缩水），usd = shares×price（4 位）→ 隐含价精确 = price。
