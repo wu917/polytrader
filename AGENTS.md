@@ -21,7 +21,7 @@ Polymarket 预测市场的 **updown 5m/15m 快速市场模拟交易工具链**�
 | MySQL | 8.0.46 arm64，安装于 `../mysql-8.0.46/`（workspace 下，非 brew） |
 | MySQL 连接 | `127.0.0.1:3306`，user `root`，密码见 `.env` 的 `POLY_DB_PASS`，库 `polytrader` |
 | LLM | DeepSeek（`.env`：`LLM_API_KEY` / `LLM_BASE_URL=https://api.deepseek.com/v1` / `LLM_MODEL=deepseek-chat`） |
-| 网络 | **必须走 macOS 系统代理 `127.0.0.1:7897`**：requests 默认 `trust_env=True` 自动走系统代理；裸 TCP/curl 直连 Polymarket 全不通（000）。主网 CLOB/Gamma 经代理可达 |
+| 网络 | **必须走本地 SOCKS5 代理 `127.0.0.1:7890`**（.env `HTTP_PROXY`/`HTTPS_PROXY` 与代码 `_req` 均硬编码此端口）：requests 需显式 `proxies=`（默认 trust_env 有时不生效）；裸 TCP/curl 直连 Polymarket 全不通（000）。主网 CLOB/Gamma 经代理可达 |
 | 网络抖动 | gamma-api 偶发 `SSL EOF` 抖动（几分钟级），扫描失败**不中断循环**，重试即可 |
 | 测试网 | `clob-staging.polymarket.com` 经当前代理**不可达**（000）——测试网全链路验证需换可用代理节点 |
 
@@ -56,6 +56,16 @@ settle_worker.py（常驻独立进程，任务停止后结算不停止）
 
 run_daemon.py（无限挂机）：每轮复用 run_llm_loop --rounds 1；结算交给 settle_worker
 backfill_settlements.py（兜底补结算）：仅当 settle_worker 未运行时才需要手动跑
+
+实盘循环脚本（真实资金，默认关闭，需用户显式确认）：
+run_live_loop.py（5m 加密 updown）：每轮一个 5m 窗口，窗口内 --scan-interval 扫、
+  --stop-before(40s) 停；信号过坏单过滤[0.25,0.85]后走 **maker GTC post_only**（--maker-offset
+  挂 ref±offset 按 tick 0.01 取整），--wait-fill 轮询成交、超时撤单
+run_event_live_loop.py（通用事件盘）：maker GTC，--wait/--poll 轮询、未成交撤单
+run_equity_live_loop.py（股票/商品日级）：FOK 吃单
+下单精度（官方规则，order_v2.calc_amounts 实现）：tick=0.01 → 价格 2 位小数、
+份额 2 位（BUY 向上取整保证隐含价精确落 tick）、USD 4 位小数；5m 盘
+orderMinSize=5 shares、orderPriceMinTickSize=0.01（book API 返回）
 ```
 
 **开单条件（完整判定链）**：ref 价可解析 → 价格带 `0.03 ≤ ref ≤ 0.97` → 行情上下文拉取成功
@@ -78,7 +88,7 @@ backfill_settlements.py（兜底补结算）：仅当 settle_worker 未运行时
 - 代码注释、提交说明用中文；标识符、文件名、命令用英文
 - 回复用户用简体中文；思考也保持中文
 - 改 `run_llm_loop.py` 时同步检查 `run_daemon.py`（它 subprocess 调 run_llm_loop 且传参数）与 `settle_worker.py`（共享 MySQL pending）
-- 验证三件套：`python -m py_compile <改动文件>` + `.venv/bin/python -m pytest tests/`（127 个）
+- 验证三件套：`python -m py_compile <改动文件>` + `.venv/bin/python -m pytest tests/`（186 个）
   + 实跑观察关键日志（无对齐等待 / 30s 间隔 / 窗口结束前 40s 停 / [db] 入库 / settle worker ensured）
 - 长任务（多轮窗口）用 `run_in_background` 后台跑，按每轮 5-10 分钟估算耗时
 - `run_llm_loop` 的 SUMMARY 是"已结算部分"——结算由 settle_worker 异步追加到结果文件，看完整收益率需 `settle_worker status` 显示 pending=0 后重读结果文件
@@ -86,6 +96,12 @@ backfill_settlements.py（兜底补结算）：仅当 settle_worker 未运行时
 - **live 实盘规则**：`config.yaml` 的 `live.enabled` 默认 false 且**禁止 env 覆盖**
   （在 ENV_PROTECTED_PATHS）；改 `execution/signer.py` / `clob_client.py` 下单逻辑后必须
   跑 `tests/` 全量 + 新增/更新对应单测；任何实盘改动默认保持"默认关闭 + 护栏"语义
+- **实盘脚本验证禁止真实下单（已踩坑，$1 损失）**：`run_live_loop.py` /
+  `run_event_live_loop.py` / `run_equity_live_loop.py` / `verify_live_*.py` 是真实交易
+  入口——即使 `--rounds 1` / `--size 1` 最小参数，LLM 一出 edge 信号就走 place_fok/
+  place_maker 真实下单、扣 deposit wallet 的 pUSD。**任何临时验证脚本不得直接调用下单
+  函数**；验证只做 py_compile / --help / pytest / 静态走查 / mock 下单函数。需要真实
+  跑盘前必须用户单独确认金额与授权。教训细节见全局记忆「实盘脚本验证禁止真实下单」
 
 ## 6. 常用命令速查
 

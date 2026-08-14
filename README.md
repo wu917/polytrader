@@ -29,8 +29,9 @@ python3.11 -m venv .venv
 .venv/bin/python -m pytest tests/        # 187 个测试
 ```
 
-网络说明：本机访问 Polymarket **经 macOS 系统代理 127.0.0.1:7897**（requests 默认自动走系统
-代理；裸直连不通）。若在无代理环境运行，需在 `HttpClient(proxy=...)` 显式配置可用代理。
+网络说明：本机访问 Polymarket **经本地 SOCKS5 代理 127.0.0.1:7890**（.env `HTTP_PROXY`/
+`HTTPS_PROXY` 与代码 `_req`/`HttpClient` 均显式配置此端口；裸直连不通）。若在无代理
+环境运行，需在 `HttpClient(proxy=...)` 显式配置可用代理。
 
 ## 架构
 
@@ -77,7 +78,7 @@ scripts/
 ├── settle_worker.py     # 常驻结算进程（任务退出后结算不停止）
 ├── run_daemon.py        # 无限挂机守护进程（复用 run_llm_loop --rounds 1）
 ├── backfill_settlements.py # 兜底补结算（settle_worker 未运行时才需要）
-├── run_live_loop.py     # 5m 加密 updown 实盘循环（FOK 吃单）
+├── run_live_loop.py     # 5m 加密 updown 实盘循环（maker GTC post_only，挂单轮询成交）
 ├── run_event_live_loop.py # 通用事件盘实盘循环（maker GTC post_only）
 ├── run_equity_live_loop.py # 股票/商品日级实盘循环（FOK 吃单）
 ├── scan_event_markets.py  # 通用事件盘扫描 + LLM 评估
@@ -149,8 +150,10 @@ side/signatureType/timestamp/metadata/builder），domain version "2"，
 verifyingContract = CTF Exchange V2（`0xE111180000d2663C0091e4f400237545B87B996B`）。
 deposit wallet 订单签名 = ERC-7739 wrapped（EOA 签嵌套 TypedDataSign，636 hex 字符），
 与官方 `@polymarket/clob-client-v2` **逐字节一致**（单测交叉验证）。
-精度：USD ≤2 位小数、shares ≤4 位小数；FOK/marketable BUY 最小 $1；每单有手续费
-（fee estimate ~$0.03）。
+精度（官方文档规则，`order_v2.calc_amounts` 实现）：tick=0.01 → 价格 ≤2 位小数、
+份额 ≤2 位小数（BUY 份额向上取整保证隐含价精确落 tick）、USD ≤4 位小数；
+FOK/marketable BUY 最小 $1；每单有手续费（fee estimate ~$0.03）。
+5m 盘实测约束：`orderPriceMinTickSize=0.01`、`orderMinSize=5 shares`（book API 返回）。
 
 **已实测（2026-08-14，$1 真实成交）**：
 认证 → 签名 → 下单（200 matched）→ 链上成交（tx status=1）→ 持仓 2.2222 shares
@@ -159,7 +162,11 @@ deposit wallet 订单签名 = ERC-7739 wrapped（EOA 签嵌套 TypedDataSign，6
 
 **坏单过滤（实盘与模拟通用）**：预期成交价须在 **[0.25, 0.85]**（`run_live_loop`
 按吃单侧盘口价预检，空壳盘口超范围则过滤；`simulate_*` 同规则），避免在空壳
-盘口上以极端价格成交。
+盘口上以极端价格成交。**实测（2026-08-14）**：5m 盘空壳盘口下 FOK 100% 无法
+成交（无对手盘，400 "couldn't be fully filled"）；改 maker GTC post_only 后
+挂单可成功，但远价 maker 单可能被对手盘吃掉（$1@0.10 曾被 MATCHED 后结算归零，
+损失 $1）——maker 单的风险不在价格远近而在有无对手盘，验证脚本严禁真实下单
+（见 AGENTS.md 第 5 节）。
 
 **实现**：`execution/order_v2.py`（V2 订单 + ERC-7739 签名）、`execution/chain.py`
 （链上广播：sign + eth_sendRawTransaction + RPC 轮换）、`execution/relayer.py`
@@ -214,7 +221,9 @@ PYTHONPATH=. .venv/bin/python scripts/run_event_live_loop.py \
 > `run_equity_live_loop`）均涉及**真实资金**，默认每轮最多 1 笔、$1/笔，
 > 资金预检（deposit wallet pUSD 需覆盖 size + 手续费）。实盘/模拟成交均
 > 写入 `pending_trades`（`mode` 字段区分 `live`/`simulate`），由
-> `settle_worker` 常驻进程自动结算。
+> `settle_worker` 常驻进程自动结算。`run_live_loop` 现为 maker 模式
+> （`--maker-offset` 挂 ref±offset、`--wait-fill` 轮询成交超时撤单），
+> 参数见 `--help`。
 
 ### updown 5/15 分钟快速市场（专项工具链）
 

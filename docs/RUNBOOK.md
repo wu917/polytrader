@@ -258,13 +258,16 @@ curl https://bridge.polymarket.com/supported-assets   # 确认支持链/最小�
 curl "https://bridge.polymarket.com/status/<桥地址>"   # 查到账进度
 ```
 
-### 9.3 下单（FOK $1，自动取当前 btc 5m 窗口）
+### 9.3 下单验证脚本（真实下单，谨慎）
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/verify_live_order_v2.py
 ```
 成功：HTTP 200 + `"status":"matched"` + `transactionsHashes`（链上成交）。
-注意：FOK 必须能立即全部成交；窗口临结束（盘口单边）会 400 "couldn't be fully filled"，
-等新窗口重试即可。余额不足会报 `not enough balance / allowance`（需先充值）。
+注意：**这是真实下单脚本**（FOK $1），会真扣 deposit wallet 的 pUSD——验证
+链路时需用户确认金额与授权后再跑；临时验证脚本严禁直接调用下单函数（教训见
+AGENTS.md 第 5 节）。FOK 必须能立即全部成交；窗口临结束（盘口单边）会 400
+"couldn't be fully filled"，等新窗口重试即可。余额不足会报 `not enough
+balance / allowance`（需先充值）。
 
 ### 9.4 查订单/持仓/结算
 ```bash
@@ -275,7 +278,9 @@ curl "https://data-api.polymarket.com/positions?user=<deposit wallet>&limit=10"
 
 ### 9.5 关键坑位（已踩过）
 - tokenId 在 POST body 必须是**字符串**（大整数 int 序列化 → 400 Invalid order payload）
-- USD ≤2 位小数、shares ≤4 位小数；FOK BUY 最小 $1（$0.99 会被拒）
+- 精度（官方规则）：tick=0.01 → 价格 ≤2 位小数、份额 ≤2 位小数（BUY 向上取整）、
+  USD ≤4 位小数；FOK BUY 最小 $1（$0.99 会被拒）；5m 盘 orderMinSize=5 shares
+  （<5 shares 会被拒）
 - 每单有 ~$0.03 手续费（余额需覆盖 order + fee）
 - ERC-7739 签名必须由 **EOA** 签嵌套 TypedDataSign（maker=signer=deposit wallet，
   verifyingContract=CTF Exchange V2）；与官方 SDK 逐字节一致（单测交叉验证）
@@ -286,10 +291,11 @@ curl "https://data-api.polymarket.com/positions?user=<deposit wallet>&limit=10"
 
 | 脚本 | 盘面 | 执行方式 | 典型调用 |
 |---|---|---|---|
-| `run_live_loop.py` | 5m 加密 updown | FOK 吃单 | `--rounds 3 --size 1 --min-edge 0.04` |
+| `run_live_loop.py` | 5m 加密 updown | maker GTC（post_only，--maker-offset 挂价） | `--rounds 3 --size 1 --min-edge 0.04 --wait-fill 90` |
 | `run_event_live_loop.py` | 通用事件盘 | maker GTC（post_only） | `--size 1 --min-edge 0.05 --min-rr 1.5 --wait 600` |
 | `run_equity_live_loop.py` | 股票/商品日级 | FOK 吃单 | `--size 1 --min-edge 0.05 --min-liquidity 200` |
 
 三者默认每轮最多 1 笔、$1/笔；成交写入 `pending_trades`（`mode='live'`），
-由 `settle_worker` 自动结算。maker 单挂单后轮询订单状态（`--wait`/`--poll`），
-未成交自动撤单。坏单过滤：预期成交价须在 [0.25, 0.85]，超范围跳过。
+由 `settle_worker` 自动结算。maker 单挂单后轮询订单状态（`--wait`/`--poll`/
+`--wait-fill`），未成交自动撤单。坏单过滤：预期成交价须在 [0.25, 0.85]，超范围跳过。
+**均为真实资金脚本**——验证阶段严禁直接运行或调用其下单函数（见 AGENTS.md 第 5 节）。
