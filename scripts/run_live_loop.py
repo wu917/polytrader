@@ -242,8 +242,8 @@ def main() -> int:
                     help="参与的市场窗口（与 run_llm_loop 一致）")
     ap.add_argument("--scan-interval", type=int, default=30,
                     help="窗口内扫描间隔秒（默认 30；0=每窗口仅扫 1 次）")
-    ap.add_argument("--stop-before", type=int, default=40,
-                    help="窗口结束前 N 秒停止该窗口的扫描（默认 40）")
+    ap.add_argument("--stop-before", type=int, default=80,
+                    help="窗口结束前 N 秒停止扫描（默认 80）")
     ap.add_argument("--size", type=float, default=1.0, help="每笔 USD（默认 $1）")
     ap.add_argument("--min-edge", type=float, default=0.04)
     ap.add_argument("--coins", type=str, default=",".join(COINS))
@@ -401,11 +401,11 @@ def main() -> int:
                     price = round(min(0.85, max(0.01, base + args.fok_slip)), 2)
                     # ⚠️ 窗口剩余时间闸：LLM 评估耗时（3-70s×多市场）可能跨越
                     # 窗口结束点（stop-before 只约束扫描开始），评估完下单时
-                    # 窗口可能已结束。剩余 <15s 直接跳过，不在临收盘/已收盘
+                    # 窗口可能已结束。剩余 <30s 直接跳过，不在临收盘/已收盘
                     # 的市场上开单。
-                    if w_end - int(time.time()) < 15:
+                    if w_end - int(time.time()) < 30:
                         print(f"  {m.slug} {side_str} 窗口剩余 "
-                              f"{w_end - int(time.time())}s <15s，跳过下单")
+                              f"{w_end - int(time.time())}s <30s，跳过下单")
                         continue
                     # ⚠️ 下单前校验 token 在 CLOB 有效（防偶发 invalid token id）
                     if not verify_token(token_id):
