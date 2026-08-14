@@ -36,6 +36,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
+# ⚠️ 硬性风控（用户强制，不可覆盖）：单笔最大 $1，绝不放大仓位。
+MAX_ORDER_USD = 1.0
+
 from polytrader import db  # noqa: E402
 from polytrader.execution import order_v2, signer  # noqa: E402
 from polytrader.execution.signer import l2_headers_new  # noqa: E402
@@ -61,11 +64,15 @@ class _Tee:
         self.fh.flush()
 
 
+# 代理：优先 HTTPS_PROXY 环境变量（缺省回退本机 socks5 7890，保持原行为）
+PROXY = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+         or "socks5h://127.0.0.1:7890")
+
+
 def _req(method: str, url: str, **kw):
     # 中国大陆环境必须走本地代理访问 clob.polymarket.com；
     # headers 从 kw 中取出，重试时保持同一份（避免重试丢失导致 401）
-    proxies = {"http": "socks5h://127.0.0.1:7890",
-               "https": "socks5h://127.0.0.1:7890"}
+    proxies = {"http": PROXY, "https": PROXY}
     headers = kw.pop("headers", {})
     for i in range(4):
         try:
@@ -157,15 +164,26 @@ def cancel_order(creds: dict, eoa: str, order_id: str) -> dict:
     return {"status_code": r.status_code, "body": r.text}
 
 
-def wait_order_fill(clob, order_id: str, timeout: int = 100,
-                    poll: int = 10) -> dict | None:
+def get_order_auth(creds: dict, eoa: str, order_id: str) -> dict:
+    """带 L2 认证查询订单（V2 端点需 POLY_* HMAC 头，不能裸调）。"""
+    path = f"/data/order/{order_id}"
+    h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
+                        creds["secret"], "GET", path)
+    r = _req("GET", f"https://clob.polymarket.com{path}", headers=h2)
+    r.raise_for_status()
+    return r.json()
+
+
+def wait_order_fill(creds: dict, eoa: str, order_id: str,
+                    timeout: int = 100, poll: int = 10) -> dict | None:
     """轮询订单成交状态，timeout 秒内 matched 则返回订单详情，否则 None。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(poll)
         try:
-            od = clob.get_order(order_id)
-        except Exception:
+            od = get_order_auth(creds, eoa, order_id)
+        except Exception as e:
+            print(f"    (get_order 失败 {str(e)[:50]}，继续轮询)")
             continue
         if not isinstance(od, dict):
             continue
@@ -225,6 +243,11 @@ def main() -> int:
     ap.add_argument("--log", type=str, default="",
                     help="日志文件路径（输出同时写文件，默认只输出到 stdout）")
     args = ap.parse_args()
+    # ⚠️ 强制单笔 $1 硬上限：传更大的 --size 直接拒绝启动（用户风控，不可覆盖）
+    if args.size <= 0 or args.size > MAX_ORDER_USD:
+        print(f"!! --size {args.size} 非法：须 (0, {MAX_ORDER_USD}] 区间 "
+              f"（用户风控，强制 $1/单，不可多买）。已拒绝启动。")
+        return 1
     if args.log:
         sys.stdout = _Tee(args.log)  # type: ignore[assignment]
         # logging 输出也进同一日志文件（统一集合到 log）
@@ -283,6 +306,19 @@ def main() -> int:
             w_start = (now // win_secs) * win_secs     # 当前窗口起点（不做对齐等待）
             w_end = w_start + win_secs
             print(f"  window {w_start} -> {w_end} (enter mid-window at {now})")
+            # ⚠️ 每轮复查余额（成交会扣款，防止资金不足时无效下单）
+            try:
+                bal_now = chain.call_balance(chain.PUSD, deposit) / 1e6
+            except Exception as e:
+                print(f"  (余额查询失败 {str(e)[:40]}，按预算假设继续)")
+                bal_now = bal
+            if bal_now < args.size + 0.05:
+                print(f"  !! 资金不足（${bal_now:.2f} < ${args.size + 0.05}），"
+                      f"本轮跳过，等下一窗口")
+                d = (w_end + 2) - int(time.time())
+                if d > 0 and i < args.rounds:
+                    time.sleep(d)
+                continue
 
             scans = 0
             while True:
@@ -293,8 +329,14 @@ def main() -> int:
                     break
                 scans += 1
                 print(f"  scan {scans} @ {time.strftime('%H:%M:%S')}")
-
-                markets = fetch_windows(http, cm, windows=win_filter)
+                try:  # ⚠️ 单次扫描异常不崩溃：跳过本次扫描继续
+                    markets = fetch_windows(http, cm, windows=win_filter)
+                except Exception as e:
+                    print(f"  (fetch_windows 失败 {str(e)[:60]}，本次扫描跳过)")
+                    if args.scan_interval <= 0:
+                        break
+                    time.sleep(args.scan_interval)
+                    continue
                 # 去重：seen 文件（与 simulate 共用，live 只去重自身成交过的 slug）
                 already = {s for s in markets if s in seen}
                 markets = {s: m for s, m in markets.items() if s not in seen}
@@ -304,8 +346,14 @@ def main() -> int:
                         break
                     time.sleep(args.scan_interval)
                     continue
-                # 只对存活窗口评估
-                signals = strat.scan(list(markets.values()))
+                try:  # ⚠️ 评估/下单段异常不崩溃：记日志后继续下一扫描
+                    signals = strat.scan(list(markets.values()))
+                except Exception as e:
+                    print(f"  (scan 失败 {str(e)[:60]}，本次扫描跳过)")
+                    if args.scan_interval <= 0:
+                        break
+                    time.sleep(args.scan_interval)
+                    continue
                 print(f"signals: {len(signals)}")
                 placed = 0
                 for s in signals:
@@ -317,7 +365,7 @@ def main() -> int:
                     m = s.market
                     idx = 0 if side_str == "YES" else 1
                     token_id = m.outcomes[idx].token_id
-                    # 预期成交价（吃单侧盘口价）：过滤坏单 [0.25, 0.85]
+                    # 预期成交价（吃单侧盘口价）：过滤坏单 [0.20, 0.85]
                     expect_fill = None
                     try:
                         b = clob.get_book(token_id)
@@ -329,14 +377,18 @@ def main() -> int:
                                                if b.best_bid() else None)
                     except Exception:
                         expect_fill = None
-                    if expect_fill is not None and not (0.25 <= expect_fill <= 0.85):
+                    if expect_fill is not None and not (0.20 <= expect_fill <= 0.85):
                         print(f"  {m.slug} {side_str} 预期成交价{expect_fill:.3f} "
-                              f"超范围[0.25,0.85] 过滤（空壳盘口）")
+                              f"超范围[0.20,0.85] 过滤（空壳盘口）")
                         continue
                     # maker 挂单价：ref 价 ± offset，再按 CLOB tick(0.01) 取整
                     # （ref 来自 Gamma outcomePrices 精度更高，直接挂会被
                     #   "breaks minimum tick size rule" 拒绝）
                     price = round(min(0.99, float(s.market_price) + args.maker_offset), 2)
+                    # ⚠️ 防重复：无论下单成败，本窗口该 slug 立即记入 seen，
+                    # 避免 30s 后同窗口重复开单（挂单未成交被撤也记）
+                    seen.add(m.slug)
+                    save_seen(args.seen_file, seen)
                     print(f"  {m.slug} {side_str} llm_p={s.extra.get('llm_p',0):.3f} "
                           f"ref={s.market_price:.3f} edge={s.edge:+.3f} "
                           f"MAKER@{price} ${args.size} (offset {args.maker_offset:+.2f})")
@@ -353,12 +405,20 @@ def main() -> int:
                         print(f"    ✅ 已挂单 {str(order_id)[:24]}... "
                               f"status={body.get('status')}，等待成交...")
                         # 轮询成交：窗口内最多等 --wait-fill 秒，超时撤单
-                        filled = wait_order_fill(clob, order_id,
+                        filled = wait_order_fill(creds, eoa, order_id,
                                                  timeout=args.wait_fill)
                         if filled is None:
                             print(f"    ⏱️ {args.wait_fill}s 未成交，撤单")
-                            cx = cancel_order(creds, eoa, order_id)
-                            print(f"    cancel: {cx['status_code']} {cx['body'][:80]}")
+                            cx = None
+                            for _ in range(2):  # 撤单失败重试，避免挂单残留占用资金
+                                cx = cancel_order(creds, eoa, order_id)
+                                print(f"    cancel: {cx['status_code']} {cx['body'][:80]}")
+                                if cx["status_code"] == 200:
+                                    break
+                                time.sleep(3)
+                            if cx and cx["status_code"] != 200:
+                                print(f"    ⚠️ 撤单失败（挂单可能残留！）"
+                                      f"orderID={order_id} 请人工核对")
                             continue
                         body = filled  # 用成交订单详情继续入库
                         print(f"    ✅ 成交 order {str(order_id)[:20]}...")
@@ -379,7 +439,7 @@ def main() -> int:
                             "coin": m.slug.split("-")[0],
                             "window": "5m" if "-5m-" in m.slug else "15m",
                             "side": side_str,
-                            "entry_price": round(float(s.market_price), 4),
+                            "entry_price": round(price, 4),   # 实际挂单价（非 ref）
                             "size_usd": args.size,
                             "round": i,
                             "mode": "live",
