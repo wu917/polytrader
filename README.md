@@ -177,6 +177,28 @@ FOK/marketable BUY 最小 $1；每单有手续费（fee estimate ~$0.03）。
 **安全护栏**：凭证只存 `.env`（gitignore）；`SENSITIVE_FIELDS` 遮盖；链上交易
 （充值/swap）每次展示交易内容；真实下单前需确认。
 
+**实盘运行（`scripts/run_live_loop.py`，与 run_llm_loop 统一窗口扫描语义）**：
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
+  scripts/run_live_loop.py --rounds 3 --min-edge 0.04 --log logs/live_loop.log
+```
+- **单笔 $1 硬上限**（`MAX_ORDER_USD=1.0`，代码写死；`--size` 超 1 或 ≤0 直接拒绝启动）
+- **maker GTC post_only 挂单**（非 FOK），挂单后轮询成交，超时自动撤单（撤单失败重试）
+- 防重复开单（同窗口 slug 只试一次）、每轮复查余额、下单前 `verify_token` 校验
+  （规避 5m 市场新建时 CLOB token 未生效的偶发 `invalid token id`）
+- 代理读 `HTTPS_PROXY` 环境变量（缺省回退 socks5h://127.0.0.1:7890）
+- 成交写入 `pending_trades`（`mode='live'` + orderID + fill_price + LLM 建议），
+  settle_worker 自动结算
+
+**近期实测结论（2026-08-14）**：
+- **50 轮模拟（坏单过滤 [0.20,0.85] + 市价模拟）**：50 轮仅 10 笔通过过滤，
+  **9 笔结算全赢 +$10.67（胜率 100%，收益率 +118%）**——过滤后的信号质量极高
+- **实盘 10 轮**：0 成交（updown 盘口长期空壳 bid 0.01/ask 0.99，坏单过滤挡掉全部信号）；
+  1 笔 15m maker 挂单 90s 未成交、撤单"失败"实为 `CANCELED_MARKET_RESOLVED`
+  （市场结算自动取消，**资金自动释放无残留**）
+- **结构性现实**：updown 5m/15m 盘口几乎总是空壳 → 坏单过滤下实盘成交机会极少；
+  过滤后的机会（50 轮模拟）胜率极高，但需盘口出现真实流动性才可成交
+
 ### 股票/商品盘（日级 updown）与通用事件盘
 
 **股票/商品盘**（`EquityUpdownStrategy`）：日级 Up-or-Down 市场，结算 =

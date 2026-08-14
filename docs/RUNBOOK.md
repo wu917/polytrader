@@ -304,3 +304,32 @@ curl "https://data-api.polymarket.com/positions?user=<deposit wallet>&limit=10"
 由 `settle_worker` 自动结算。maker 单挂单后轮询订单状态（`--wait`/`--poll`/
 `--wait-fill`），未成交自动撤单。坏单过滤：预期成交价须在 [0.25, 0.85]，超范围跳过。
 **均为真实资金脚本**——验证阶段严禁直接运行或调用其下单函数（见 AGENTS.md 第 5 节）。
+
+### 9.7 实盘运行要点（run_live_loop，2026-08-14 实测补充）
+
+```bash
+# 启动 3 轮实盘（本机代理 7897；代理走 HTTPS_PROXY 环境变量，缺省 7890）
+HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
+  scripts/run_live_loop.py --rounds 3 --min-edge 0.04 --size 1 --log logs/live_loop.log
+```
+
+**硬性风控（代码写死，不可覆盖）**：
+- 单笔 `$1` 上限（`MAX_ORDER_USD=1.0`）；`--size` >1 或 ≤0 直接拒绝启动
+- 同窗口 slug 只尝试一次（防重复开单）；每轮复查余额，不足跳过
+- 下单前 `verify_token`（GET /tick-size）校验，CLOB 侧无效跳过
+
+**常见现象与处理**：
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 0 成交（信号全被过滤） | updown 盘口长期空壳（bid 0.01/ask 0.99），坏单过滤 [0.20,0.85] 挡掉 | 正常；等盘口有真实流动性 |
+| `invalid token id` | 5m 市场新建时 CLOB token 未生效（瞬态） | 已加 verify_token 自动跳过 |
+| 撤单返回非 200（挂单疑似残留） | 市场已结算 → 订单 `CANCELED_MARKET_RESOLVED` | **资金自动释放**，无需人工处理 |
+| 挂单 90s 未成交 | 空壳盘口无对手单 | 自动撤单，等下一窗口 |
+| DeepSeek 偶发超时（30-90s） | 代理通道慢 | 自动重试（最多 3 次），主循环不崩 |
+
+**结算查询**：成交单 `mode='live'` 入库，含 orderID/fill_price/LLM 建议
+（llm_p/ref_price/edge/llm_reason/llm_model），settle_worker 自动结算：
+```sql
+SELECT trade_id, slug, side, entry_price, fill_price, llm_p, edge, win, pnl
+FROM pending_trades WHERE mode='live' ORDER BY created_at DESC LIMIT 20;
+```
