@@ -192,6 +192,9 @@ def main() -> int:
         except Exception:
             pass
 
+    # 只接受合理成交价（过滤空壳盘口坏价：0.97 吃单赢只赚 3%）
+    MIN_FILL, MAX_FILL = 0.20, 0.85
+
     def sim_market_price(book: dict | None, side: str, ref: float) -> float:
         """模拟市价单成交价：YES→ask；NO→1-bid（总成交，反映吃单成本）。
         盘口无数据时回退 ref 价。
@@ -210,11 +213,20 @@ def main() -> int:
     signals = strat.scan(list(markets.values()))
     print(f"signals: {len(signals)}")
     trades = []
+    skipped_bad = 0
     for s in signals:
         side = s.extra.get("side")
         fill = sim_market_price(books.get(s.market.condition_id), side,
                                 s.market_price) if side else None
         if fill is None:
+            continue
+        if not (MIN_FILL <= fill <= MAX_FILL):
+            skipped_bad += 1
+            print(f"  {s.market.slug:34s} {side:3s} 成交价{fill} 超范围[{MIN_FILL},{MAX_FILL}] 过滤")
+            audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                   "event": "trade_skipped_bad_price", "slug": s.market.slug,
+                   "side": side, "fill": fill,
+                   "reason": f"fill not in [{MIN_FILL},{MAX_FILL}]"}, audit_path)
             continue
         trade_id = str(uuid.uuid4())[:8]
         trades.append({"trade_id": trade_id,

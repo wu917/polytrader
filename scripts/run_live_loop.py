@@ -143,6 +143,8 @@ def main() -> int:
     strat = LLMUpdownStrategy(scorer, min_edge=args.min_edge, max_markets=20,
                               coin_map=cm)
     http = HttpClient(timeout=15)
+    from polytrader.data.clob_client import ClobClient
+    clob = ClobClient(http=http)
     win_filter = tuple(args.windows.split(","))
     results = []
     try:
@@ -170,6 +172,22 @@ def main() -> int:
                 m = s.market
                 idx = 0 if side_str == "YES" else 1
                 token_id = m.outcomes[idx].token_id
+                # 预期成交价（吃单侧盘口价）：过滤坏单 [0.20, 0.85]
+                expect_fill = None
+                try:
+                    b = clob.get_book(token_id)
+                    if b:
+                        if side_str == "YES":
+                            expect_fill = b.best_ask().price if b.best_ask() else None
+                        else:
+                            expect_fill = (1.0 - b.best_bid().price
+                                           if b.best_bid() else None)
+                except Exception:
+                    expect_fill = None
+                if expect_fill is not None and not (0.20 <= expect_fill <= 0.85):
+                    print(f"  {m.slug} {side_str} 预期成交价{expect_fill:.3f} "
+                          f"超范围[0.20,0.85] 过滤（空壳盘口）")
+                    continue
                 if args.market:
                     # 市价化：直接 0.99 吃单（空壳盘口只有 0.99 有卖单）
                     price = 0.99
