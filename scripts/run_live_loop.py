@@ -38,6 +38,7 @@ load_dotenv(ROOT / ".env")
 
 from polytrader import db  # noqa: E402
 from polytrader.execution import order_v2, signer  # noqa: E402
+from polytrader.execution.signer import l2_headers_new  # noqa: E402
 from scripts.simulate_llm_updown import (  # noqa: E402
     COINS, LLMUpdownStrategy, fetch_windows, load_seen, save_seen)
 
@@ -61,11 +62,16 @@ class _Tee:
 
 
 def _req(method: str, url: str, **kw):
+    # 中国大陆环境必须走本地代理访问 clob.polymarket.com；
+    # headers 从 kw 中取出，重试时保持同一份（避免重试丢失导致 401）
+    proxies = {"http": "socks5h://127.0.0.1:7890",
+               "https": "socks5h://127.0.0.1:7890"}
+    headers = kw.pop("headers", {})
     for i in range(4):
         try:
-            r = requests.request(method, url, timeout=20,
+            r = requests.request(method, url, timeout=20, proxies=proxies,
                                  headers={"User-Agent": "Mozilla/5.0",
-                                          **kw.pop("headers", {})}, **kw)
+                                          **headers}, **kw)
             return r
         except Exception as e:  # noqa: BLE001 代理抖动重试
             print(f"  重试{i + 1}: {str(e)[:50]}")
@@ -108,6 +114,69 @@ def place_fok(creds: dict, eoa: str, pk: str, deposit: str,
     return {"status_code": r.status_code, "body": r.text}
 
 
+def place_maker(creds: dict, eoa: str, pk: str, deposit: str,
+                token_id: str, side: int, size_usd: float,
+                price: float) -> dict:
+    """maker GTC 限价单（post_only=True）：挂单不成交则留在订单簿。
+
+    与 place_fok 的区别：orderType=GTC + postOnly=true，价格是限价
+    （期望成交价），不会以更差价格吃单；空壳盘口下先挂单等对手盘。
+    """
+    maker_amt, taker_amt = order_v2.calc_amounts(side, size_usd, price)
+    ts_ms = str(time.time_ns() // 1_000_000)
+    td = order_v2.build_order_typed_data(
+        maker=deposit, signer=deposit, token_id=token_id,
+        maker_amount=maker_amt, taker_amount=taker_amt,
+        side=side, signature_type=order_v2.POLY_1271,
+        timestamp_ms=ts_ms, contract=order_v2.CTF_EXCHANGE_V2)
+    sig1271 = order_v2.sign_order_poly1271(td, pk, order_v2.CTF_EXCHANGE_V2, 137)
+    order = {**td["message"], "signature": sig1271,
+             "salt": str(td["message"]["salt"]), "timestamp": ts_ms,
+             "metadata": order_v2.ZERO_BYTES32, "builder": order_v2.ZERO_BYTES32}
+    payload = order_v2.order_to_json_v2(order, owner=creds["apiKey"],
+                                        order_type="GTC", post_only=True)
+    serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
+                        creds["secret"], "POST", "/order", body=serialized)
+    h2["Content-Type"] = "application/json"
+    r = _req("POST", "https://clob.polymarket.com/order", data=serialized,
+             headers=h2)
+    return {"status_code": r.status_code, "body": r.text}
+
+
+def cancel_order(creds: dict, eoa: str, order_id: str) -> dict:
+    """撤销挂单（DELETE /order?orderID=...）。
+
+    官方签名规则：query param 不在签名内，message = ts + DELETE + /order
+    （无 body），因此 l2_headers_new 不传 body，order_id 走 query。
+    """
+    h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
+                        creds["secret"], "DELETE", "/order")
+    r = _req("DELETE", "https://clob.polymarket.com/order",
+             params={"orderID": order_id}, headers=h2)
+    return {"status_code": r.status_code, "body": r.text}
+
+
+def wait_order_fill(clob, order_id: str, timeout: int = 100,
+                    poll: int = 10) -> dict | None:
+    """轮询订单成交状态，timeout 秒内 matched 则返回订单详情，否则 None。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(poll)
+        try:
+            od = clob.get_order(order_id)
+        except Exception:
+            continue
+        if not isinstance(od, dict):
+            continue
+        st = od.get("status")
+        if st == "matched":
+            return od
+        if st in ("cancelled", "canceled", "expired"):
+            return None
+    return None
+
+
 def _settle_worker_alive() -> bool:
     pid = None
     if SETTLE_PID_FILE.exists():
@@ -146,8 +215,10 @@ def main() -> int:
     ap.add_argument("--min-edge", type=float, default=0.04)
     ap.add_argument("--coins", type=str, default=",".join(COINS))
     ap.add_argument("--per-round", type=int, default=1, help="每轮最多开几笔")
-    ap.add_argument("--market", action="store_true",
-                    help="市价化：BUY 直接 0.99 激进吃单（FOK 全成或撤）")
+    ap.add_argument("--maker-offset", type=float, default=0.01,
+                    help="maker 挂单价 = ref ± offset（默认 0.01，0=挂 ref 价）")
+    ap.add_argument("--wait-fill", type=int, default=90,
+                    help="挂单后等待成交秒数（默认 90），超时撤单")
     ap.add_argument("--seen-file", type=str,
                     default="backtest_results/seen_slugs.txt",
                     help="已交易 slug 持久化文件（与 simulate 共用同一去重文件）")
@@ -156,6 +227,9 @@ def main() -> int:
     args = ap.parse_args()
     if args.log:
         sys.stdout = _Tee(args.log)  # type: ignore[assignment]
+        # logging 输出也进同一日志文件（统一集合到 log）
+        from polytrader.logging_setup import setup_logging
+        setup_logging(level="INFO", log_file=args.log)
 
     # ---- 凭证与资金预检 ----
     pk = os.environ["POLYMARKET_PRIVATE_KEY"]
@@ -259,16 +333,15 @@ def main() -> int:
                         print(f"  {m.slug} {side_str} 预期成交价{expect_fill:.3f} "
                               f"超范围[0.25,0.85] 过滤（空壳盘口）")
                         continue
-                    if args.market:
-                        # 市价化：直接 0.99 吃单（空壳盘口只有 0.99 有卖单）
-                        price = 0.99
-                    else:
-                        price = round(min(0.99, float(s.market_price) + 0.01), 3)
+                    # maker 挂单价：ref 价 ± offset，再按 CLOB tick(0.01) 取整
+                    # （ref 来自 Gamma outcomePrices 精度更高，直接挂会被
+                    #   "breaks minimum tick size rule" 拒绝）
+                    price = round(min(0.99, float(s.market_price) + args.maker_offset), 2)
                     print(f"  {m.slug} {side_str} llm_p={s.extra.get('llm_p',0):.3f} "
                           f"ref={s.market_price:.3f} edge={s.edge:+.3f} "
-                          f"BUY@{price} ${args.size} {'[市价]' if args.market else ''}")
-                    resp = place_fok(creds, eoa, pk, deposit, token_id,
-                                     order_v2.BUY, args.size, price)
+                          f"MAKER@{price} ${args.size} (offset {args.maker_offset:+.2f})")
+                    resp = place_maker(creds, eoa, pk, deposit, token_id,
+                                       order_v2.BUY, args.size, price)
                     print(f"    POST /order: {resp['status_code']}")
                     print(f"    {resp['body'][:220]}")
                     try:
@@ -276,6 +349,19 @@ def main() -> int:
                     except Exception:
                         body = {}
                     if resp["status_code"] == 200 and body.get("success"):
+                        order_id = body.get("orderID")
+                        print(f"    ✅ 已挂单 {str(order_id)[:24]}... "
+                              f"status={body.get('status')}，等待成交...")
+                        # 轮询成交：窗口内最多等 --wait-fill 秒，超时撤单
+                        filled = wait_order_fill(clob, order_id,
+                                                 timeout=args.wait_fill)
+                        if filled is None:
+                            print(f"    ⏱️ {args.wait_fill}s 未成交，撤单")
+                            cx = cancel_order(creds, eoa, order_id)
+                            print(f"    cancel: {cx['status_code']} {cx['body'][:80]}")
+                            continue
+                        body = filled  # 用成交订单详情继续入库
+                        print(f"    ✅ 成交 order {str(order_id)[:20]}...")
                         # 实际成交价：BUY 时 making(USD) / taking(shares)
                         try:
                             fill_price = round(

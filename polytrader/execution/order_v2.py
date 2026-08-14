@@ -88,24 +88,53 @@ def generate_order_salt() -> str:
     return str(int(random.random() * (time.time_ns() // 1_000_000)))
 
 
+def round_price_tick(price: float, tick_size: float = 0.01) -> float:
+    """价格按 tick 取整（tick=0.01 → 2 位小数）。"""
+    import decimal
+    ticks = int(round(decimal.Decimal(str(price)) / decimal.Decimal(str(tick_size))))
+    return round(ticks * tick_size, 4)
+
+
 def calc_amounts(side: int, size: float, price: float) -> tuple[int, int]:
     """limit order 的 (maker_amount, taker_amount)（6 decimals）。
 
-    BUY:  size = 美元金额；maker = usd（round 2 位），taker = floor(usd/price, 4 位份额)
-    SELL: size = 份额数；maker = shares（floor 4 位），taker = floor(shares*price, 2 位)
-    遵循 CLOB 精度限制（USD ≤2 位小数，shares ≤4 位小数）；BUY 用 round 保证
-    $1 不缩水为 $0.99（marketable BUY 最小 $1）。
+    遵循官方文档精度规则（tick=0.01 → Price 2 位 / Size 2 位 / Amount 4 位）：
+    1. price 按 tick 取整（≤2 位小数）
+    2. 份额 round DOWN 到 2 位小数
+    3. USD 金额 round UP 到 6 位、再 DOWN 到 4 位（Amount decimals）
+    BUY:  maker=USD(price×shares)，taker=shares
+    SELL: maker=shares，taker=USD(price×shares)
     """
-    from math import floor
+    from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING
+
+    def _usd_4(v: Decimal) -> Decimal:
+        # Amount 4 位：先 round UP 到 8 位再 DOWN 到 4 位
+        return v.quantize(Decimal("0.00000001"),
+                          rounding=ROUND_HALF_UP).quantize(Decimal("0.0001"),
+                                                           rounding=ROUND_DOWN)
+
+    def _to_6(v: Decimal) -> int:
+        return int((v * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
+
+    price_d = Decimal(str(round_price_tick(price)))
     if side == BUY:
-        usd = round(size * 100) / 100
-        shares = floor(usd / price * 10000) / 10000
-        maker, taker = usd, shares
+        # BUY: size = 美元金额；shares = ceil(usd/price, 2 位)（向上取整保证
+        # 金额不缩水），usd = shares×price（4 位）→ 隐含价精确 = price。
+        usd_in = Decimal(str(size)).quantize(Decimal("0.01"),
+                                             rounding=ROUND_HALF_UP)
+        shares = (usd_in / price_d).quantize(Decimal("0.01"),
+                                             rounding=ROUND_CEILING)
+        if shares == 0:
+            shares = Decimal("0.01")
+        usd = _usd_4(shares * price_d)
+        maker, taker = _to_6(usd), _to_6(shares)
     else:
-        shares = floor(size * 10000) / 10000
-        usd = floor(shares * price * 100) / 100
-        maker, taker = shares, usd
-    return int(maker * 1e6), int(taker * 1e6)
+        # SELL: size = 份额数；maker=shares（2 位），taker=USD=shares×price
+        shares = Decimal(str(size)).quantize(Decimal("0.01"),
+                                             rounding=ROUND_DOWN)
+        usd = _usd_4(shares * price_d)
+        maker, taker = _to_6(shares), _to_6(usd)
+    return maker, taker
 
 
 def build_order_typed_data(

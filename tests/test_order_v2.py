@@ -24,9 +24,9 @@ def test_calc_amounts():
     # BUY $1 @ 0.5 → 付 $1，得 2 shares
     m, t = order_v2.calc_amounts(order_v2.BUY, 1.0, 0.5)
     assert (m, t) == (1_000_000, 2_000_000)
-    # BUY $1 @ 0.535 → 付 $1.00，得 1.8691 shares（4 位）
+    # BUY $1 @ 0.535 → 价格 tick 取整 0.54：付 $1.0044，得 1.86 shares（2 位）
     m, t = order_v2.calc_amounts(order_v2.BUY, 1.0, 0.535)
-    assert (m, t) == (1_000_000, 1_869_100)
+    assert (m, t) == (1_004_400, 1_860_000)
     # SELL 2 shares @ 0.5 → 卖 2 shares，收 $1
     m, t = order_v2.calc_amounts(order_v2.SELL, 2.0, 0.5)
     assert (m, t) == (2_000_000, 1_000_000)

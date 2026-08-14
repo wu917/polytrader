@@ -76,12 +76,15 @@ def place_maker(creds: dict, eoa: str, pk: str, deposit: str,
 
 
 def cancel_order(creds: dict, eoa: str, order_id: str) -> dict:
-    """撤销挂单（DELETE /order）。"""
+    """撤销挂单（DELETE /order?orderID=...）。
+
+    官方签名规则：query param 不在签名内，message = ts + DELETE + /order
+    （无 body），因此 l2_headers_new 不传 body，order_id 走 query。
+    """
     h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
-                        creds["secret"], "DELETE", "/order",
-                        body=f'{{"orderID":"{order_id}"}}')
+                        creds["secret"], "DELETE", "/order")
     r = _req("DELETE", "https://clob.polymarket.com/order",
-             data=json.dumps({"orderID": order_id}), headers=h2)
+             params={"orderID": order_id}, headers=h2)
     return {"status_code": r.status_code, "body": r.text}
 
 
@@ -100,6 +103,9 @@ def main() -> int:
     args = ap.parse_args()
     if args.log:
         sys.stdout = _Tee(args.log)  # type: ignore[assignment]
+        # logging 输出也进同一日志文件（统一集合到 log）
+        from polytrader.logging_setup import setup_logging
+        setup_logging(level="INFO", log_file=args.log)
 
     # ---- 凭证与资金预检 ----
     pk = os.environ["POLYMARKET_PRIVATE_KEY"]

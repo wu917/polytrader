@@ -137,6 +137,8 @@ def derive_api_key_headers(address: str, signature: str,
     }
 
 
+from polytrader.execution.order_v2 import ZERO_BYTES32  # noqa: F401 兼容导入
+
 def l2_headers_new(address: str, api_key: str, passphrase: str,
                    secret_b64: str, method: str, path: str,
                    body: str = "") -> dict:
