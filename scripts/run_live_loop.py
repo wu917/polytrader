@@ -247,10 +247,8 @@ def main() -> int:
     ap.add_argument("--min-edge", type=float, default=0.04)
     ap.add_argument("--coins", type=str, default=",".join(COINS))
     ap.add_argument("--per-round", type=int, default=1, help="每轮最多开几笔")
-    ap.add_argument("--maker-offset", type=float, default=0.01,
-                    help="maker 挂单价 = ref ± offset（默认 0.01，0=挂 ref 价）")
-    ap.add_argument("--wait-fill", type=int, default=90,
-                    help="挂单后等待成交秒数（默认 90），超时撤单")
+    ap.add_argument("--fok-slip", type=float, default=0.01,
+                    help="FOK 吃单滑点容忍（maxPrice=盘口价+slip，封顶 0.85，默认 0.01）")
     ap.add_argument("--seen-file", type=str,
                     default="backtest_results/seen_slugs.txt",
                     help="已交易 slug 持久化文件（与 simulate 共用同一去重文件）")
@@ -395,32 +393,27 @@ def main() -> int:
                         print(f"  {m.slug} {side_str} 预期成交价{expect_fill:.3f} "
                               f"超范围[0.20,0.85] 过滤（空壳盘口）")
                         continue
-                    # maker 挂单价：ref 价 ± offset，再按 CLOB tick(0.01) 取整
-                    # （ref 来自 Gamma outcomePrices 精度更高，直接挂会被
-                    #   "breaks minimum tick size rule" 拒绝）
-                    price = round(min(0.99, float(s.market_price) + args.maker_offset), 2)
+                    # FOK maxPrice：盘口吃单侧价（或 ref）+ 滑点容忍，封顶 0.85
+                    # （0.85 与坏单过滤上限一致，避免空壳盘口 0.99 极端价成交）
+                    base = expect_fill if expect_fill is not None \
+                        else float(s.market_price)
+                    price = round(min(0.85, max(0.01, base + args.fok_slip)), 2)
                     # ⚠️ 下单前校验 token 在 CLOB 有效（防偶发 invalid token id）
                     if not verify_token(token_id):
                         print(f"  {m.slug} {side_str} token 在 CLOB 无效/未生效，跳过")
                         continue
-                    # ⚠️ 最小订单规模预检：CLOB 拒绝份额<min_order_size 的订单
-                    # （book API 返回，当前 5m/15m updown 盘实测 = 5 份额：
-                    #   "Size (3.45) lower than the minimum: 5"）
-                    # $1 单仅 price<=0.20 达标（1/0.2=5 份），>0.20 直接跳过不盲发
-                    min_size = b.min_order_size if (b and b.min_order_size) else 5.0
-                    if args.size / price < min_size:
-                        print(f"  {m.slug} {side_str} 份额 {args.size/price:.2f} "
-                              f"< {min_size:g} (min_order_size)，跳过")
-                        continue
+                    # 注：FOK/市价单 BUY 按 USD 金额（$1）驱动，豁免
+                    # min_order_size 份额约束（实测 $1@0.54=1.85 份成交，
+                    # 而 GTC 3.45 份被拒）——故不做份额预检
                     # ⚠️ 防重复：无论下单成败，本窗口该 slug 立即记入 seen，
-                    # 避免 30s 后同窗口重复开单（挂单未成交被撤也记）
+                    # 避免 30s 后同窗口重复开单
                     seen.add(m.slug)
                     save_seen(args.seen_file, seen)
                     print(f"  {m.slug} {side_str} llm_p={s.extra.get('llm_p',0):.3f} "
                           f"ref={s.market_price:.3f} edge={s.edge:+.3f} "
-                          f"MAKER@{price} ${args.size} (offset {args.maker_offset:+.2f})")
-                    resp = place_maker(creds, eoa, pk, deposit, token_id,
-                                       order_v2.BUY, args.size, price)
+                          f"FOK@{price} ${args.size} (slip {args.fok_slip:+.2f})")
+                    resp = place_fok(creds, eoa, pk, deposit, token_id,
+                                     order_v2.BUY, args.size, price)
                     print(f"    POST /order: {resp['status_code']}")
                     print(f"    {resp['body'][:220]}")
                     try:
@@ -429,26 +422,7 @@ def main() -> int:
                         body = {}
                     if resp["status_code"] == 200 and body.get("success"):
                         order_id = body.get("orderID")
-                        print(f"    ✅ 已挂单 {str(order_id)[:24]}... "
-                              f"status={body.get('status')}，等待成交...")
-                        # 轮询成交：窗口内最多等 --wait-fill 秒，超时撤单
-                        filled = wait_order_fill(creds, eoa, order_id,
-                                                 timeout=args.wait_fill)
-                        if filled is None:
-                            print(f"    ⏱️ {args.wait_fill}s 未成交，撤单")
-                            cx = None
-                            for _ in range(2):  # 撤单失败重试，避免挂单残留占用资金
-                                cx = cancel_order(creds, eoa, order_id)
-                                print(f"    cancel: {cx['status_code']} {cx['body'][:80]}")
-                                if cx["status_code"] == 200:
-                                    break
-                                time.sleep(3)
-                            if cx and cx["status_code"] != 200:
-                                print(f"    ⚠️ 撤单失败（挂单可能残留！）"
-                                      f"orderID={order_id} 请人工核对")
-                            continue
-                        body = filled  # 用成交订单详情继续入库
-                        print(f"    ✅ 成交 order {str(order_id)[:20]}...")
+                        # FOK 立即成交（status=matched）或拒绝；无需轮询/撤单
                         # 实际成交价：BUY 时 making(USD) / taking(shares)
                         try:
                             fill_price = round(
@@ -466,7 +440,8 @@ def main() -> int:
                             "coin": m.slug.split("-")[0],
                             "window": "5m" if "-5m-" in m.slug else "15m",
                             "side": side_str,
-                            "entry_price": round(price, 4),   # 实际挂单价（非 ref）
+                            "entry_price": round(fill_price if fill_price
+                                                 else price, 4),  # FOK 实际成交价
                             "size_usd": args.size,
                             "round": i,
                             "mode": "live",
