@@ -121,6 +121,20 @@ def place_fok(creds: dict, eoa: str, pk: str, deposit: str,
     return {"status_code": r.status_code, "body": r.text}
 
 
+def verify_token(token_id: str) -> bool:
+    """下单前只读校验 token 在 CLOB 有效（GET /tick-size，公开端点）。
+
+    规避偶发 invalid token id：5m 市场新创建时 gamma 已返回 clobTokenIds
+    但 CLOB 侧可能尚未生效，直接下单会 400 invalid token id。
+    """
+    try:
+        r = _req("GET", "https://clob.polymarket.com/tick-size",
+                 params={"token_id": token_id})
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def place_maker(creds: dict, eoa: str, pk: str, deposit: str,
                 token_id: str, side: int, size_usd: float,
                 price: float) -> dict:
@@ -385,6 +399,10 @@ def main() -> int:
                     # （ref 来自 Gamma outcomePrices 精度更高，直接挂会被
                     #   "breaks minimum tick size rule" 拒绝）
                     price = round(min(0.99, float(s.market_price) + args.maker_offset), 2)
+                    # ⚠️ 下单前校验 token 在 CLOB 有效（防偶发 invalid token id）
+                    if not verify_token(token_id):
+                        print(f"  {m.slug} {side_str} token 在 CLOB 无效/未生效，跳过")
+                        continue
                     # ⚠️ 防重复：无论下单成败，本窗口该 slug 立即记入 seen，
                     # 避免 30s 后同窗口重复开单（挂单未成交被撤也记）
                     seen.add(m.slug)
