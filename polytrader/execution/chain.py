@@ -149,10 +149,29 @@ def wait_tx(tx_hash: str, timeout: int = 180, poll: int = 5) -> dict:
 
 
 def call_balance(token: str, addr: str) -> int:
-    """只读查 ERC-20 余额（base units）。"""
+    """只读查 ERC-20 余额（base units）。
+
+    公共 RPC 偶发对较新合约（如 PUSD）返回 0x0（节点不同步）——
+    单节点 0 会被误判资金不足。策略：结果 >0 直接返回（正常路径零
+    额外开销）；结果 0 时轮询全部节点，取非零最大值（真实余额 >0
+    时坏节点给 0 不影响；真实余额 =0 时所有节点都 0）。
+    """
     data = _erc20_data("balanceOf", addr)
     res = _rpc("eth_call", [{"to": token, "data": data}, "latest"])
-    return int(res, 16)
+    v = int(res, 16)
+    if v > 0:
+        return v
+    vals: list[int] = []
+    for rpc_url in POLYGON_RPCS:
+        try:
+            r2 = _rpc("eth_call", [{"to": token, "data": data}, "latest"],
+                      rpc=rpc_url)
+            vals.append(int(r2, 16))
+        except Exception:  # noqa: BLE001
+            continue
+    if not vals:
+        raise ChainError(f"balance query failed on all RPCs ({token}, {addr})")
+    return max(vals)
 
 
 def find_v3_pool(token_a: str, token_b: str, fee: int = 100) -> str:
