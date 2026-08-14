@@ -1,6 +1,6 @@
 # PolyTrader 操作手册（RUNBOOK）
 
-> 面向日常运维：启动/停止、日志查看、数据复盘、故障排查。版本 2026-08-13。
+> 面向日常运维：启动/停止、日志查看、数据复盘、故障排查。版本 2026-08-14。
 
 ## 1. 快速命令速查
 
@@ -12,16 +12,22 @@
 | 常驻结算进程：查看状态 | `.venv/bin/python scripts/settle_worker.py status` |
 | 常驻结算进程：停止 | `.venv/bin/python scripts/settle_worker.py stop` |
 | 多轮循环测试 | `.venv/bin/python scripts/run_llm_loop.py --rounds 3 --windows 5m` |
+| 5m 加密盘实盘循环 | `PYTHONPATH=. .venv/bin/python scripts/run_live_loop.py --rounds 3` |
+| 事件盘实盘循环（maker） | `PYTHONPATH=. .venv/bin/python scripts/run_event_live_loop.py --size 1 --min-edge 0.05` |
+| 股票/商品盘日级实盘循环 | `PYTHONPATH=. .venv/bin/python scripts/run_equity_live_loop.py --size 1 --min-edge 0.05` |
+| 股票/商品盘日级模拟回测 | `PYTHONPATH=. .venv/bin/python scripts/simulate_equity_updown.py --size 100` |
+| 事件盘/股票盘扫描评估 | `.venv/bin/python scripts/scan_event_markets.py` / `scripts/scan_equity_updown.py` |
 | 启动 Web 面板 | `.venv/bin/python scripts/web_dashboard.py --port 8787` |
 | 打开面板 | 浏览器 → `http://127.0.0.1:8787` |
 | 看全部日志 | `tail -f logs/llm_daemon_*/daemon.log` |
 | 补结算（仅 settle_worker 未运行时需要） | `.venv/bin/python scripts/backfill_settlements.py --results logs/llm_daemon_*/llm_results.jsonl` |
 | 收益率统计 | `.venv/bin/python scripts/summarize_rounds.py` |
 | 查询待结算队列 | `.venv/bin/python scripts/settle_worker.py status`（pending trades 数） |
-| 运行测试 | `.venv/bin/python -m pytest tests/`（127 个） |
+| 运行测试 | `.venv/bin/python -m pytest tests/`（187 个） |
 
-> **结算分工**：`run_llm_loop` / `run_daemon` 只负责开单（写入 MySQL `pending_trades`），
-> **结算由常驻进程 `settle_worker` 独立处理**——任务退出后结算不停止，一般无需手动 backfill。
+> **结算分工**：`run_llm_loop` / `run_daemon` / `*_live_loop` / `simulate_*` 只负责开单
+> （写入 MySQL `pending_trades`），**结算由常驻进程 `settle_worker` 独立处理**——
+> 任务退出后结算不停止，一般无需手动 backfill。
 
 ## 2. 守护进程（run_daemon.py）
 
@@ -144,8 +150,11 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 # 直接查库（密码见 .env 的 POLY_DB_PASS；中文操作务必加 --default-character-set=utf8mb4）
 ../mysql-8.0.46/bin/mysql -h127.0.0.1 -P3306 -uroot -p"$POLY_DB_PASS" \
   --default-character-set=utf8mb4 polytrader \
-  -e "SELECT trade_id, slug, side, entry_price, status, pnl FROM pending_trades;"
+  -e "SELECT trade_id, mode, slug, side, entry_price, status, pnl FROM pending_trades;"
 ```
+
+`mode` 字段区分实盘（`live`）与模拟（`simulate`）单——`*_live_loop` 写入 `live`，
+`simulate_*` / `run_llm_loop` 写入 `simulate`。
 
 > **MySQL 实例说明**：本机 MySQL 8.0.46 安装于 `../mysql-8.0.46/`（workspace 下），
 > 库 `polytrader` 表 `pending_trades`。机器重启后需手动启动：
@@ -205,6 +214,8 @@ grep '"event": "llm_call"' logs/llm_daemon_*/audit_all.jsonl | grep <trade_id �
 - **实盘护栏（不可绕过）**：无凭证拒绝 / 单笔 > `live.max_order_usd`（默认 $10）拒绝 /
   价格不在 [0.03, 0.97] 拒绝 / USDC 不足拒绝 / 下单前终端输入 `yes` 确认 /
   不自动重试下单 / 实盘部分成交**不自动回滚**（真实成交不可撤销）
+- **坏单过滤**：实盘与模拟成交的预期成交价须在 **[0.20, 0.85]**，空壳盘口超范围则跳过，
+  避免极端价格成交
 - **paper 是默认推荐模式**：收益率回测、策略验证一律用 paper（真实取价模拟成交）
 - **仓位 $1/笔**：默认最小仓位验证信号，放大仓位前至少累积 100+ 结算样本
 - **`seen_slugs.txt` 勿删**：删除会导致已交易盘口重新开单（同一窗口重复交易）
@@ -270,3 +281,15 @@ curl "https://data-api.polymarket.com/positions?user=<deposit wallet>&limit=10"
   verifyingContract=CTF Exchange V2）；与官方 SDK 逐字节一致（单测交叉验证）
 - 链上广播：raw tx 需 0x 前缀；swap 交易 gas 需 estimate（300k 默认会 out of gas）
 - RPC 走系统代理时偶发 SSL EOF → 已做多端点轮换容错
+
+### 9.6 实盘循环脚本（三套）
+
+| 脚本 | 盘面 | 执行方式 | 典型调用 |
+|---|---|---|---|
+| `run_live_loop.py` | 5m 加密 updown | FOK 吃单 | `--rounds 3 --size 1 --min-edge 0.04` |
+| `run_event_live_loop.py` | 通用事件盘 | maker GTC（post_only） | `--size 1 --min-edge 0.05 --min-rr 1.5 --wait 600` |
+| `run_equity_live_loop.py` | 股票/商品日级 | FOK 吃单 | `--size 1 --min-edge 0.05 --min-liquidity 200` |
+
+三者默认每轮最多 1 笔、$1/笔；成交写入 `pending_trades`（`mode='live'`），
+由 `settle_worker` 自动结算。maker 单挂单后轮询订单状态（`--wait`/`--poll`），
+未成交自动撤单。坏单过滤：预期成交价须在 [0.20, 0.85]，超范围跳过。

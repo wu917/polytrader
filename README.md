@@ -2,7 +2,7 @@
 
 Polymarket 预测市场自动化交易系统（Python 3.11+）。模块化设计：套利 / AI 概率 / LLM 判断 /
 聪明钱跟单四大策略 + 完整风控，支持 dry-run / paper / live 三种执行模式；含 updown 5/15 分钟
-快速市场专项工具（扫描、监控、LLM 模拟测算、审计）。
+快速市场专项工具（扫描、监控、LLM 模拟测算、审计）以及通用事件盘、股票/商品日级盘专项模块。
 
 > ⚠️ **盈利性声明**：本系统提供行业标准策略与风控框架，但**不保证持续盈利**。
 > 预测市场存在对手方风险、滑点、模型失效等风险。请先用 dry-run/paper 模式长期验证，
@@ -26,7 +26,7 @@ python3.11 -m venv .venv
 .venv/bin/python scripts/run_polytrader.py offline
 
 # 运行测试
-.venv/bin/python -m pytest tests/        # 127 个测试
+.venv/bin/python -m pytest tests/        # 187 个测试
 ```
 
 网络说明：本机访问 Polymarket **经 macOS 系统代理 127.0.0.1:7897**（requests 默认自动走系统
@@ -47,7 +47,10 @@ polytrader/
 │   ├── arbitrage.py     # 二元 YES/NO 互补 + 分类市场概率和套利
 │   ├── ai_probability.py# 模型概率 vs 市场价格 → 期望边际
 │   ├── llm_book.py      # LLM 盘口策略（盘口上下文进 prompt，双侧 edge）
-│   └── llm_updown.py    # updown 市场 LLM 方向判断（实时行情 + 锚定修正）
+│   ├── llm_updown.py    # updown 市场 LLM 方向判断（实时行情 + 锚定修正）
+│   ├── event_market.py  # 通用事件盘（LLM 判 P(YES)，双侧 edge + RR/EV 过滤）
+│   ├── equity_updown.py # 股票/商品日级 updown（日 K + 大盘局势）
+│   └── equity_context.py# 股票/商品盘上下文构建（日 K 特征 + SPY/QQQ/VXX 局势）
 ├── ai/
 │   ├── models.py        # 可插拔：lightgbm（需 libomp）/ sklearn fallback
 │   ├── features.py      # 14+ 维特征（元数据/订单簿/价格动量/类别）
@@ -63,18 +66,29 @@ polytrader/
 │   └── risk_manager.py  # 敞口 / 日损熔断 / 回撤熔断 / 冷却 / 价格带
 └── execution/
     ├── broker.py        # dry-run（模拟）/ paper（真实取价模拟）/ live（安全拒绝）
-    └── order_manager.py # Kelly 定仓 + 套利组原子性（组内全成或全弃）
+    ├── order_manager.py # Kelly 定仓 + 套利组原子性（组内全成或全弃）
+    ├── order_v2.py      # CLOB V2 订单 + ERC-7739 签名
+    ├── chain.py         # 链上广播（sign + eth_sendRawTransaction + RPC 轮换）
+    ├── relayer.py       # gasless 钱包操作（POLY_RELAYER_*）
+    └── signer.py        # ClobAuth + POLY_* L2 HMAC
 
 scripts/
 ├── run_llm_loop.py      # 多轮循环主任务（窗口内扫描 + 开单写 MySQL）
 ├── settle_worker.py     # 常驻结算进程（任务退出后结算不停止）
 ├── run_daemon.py        # 无限挂机守护进程（复用 run_llm_loop --rounds 1）
 ├── backfill_settlements.py # 兜底补结算（settle_worker 未运行时才需要）
+├── run_live_loop.py     # 5m 加密 updown 实盘循环（FOK 吃单）
+├── run_event_live_loop.py # 通用事件盘实盘循环（maker GTC post_only）
+├── run_equity_live_loop.py # 股票/商品日级实盘循环（FOK 吃单）
+├── scan_event_markets.py  # 通用事件盘扫描 + LLM 评估
+├── scan_equity_updown.py  # 股票/商品日级盘扫描 + LLM 评估
+├── simulate_equity_updown.py # 股票/商品日级模拟回测
 └── ...（scan/monitor/simulate/web_dashboard 等）
 ```
 
 **存储**：已开单队列存于本地 MySQL（`polytrader.pending_trades` 表）——
-`run_llm_loop`/`run_daemon` 开单写入，`settle_worker` 常驻轮询结算，多进程共享、不随任务删除。
+`run_llm_loop`/`run_daemon`/`*_live_loop`/`simulate_*` 开单写入，`settle_worker` 常驻轮询结算，
+多进程共享、不随任务删除。
 
 ## 使用
 
@@ -86,6 +100,8 @@ scripts/
 | AI 概率 | 特征 → 模型 P(YES) vs ask 价，edge ≥ ε 买入 | `ai_probability.min_edge` |
 | LLM 盘口 | 订单簿上下文进 prompt，LLM 双侧评估 edge（DeepSeek 等） | `llm_book`（`scripts/run_polytrader.py llm`） |
 | LLM updown | 实时行情（Binance/OKX）→ LLM 判断窗口方向 vs 市场 ref | `llm_updown`（见下） |
+| 事件盘 | 全量二元市场（选举/宏观/地缘），LLM 世界知识判 P(YES)，双侧 edge + RR/EV 过滤 | `event_market`（`scan_event_markets`） |
+| 股票/商品盘 | 日 K 特征 + 大盘局势（SPY/QQQ/VXX）→ LLM 判日级涨跌 vs 隐含价 | `equity_updown`（`scan_equity_updown`） |
 | 跟单 | 聚合市场成交找出盈利钱包 → 镜像其 BUY（去重/滑点过滤） | `copytrade.*` |
 
 ### 模式
@@ -141,6 +157,10 @@ deposit wallet 订单签名 = ERC-7739 wrapped（EOA 签嵌套 TypedDataSign，6
 全链路打通。充值：`fund_deposit.py`（USDC→pUSD 经 Paraswap 聚合器，$1.10 → 1.0999 pUSD，
 几乎无损）。
 
+**坏单过滤（实盘与模拟通用）**：预期成交价须在 **[0.20, 0.85]**（`run_live_loop`
+按吃单侧盘口价预检，空壳盘口超范围则过滤；`simulate_*` 同规则），避免在空壳
+盘口上以极端价格成交。
+
 **实现**：`execution/order_v2.py`（V2 订单 + ERC-7739 签名）、`execution/chain.py`
 （链上广播：sign + eth_sendRawTransaction + RPC 轮换）、`execution/relayer.py`
 （gasless 钱包操作）、`execution/signer.py`（ClobAuth + POLY_* L2 HMAC）、
@@ -149,6 +169,52 @@ deposit wallet 订单签名 = ERC-7739 wrapped（EOA 签嵌套 TypedDataSign，6
 
 **安全护栏**：凭证只存 `.env`（gitignore）；`SENSITIVE_FIELDS` 遮盖；链上交易
 （充值/swap）每次展示交易内容；真实下单前需确认。
+
+### 股票/商品盘（日级 updown）与通用事件盘
+
+**股票/商品盘**（`EquityUpdownStrategy`）：日级 Up-or-Down 市场，结算 =
+当日收盘 vs 前一日收盘（Pyth Close）。输入为日 K 技术特征 + 大盘局势
+（SPY/QQQ/VXX），参考价 ref 来自 Gamma outcomePrices（市场隐含 P(涨)）。
+数据源 stockanalysis.com 公开 API（免费无 key）；商品/指数用 ETF 代理
+（XAUUSD→GLD、XAGUSD→SLV、WTI→USO、HSI→EWH、UKX→EWU），prompt 已标注。
+支持 17 个标的：NVDA/TSLA/MSFT/AAPL/AMZN/GOOGL/META/COIN/PLTR + SPY/QQQ/NDX
+/金/银/WTI/恒生/富时100。
+
+```bash
+# 扫描当日股票/商品盘 + LLM 评估（paper 模式）
+.venv/bin/python scripts/scan_equity_updown.py --list-only    # 只列盘口不调 LLM
+.venv/bin/python scripts/scan_equity_updown.py --min-edge 0.05
+
+# 日级模拟回测：信号 → 模拟成交 → 入库（window='daily'）→ settle_worker 结算
+PYTHONPATH=. .venv/bin/python scripts/simulate_equity_updown.py \
+    --min-edge 0.05 --min-liquidity 200 --size 100
+
+# 日级实盘循环：首个 |edge|>=min_edge 信号 FOK $size 真实下单
+PYTHONPATH=. .venv/bin/python scripts/run_equity_live_loop.py --size 1 --min-edge 0.05
+```
+
+**通用事件盘**（`EventMarketStrategy`）：不绑定股票/商品，覆盖任意活跃二元
+市场（选举/宏观/地缘/商业）。复用 LLMBookStrategy 评估骨架，增加收益比
+`RR=(1-p)/p` 与期望值 `EV=P(win)×(1-p)-(1-P(win))×p`，开单条件 =
+edge 阈值 + RR 下限（默认 1.5，即买入价 ≤0.40 或 ≥0.60 侧）+ EV>0。
+
+```bash
+# 事件盘扫描 + LLM 评估
+PYTHONPATH=. .venv/bin/python scripts/scan_event_markets.py --list-only
+PYTHONPATH=. .venv/bin/python scripts/scan_event_markets.py \
+    --no-db --min-vol 5000 --min-edge 0.05 --min-rr 1.5
+
+# 事件盘实盘循环：maker GTC 限价单（post_only 挂中间价等成交，非 FOK 吃单）
+# 盘口空壳 taker 不可行，只能 maker；挂单后轮询状态，未成交自动撤单
+PYTHONPATH=. .venv/bin/python scripts/run_event_live_loop.py \
+    --size 1 --min-edge 0.05 --min-rr 1.5 --wait 600
+```
+
+> ⚠️ 三个实盘循环脚本（`run_live_loop` / `run_event_live_loop` /
+> `run_equity_live_loop`）均涉及**真实资金**，默认每轮最多 1 笔、$1/笔，
+> 资金预检（deposit wallet pUSD 需覆盖 size + 手续费）。实盘/模拟成交均
+> 写入 `pending_trades`（`mode` 字段区分 `live`/`simulate`），由
+> `settle_worker` 常驻进程自动结算。
 
 ### updown 5/15 分钟快速市场（专项工具链）
 
@@ -279,5 +345,5 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/        # 127 个测试（含端到端离线全链路、审计、reason 解析）
+.venv/bin/python -m pytest tests/        # 187 个测试（含端到端离线全链路、审计、reason 解析）
 ```
