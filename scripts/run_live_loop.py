@@ -403,6 +403,13 @@ def main() -> int:
                     if not verify_token(token_id):
                         print(f"  {m.slug} {side_str} token 在 CLOB 无效/未生效，跳过")
                         continue
+                    # ⚠️ 最小订单规模预检：CLOB 拒绝份额<5 的订单（book API
+                    # orderMinSize=5 实测：Size (3.45) lower than the minimum: 5）
+                    # $1 单仅 price<=0.20 达标（1/0.2=5 份），>0.20 直接跳过不盲发
+                    if args.size / price < 5.0:
+                        print(f"  {m.slug} {side_str} 份额 {args.size/price:.2f} < 5 "
+                              f"(orderMinSize)，跳过")
+                        continue
                     # ⚠️ 防重复：无论下单成败，本窗口该 slug 立即记入 seen，
                     # 避免 30s 后同窗口重复开单（挂单未成交被撤也记）
                     seen.add(m.slug)
