@@ -69,11 +69,14 @@ class HttpClient:
                 if resp.status_code >= 500:
                     raise requests.HTTPError(f"{resp.status_code} {url}")
                 ms = int((time.time() - t0) * 1000)
-                body_preview = resp.text[:200]
+                # 行情 K 线端点（binance klines / okx candles）响应完整输出
+                # （6 根 K 线 ~1.1KB，便于核对行情）；其他端点截断防刷屏
+                preview_len = 1500 if ("/klines" in url or "/candles" in url) else 200
+                body_preview = resp.text[:preview_len]
                 # 统一日志：每次请求的 url/status/耗时/响应预览（截断防刷屏）
                 log.info("→ %s %s | %s %dms | resp: %.200s",
                          method, url[:150], resp.status_code, ms,
-                         body_preview.replace("\n", " ")[:200])
+                         body_preview.replace("\n", " ")[:preview_len])
                 self._audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
                              "event": "http_request",
                              "method": method, "url": url[:200],
