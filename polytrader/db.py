@@ -30,10 +30,62 @@ def connect():
     )
 
 
+_schema_checked = False  # 进程内只做一次建表检查
+
+
+def ensure_schema() -> None:
+    """幂等建表：pending_trades 不存在则创建（进程内只检查一次）。
+
+    5m/15m 加密盘与 daily 股票/商品盘共用同一张表（window 区分）。
+    CREATE TABLE IF NOT EXISTS 保证多进程并发启动安全。
+    """
+    global _schema_checked
+    if _schema_checked:
+        return
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_trades (
+                    trade_id     VARCHAR(32)  NOT NULL PRIMARY KEY,
+                    slug         VARCHAR(160) NOT NULL,
+                    coin         VARCHAR(32),
+                    `window`     VARCHAR(16),
+                    side         VARCHAR(8)   NOT NULL,
+                    entry_price  DECIMAL(12,6),
+                    size_usd     DECIMAL(14,4),
+                    `round`      INT,
+                    results_file VARCHAR(255),
+                    mode         VARCHAR(16)  DEFAULT 'simulate',
+                    order_id     VARCHAR(80),
+                    order_status VARCHAR(32),
+                    fill_price   DECIMAL(12,6),
+                    fill_tx      VARCHAR(80),
+                    llm_p        DECIMAL(8,4),
+                    ref_price    DECIMAL(12,6),
+                    edge         DECIMAL(8,4),
+                    llm_reason   TEXT,
+                    llm_model    VARCHAR(64),
+                    status       VARCHAR(16)  DEFAULT 'pending',
+                    settle_yes   DECIMAL(8,4),
+                    win          TINYINT,
+                    pnl          DECIMAL(14,4),
+                    created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                    settled_at   TIMESTAMP    NULL DEFAULT NULL,
+                    INDEX idx_status (status),
+                    INDEX idx_slug (slug)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+        _schema_checked = True
+    finally:
+        conn.close()
+
+
 def insert_pending(recs: list[dict]) -> int:
     """批量插入待结算单（trade_id 已存在则忽略）。返回实际插入数。"""
     if not recs:
         return 0
+    ensure_schema()
     sql = ("INSERT IGNORE INTO pending_trades "
            "(trade_id, slug, coin, `window`, side, entry_price, size_usd, "
            "round, results_file, mode, order_id, order_status, "

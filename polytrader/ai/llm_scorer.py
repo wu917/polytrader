@@ -65,7 +65,9 @@ class LLMScorer:
                             {"role": "user", "content": user},
                         ],
                         "temperature": 0.0,
-                        "max_tokens": 800,  # 推理模型需要足够 token（reasoning + 输出）
+                        # 推理模型（deepseek-v4-flash 等）思维链会消耗大量 token，
+                        # 800 不够 → content 被截断为空；4000 保证 content 有完整 JSON
+                        "max_tokens": 4000,
                     },
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 )

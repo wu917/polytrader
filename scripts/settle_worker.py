@@ -76,7 +76,9 @@ def settle_one(rec: dict) -> bool:
         return False
     # DB DECIMAL 列读出为 Decimal，统一转 float 参与运算
     size_usd = float(rec["size_usd"])
-    entry_price = float(rec["entry_price"])
+    # 结算成本价口径：优先实际成交价 fill_price（live 吃单加价/滑点），
+    # 无则回退 entry_price（simulate 的 entry_price 即成交价）
+    entry_price = float(rec.get("fill_price") or rec["entry_price"])
     win = (rec["side"] == "YES" and s == 1.0) or \
           (rec["side"] == "NO" and s == 0.0)
     pnl = round((size_usd / entry_price) * (1.0 if win else 0.0)
