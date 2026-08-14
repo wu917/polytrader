@@ -1,7 +1,7 @@
 """股票/商品盘日级模拟回测：扫描当日盘 → LLM 评估 → 模拟成交 → 入库 → 结算。
 
 与 5m 盘 simulate_llm_updown.py 对齐：
-- 信号 → 模拟成交（吃单侧盘口价，空壳回退 ref）→ 过滤坏价 [0.20, 0.85]
+- 信号 → 模拟成交（吃单侧盘口价，空壳回退 ref）→ 过滤坏价 [0.25, 0.85]
 - 每笔写入 MySQL pending_trades（window='daily'），由 settle_worker 自动结算
   （settle_worker 按 slug 查 Gamma keyset 结算，对日级盘同样适用）
 - 本地结果 JSON + 审计 JSONL
@@ -35,7 +35,7 @@ from scripts.scan_equity_updown import (  # noqa: E402
     PROXY, discover_daily_updown, to_market)
 
 # 模拟成交价过滤（吃单成本过高/空壳盘口不成交）
-MIN_FILL, MAX_FILL = 0.20, 0.85
+MIN_FILL, MAX_FILL = 0.25, 0.85
 
 
 def audit(rec: dict, path: str | None):

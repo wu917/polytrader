@@ -172,7 +172,7 @@ def main() -> int:
                 m = s.market
                 idx = 0 if side_str == "YES" else 1
                 token_id = m.outcomes[idx].token_id
-                # 预期成交价（吃单侧盘口价）：过滤坏单 [0.20, 0.85]
+                # 预期成交价（吃单侧盘口价）：过滤坏单 [0.25, 0.85]
                 expect_fill = None
                 try:
                     b = clob.get_book(token_id)
@@ -184,9 +184,9 @@ def main() -> int:
                                            if b.best_bid() else None)
                 except Exception:
                     expect_fill = None
-                if expect_fill is not None and not (0.20 <= expect_fill <= 0.85):
+                if expect_fill is not None and not (0.25 <= expect_fill <= 0.85):
                     print(f"  {m.slug} {side_str} 预期成交价{expect_fill:.3f} "
-                          f"超范围[0.20,0.85] 过滤（空壳盘口）")
+                          f"超范围[0.25,0.85] 过滤（空壳盘口）")
                     continue
                 if args.market:
                     # 市价化：直接 0.99 吃单（空壳盘口只有 0.99 有卖单）

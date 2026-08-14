@@ -157,7 +157,7 @@ deposit wallet 订单签名 = ERC-7739 wrapped（EOA 签嵌套 TypedDataSign，6
 全链路打通。充值：`fund_deposit.py`（USDC→pUSD 经 Paraswap 聚合器，$1.10 → 1.0999 pUSD，
 几乎无损）。
 
-**坏单过滤（实盘与模拟通用）**：预期成交价须在 **[0.20, 0.85]**（`run_live_loop`
+**坏单过滤（实盘与模拟通用）**：预期成交价须在 **[0.25, 0.85]**（`run_live_loop`
 按吃单侧盘口价预检，空壳盘口超范围则过滤；`simulate_*` 同规则），避免在空壳
 盘口上以极端价格成交。
 

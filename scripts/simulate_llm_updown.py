@@ -193,7 +193,7 @@ def main() -> int:
             pass
 
     # 只接受合理成交价（过滤空壳盘口坏价：0.97 吃单赢只赚 3%）
-    MIN_FILL, MAX_FILL = 0.20, 0.85
+    MIN_FILL, MAX_FILL = 0.25, 0.85
 
     def sim_market_price(book: dict | None, side: str, ref: float) -> float:
         """模拟市价单成交价：YES→ask；NO→1-bid（总成交，反映吃单成本）。

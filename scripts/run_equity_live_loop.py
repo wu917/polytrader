@@ -110,7 +110,7 @@ def main() -> int:
         m = s.market
         idx = 0 if side == "YES" else 1
         token_id = m.outcomes[idx].token_id
-        # 预期成交价（吃单侧盘口价）：过滤坏单 [0.20, 0.85]（空壳盘口保护）
+        # 预期成交价（吃单侧盘口价）：过滤坏单 [0.25, 0.85]（空壳盘口保护）
         expect_fill = None
         try:
             from polytrader.data.clob_client import ClobClient
@@ -124,9 +124,9 @@ def main() -> int:
                                    if b.best_bid() else None)
         except Exception:
             expect_fill = None
-        if expect_fill is not None and not (0.20 <= expect_fill <= 0.85):
+        if expect_fill is not None and not (0.25 <= expect_fill <= 0.85):
             print(f"  {m.slug} {side} 预期成交价{expect_fill:.3f} "
-                  f"超范围[0.20,0.85] 过滤（空壳盘口）")
+                  f"超范围[0.25,0.85] 过滤（空壳盘口）")
             continue
         price = round(min(0.99, float(s.market_price) + 0.01), 3)
         print(f"  {m.slug} {side} llm_p={s.extra.get('llm_p', 0):.3f} "
