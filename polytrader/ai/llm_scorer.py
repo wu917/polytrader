@@ -76,6 +76,11 @@ class LLMScorer:
                 content = data["choices"][0]["message"]["content"]
                 parsed = _parse_response(content)
                 usage = data.get("usage") or {}
+                # 统一日志：LLM 调用的 model/耗时/概率/理由（截断防刷屏）
+                log.info("LLM %s attempt%d | %dms | p=%s | reason: %.120s | tokens=%s",
+                         self.model, attempt + 1, int((time.time() - t0) * 1000),
+                         parsed[0], str(parsed[1] or "")[:120],
+                         {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens")})
                 self._audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
                              "event": "llm_call",
                              "model": self.model, "attempt": attempt + 1,

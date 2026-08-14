@@ -138,6 +138,9 @@ def main() -> int:
 
     if args.log:
         sys.stdout = _Tee(args.log)  # type: ignore[assignment]
+        # logging 输出也进同一日志文件（统一集合到 log）
+        from polytrader.logging_setup import setup_logging
+        setup_logging(level="INFO", log_file=args.log)
 
     http = HttpClient(proxy=PROXY, timeout=20)
     print(f"拉取全量活跃市场（vol ≥ ${args.min_vol:,.0f}）...")

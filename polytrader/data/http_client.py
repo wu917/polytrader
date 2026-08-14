@@ -70,6 +70,10 @@ class HttpClient:
                     raise requests.HTTPError(f"{resp.status_code} {url}")
                 ms = int((time.time() - t0) * 1000)
                 body_preview = resp.text[:200]
+                # 统一日志：每次请求的 url/status/耗时/响应预览（截断防刷屏）
+                log.info("→ %s %s | %s %dms | resp: %.200s",
+                         method, url[:150], resp.status_code, ms,
+                         body_preview.replace("\n", " ")[:200])
                 self._audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
                              "event": "http_request",
                              "method": method, "url": url[:200],
