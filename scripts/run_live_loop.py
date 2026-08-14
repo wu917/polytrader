@@ -399,6 +399,14 @@ def main() -> int:
                     base = expect_fill if expect_fill is not None \
                         else float(s.market_price)
                     price = round(min(0.85, max(0.01, base + args.fok_slip)), 2)
+                    # ⚠️ 窗口剩余时间闸：LLM 评估耗时（3-70s×多市场）可能跨越
+                    # 窗口结束点（stop-before 只约束扫描开始），评估完下单时
+                    # 窗口可能已结束。剩余 <15s 直接跳过，不在临收盘/已收盘
+                    # 的市场上开单。
+                    if w_end - int(time.time()) < 15:
+                        print(f"  {m.slug} {side_str} 窗口剩余 "
+                              f"{w_end - int(time.time())}s <15s，跳过下单")
+                        continue
                     # ⚠️ 下单前校验 token 在 CLOB 有效（防偶发 invalid token id）
                     if not verify_token(token_id):
                         print(f"  {m.slug} {side_str} token 在 CLOB 无效/未生效，跳过")
