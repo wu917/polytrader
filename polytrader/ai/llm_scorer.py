@@ -28,7 +28,7 @@ class LLMScorer:
 
     def __init__(self, api_key: str = "", base_url: str = "https://api.openai.com/v1",
                  model: str = "gpt-4o-mini", http: HttpClient | None = None,
-                 timeout: int = 30, use_proxy: bool = False, audit_path: str | None = None):
+                 timeout: int = 90, use_proxy: bool = False, audit_path: str | None = None):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model

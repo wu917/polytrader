@@ -5,12 +5,18 @@
   必须喂数据才能判断短期方向
 - 一次调用问 P(窗口内上涨)，双侧 edge = |P - ref| 取大
 - 专为 updown 滚动窗口市场设计（ref_yes 来自 Gamma outcomePrices）
+
+性能（2026-08-15 优化）：
+- scan 并发评估（ThreadPoolExecutor，max_workers 可配），多市场不再串行等 LLM
+- 窗口内评估缓存（TTL 45s）：同一窗口 30s 间隔扫描复用上轮 LLM 结果，
+  大幅降低 LLM 调用量与评估耗时
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from polytrader.ai.llm_scorer import LLMScorer
 from polytrader.data.http_client import HttpClient
@@ -97,12 +103,26 @@ class LLMUpdownStrategy(LLMBookStrategy):
 
     def __init__(self, scorer: LLMScorer, min_edge: float = 0.05,
                  min_price: float = 0.03, max_price: float = 0.97,
-                 max_markets: int = 10, coin_map: dict | None = None):
+                 max_markets: int = 10, coin_map: dict | None = None,
+                 max_workers: int = 6, cache_ttl: float = 45.0):
         super().__init__(scorer, min_edge=min_edge, min_liquidity_usd=0.0,
                          min_price=min_price, max_price=max_price,
                          max_markets=max_markets)
         self.coin_map = coin_map or {}
         self.last_evaluations: list[dict] = []  # 本轮所有评估（含未下单原因）
+        self.max_workers = max_workers  # 并发评估线程数
+        self.cache_ttl = cache_ttl  # 窗口内评估缓存 TTL（秒）
+        self._cache: dict[str, tuple[dict, float]] = {}  # slug -> (result, ts)
+
+    def _score_cached(self, market: Market, coin: str, window_s: int) -> dict | None:
+        """带缓存的单市场评估：TTL 内复用上轮 LLM 结果（省 LLM 调用）。"""
+        cached = self._cache.get(market.slug)
+        if cached and time.time() - cached[1] < self.cache_ttl:
+            return cached[0]
+        r = self.score_updown(market, coin, window_s)
+        if r is not None:
+            self._cache[market.slug] = (r, time.time())
+        return r
 
     def score_updown(self, market: Market, coin: str, window_s: int) -> dict | None:
         """单市场：行情上下文 + LLM 判断 + 双侧 edge。返回 None 表示无法评估。"""
@@ -144,10 +164,40 @@ class LLMUpdownStrategy(LLMBookStrategy):
 
     def scan(self, markets: list[Market],
              books: dict | None = None) -> list[Signal]:
-        """markets 需携带 slug（btc-updown-5m-<ts>）与 coin_map 映射。"""
+        """markets 需携带 slug（btc-updown-5m-<ts>）与 coin_map 映射。
+
+        并发评估（ThreadPoolExecutor）：每个市场独立网络请求（行情+LLM），
+        并发可把 N 个市场的评估耗时从 N×单次压到接近单次；信号按 markets
+        原序输出，保证可复现。
+        """
         if not self.enabled:
             log.warning("LLMUpdownStrategy disabled: no LLM_API_KEY")
             return []
+        tasks: list[tuple[Market, str, int]] = []
+        for market in markets:
+            coin = self.coin_map.get(market.slug.split("-")[0])
+            if not coin:
+                continue
+            window_s = 300 if "-5m-" in market.slug else 900
+            tasks.append((market, coin, window_s))
+        # 与旧串行语义一致：评估量不超过 max_markets（并发不放大 LLM 调用量）
+        tasks = tasks[: self.max_markets]
+
+        results: dict[str, dict | None] = {}
+        if tasks:
+            workers = max(1, min(self.max_workers, len(tasks)))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {
+                    ex.submit(self._score_cached, m, c, w): m.slug
+                    for m, c, w in tasks}
+                for f in as_completed(futures):
+                    slug = futures[f]
+                    try:
+                        results[slug] = f.result()
+                    except Exception as exc:  # noqa: BLE001 单市场失败不影响整体
+                        log.warning("concurrent eval failed for %s: %s", slug, exc)
+                        results[slug] = None
+
         signals: list[Signal] = []
         self.last_evaluations = []
         for market in markets:
@@ -157,7 +207,7 @@ class LLMUpdownStrategy(LLMBookStrategy):
             if not coin:
                 continue
             window_s = 300 if "-5m-" in market.slug else 900
-            r = self.score_updown(market, coin, window_s)
+            r = results.get(market.slug)
             if r is None:
                 self.last_evaluations.append({"slug": market.slug, "evaluated": False,
                                               "skip_reason": "llm/context failed"})
