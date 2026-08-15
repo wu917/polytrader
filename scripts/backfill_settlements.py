@@ -17,28 +17,58 @@ from polytrader.data.http_client import HttpClient
 HTTP = HttpClient(proxy="http://127.0.0.1:7897", timeout=15)
 
 
+def _settle_from_market(m: dict) -> float | None:
+    """从市场 dict 提取 YES 结算价（outcomePrices[0] 为 0/1 才算已结算）。"""
+    prices = m.get("outcomePrices") or ""
+    try:
+        prices = json.loads(prices) if isinstance(prices, str) else prices
+    except Exception:
+        return None
+    if not prices:
+        return None
+    try:
+        yes = float(prices[0])
+    except (TypeError, ValueError):
+        return None
+    if yes in (0.0, 1.0):
+        return yes
+    return None
+
+
 def fetch_settle(slug: str) -> float | None:
+    """按 slug 查结算价（YES 结算 1.0/0.0；未结算返回 None）。
+
+    两级查询（2026-08-15 修复衍生盘结算）：
+    1. events/keyset?slug=（主市场路径，现有逻辑）
+    2. /markets?slug= 直查（衍生盘如 -1pt5/-away 后缀不在 events 列表，
+       曾导致已成交单永久 pending 占持仓名额）
+    """
     try:
         resp = HTTP.get_json("https://gamma-api.polymarket.com/events/keyset?" +
                              f"slug={slug}&limit=10&locale=en")
     except Exception:
-        return None
-    events = resp if isinstance(resp, list) else resp.get("events", [])
+        resp = None
+    events = resp if isinstance(resp, list) else (resp or {}).get("events", [])
     for ev in events:
         for m in ev.get("markets", []) or []:
             if m.get("slug") != slug:
                 continue
-            prices = m.get("outcomePrices") or ""
-            try:
-                prices = json.loads(prices) if isinstance(prices, str) else prices
-            except Exception:
-                return None
-            if not prices:
-                return None
-            yes = float(prices[0])
-            if yes in (0.0, 1.0):
+            yes = _settle_from_market(m)
+            if yes is not None:
                 return yes
             return None
+    # 回退：gamma /markets 直查（衍生盘子市场）
+    try:
+        resp2 = HTTP.get_json("https://gamma-api.polymarket.com/markets",
+                              params={"slug": slug, "limit": 5})
+    except Exception:
+        return None
+    items = resp2 if isinstance(resp2, list) else \
+        (resp2 or {}).get("data", resp2.get("markets", []))
+    for m in items:
+        if m.get("slug") != slug:
+            continue
+        return _settle_from_market(m)
     return None
 
 

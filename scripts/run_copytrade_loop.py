@@ -216,7 +216,6 @@ def main() -> int:
 
     round_no = 0
     last_refresh = 0.0
-    live_opened = 0  # 实盘总开单数（硬上限控制）
     while args.rounds == 0 or round_no < args.rounds:
         round_no += 1
         ts0 = time.time()
@@ -239,14 +238,17 @@ def main() -> int:
                 rec["error"] = f"refresh: {e}"
 
         # 2) 活动流扫描 → 信号
-        #    持仓上限按 DB 未结算数控制（RiskManager 内存态不感知结算释放）；
-        #    实盘模式跳过该闸（由 --max-live-orders 硬上限控制，模拟 pending 不挡实盘）
+        #    持仓上限：paper 按全部 copytrade pending；live 按未结算 live 单数
+        #    （结算释放后自动恢复开单，保持同时持仓 ≤ 上限）
         try:
-            if not args.no_db and not args.live:
-                open_cnt = _count_open(db)
-                if open_cnt >= args.max_open_positions:
-                    log(f"  waiting: copytrade pending {open_cnt} >= "
-                        f"max {args.max_open_positions}（结算释放后自动恢复）")
+            if not args.no_db:
+                open_cnt = (_count_live_open(db) if args.live
+                            else _count_open(db))
+                limit = (args.max_live_orders if args.live
+                         else args.max_open_positions)
+                if open_cnt >= limit:
+                    log(f"  waiting: {'live' if args.live else 'copytrade'} "
+                        f"pending {open_cnt} >= max {limit}（结算释放后自动恢复）")
                     emit({**rec, "trades": 0, "waiting_open_positions": open_cnt})
                     if args.rounds != 0 and round_no >= args.rounds:
                         break
@@ -264,10 +266,6 @@ def main() -> int:
         # 3) 过滤 + 风控 + 成交 + 入库
         opened = 0
         for s in signals:
-            if args.live and live_opened >= args.max_live_orders:
-                log(f"  max live orders reached ({live_opened}/"
-                    f"{args.max_live_orders})，停止开单（继续轮询观察）")
-                break
             price = s.market_price
             if price < args.min_buy_price or price > args.max_buy_price:
                 log(f"  filter: {s.market.slug[:40]:42s} price={price:.3f} "
@@ -356,7 +354,6 @@ def main() -> int:
                                 db.mark_filled(rec_row["trade_id"], fill_price, tx_hash)
                         except Exception as e:  # noqa: BLE001
                             log(f"  !! db insert FAILED {s.market.slug}: {e}")
-                    live_opened += 1
                     opened += 1
                     emit({"type": "trade_open", "round": round_no, **rec_row})
                     # 成交后立即落 seen（防崩溃重启重复镜像同一笔 FOK）
@@ -486,10 +483,20 @@ def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
 
 
 def _count_open(dbmod) -> int:
-    """DB 中未结算 copytrade 单数（持仓上限控制用）。"""
+    """DB 中未结算 copytrade 单数（paper 持仓上限控制用）。"""
     try:
         return len([r for r in dbmod.fetch_pending()
                     if r.get("window") == "copytrade"])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _count_live_open(dbmod) -> int:
+    """DB 中未结算 live 跟单单数（实盘持仓上限控制用）。"""
+    try:
+        return len([r for r in dbmod.fetch_pending()
+                    if r.get("window") == "copytrade"
+                    and r.get("mode") == "live"])
     except Exception:  # noqa: BLE001
         return 0
 

@@ -28,9 +28,15 @@ USDC = chain.USDC_NATIVE
 
 
 def _req(method: str, url: str, **kw):
+    # 中国大陆环境：Paraswap 境外 API 需走本地代理（.env HTTPS_PROXY）
+    proxies = None
+    px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    if px:
+        proxies = {"http": px, "https": px}
     for i in range(4):
         try:
             r = requests.request(method, url, timeout=20,
+                                 proxies=proxies,
                                  headers={"User-Agent": "Mozilla/5.0",
                                           **kw.pop("headers", {})}, **kw)
             return r
@@ -49,17 +55,28 @@ def quote(amount: int) -> dict:
     return r.json()["priceRoute"]
 
 
-def build_tx(price_route: dict, user: str) -> dict:
+def build_tx(price_route: dict, user: str, slippage_bps: int = 100) -> dict:
+    # 注意：v5 接口顶层 destAmount 与 slippage 互斥（400 Cannot specify both）。
+    # 只传 slippage：执行时按最新市场价 ± 容忍，避免报价 destAmount 过期 revert。
     body = {
         "srcToken": USDC, "destToken": chain.PUSD,
         "srcDecimals": 6, "destDecimals": 6,
         "srcAmount": price_route["srcAmount"],
-        "destAmount": price_route["destAmount"],
         "userAddress": user, "side": "SELL", "priceRoute": price_route,
+        "slippage": slippage_bps,  # 滑点容忍（bps，100 = 1%）
     }
     r = _req("POST", f"{PARASWAP}/transactions/137", json=body)
     r.raise_for_status()
     return r.json()
+
+
+def _wait_ok(tx_hash: str, what: str) -> dict:
+    """等待交易确认并校验 status=1（revert 必须报错，不能误报成功）。"""
+    rcpt = chain.wait_tx(tx_hash)
+    if int(rcpt.get("status", "0x0"), 16) != 1:
+        raise RuntimeError(f"{what} tx {tx_hash} FAILED (reverted)")
+    print(f"  {what} confirmed ✓")
+    return rcpt
 
 
 def main() -> int:
@@ -102,8 +119,7 @@ def main() -> int:
         r = chain.send_transaction(pk, USDC,
                                    chain._erc20_data("approve", TOKEN_TRANSFER_PROXY, 2**256 - 1))
         print(f"  approve tx: {r['txHash']}")
-        chain.wait_tx(r["txHash"])
-        print("  approved ✓")
+        _wait_ok(r["txHash"], "approve")
 
     # 2. swap
     tx = build_tx(pr, acct.address)
@@ -111,8 +127,7 @@ def main() -> int:
     r = chain.send_transaction(pk, tx["to"], tx["data"],
                                value=int(tx.get("value", "0"), 16))
     print(f"  swap tx: {r['txHash']}")
-    chain.wait_tx(r["txHash"])
-    print("  swapped ✓")
+    _wait_ok(r["txHash"], "swap")
 
     # 3. transfer pUSD -> deposit wallet
     pbal = chain.call_balance(chain.PUSD, acct.address)
@@ -121,8 +136,7 @@ def main() -> int:
         r = chain.send_transaction(pk, chain.PUSD,
                                    chain._erc20_data("transfer", deposit, pbal))
         print(f"transfer pUSD -> deposit: {r['txHash']}")
-        chain.wait_tx(r["txHash"])
-        print("  transferred ✓")
+        _wait_ok(r["txHash"], "transfer")
 
     print(f"deposit wallet pUSD: {chain.call_balance(chain.PUSD, deposit) / 1e6:.6f}")
     return 0
