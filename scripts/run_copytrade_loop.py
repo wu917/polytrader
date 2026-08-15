@@ -205,6 +205,12 @@ def main() -> int:
                     "negrisk_cache": {},  # token_id -> (neg_risk, 时间)
                     "pending_fills": [],  # [(trade_id, order_id, first_seen_ts)]
                     }
+        # 启动恢复：DB 中 order_status='delayed' 的历史单重新登记追踪
+        # （pending_fills 是内存态，重启后丢失曾导致孤儿订单——无法回填成交价）
+        for tid, oid in _load_delayed_orders(db):
+            live_ctx["pending_fills"].append((tid, oid, time.time()))
+        if live_ctx["pending_fills"]:
+            print(f"  恢复 {len(live_ctx['pending_fills'])} 笔 delayed 单追踪")
     log(f"copytrade loop | period={args.period} category={args.category} "
         f"top_n={args.top_n} size=${args.size} poll={args.poll}s "
         f"seen={len(seen)} refresh={args.refresh_interval}s "
@@ -604,6 +610,27 @@ def _hot_limit(args, is_live: bool) -> int:
     except (ValueError, OSError):
         pass
     return args.max_live_orders
+
+
+def _load_delayed_orders(dbmod) -> list[tuple[str, str]]:
+    """DB 中 order_status='delayed' 的 live 单（重启后恢复回填追踪）。"""
+    try:
+        conn = dbmod.connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT trade_id, order_id FROM pending_trades "
+                        "WHERE mode='live' AND `window`='copytrade' "
+                        "AND order_status='delayed' AND status='pending'")
+            rows = cur.fetchall()
+        conn.close()
+        return [(str(r["trade_id"]), str(r["order_id"]))
+                for r in rows if r.get("order_id")]
+    except Exception:  # noqa: BLE001
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _live_slugs(dbmod) -> set[str]:

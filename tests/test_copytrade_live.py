@@ -267,6 +267,36 @@ def test_live_slugs_empty_on_error(monkeypatch):
     assert rcl._live_slugs(BadDB) == set()
 
 
+def test_load_delayed_orders_restores_pending_fills():
+    """启动恢复：DB 中 delayed 单重新登记追踪（防重启后孤儿订单）。"""
+    class FakeDB:
+        @staticmethod
+        def connect():
+            class Cur:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def execute(self, sql, *a): pass
+                def fetchall(self):
+                    return [{"trade_id": "t1", "order_id": "0xa1"},
+                            {"trade_id": "t2", "order_id": "0xa2"},
+                            {"trade_id": "t3", "order_id": None}]  # 无 order_id 跳过
+            class Conn:
+                def cursor(self): return Cur()
+                def close(self): pass
+            return Conn()
+    rows = rcl._load_delayed_orders(FakeDB)
+    assert rows == [("t1", "0xa1"), ("t2", "0xa2")]
+
+
+def test_load_delayed_orders_error_safe():
+    """查询失败返回空列表（不阻塞启动）。"""
+    class BadDB:
+        @staticmethod
+        def connect():
+            raise RuntimeError("db down")
+    assert rcl._load_delayed_orders(BadDB) == []
+
+
 # ---------- 持仓上限热更新 ----------
 
 def test_hot_limit_file_overrides(monkeypatch, tmp_path):
