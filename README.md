@@ -78,7 +78,7 @@ scripts/
 ├── settle_worker.py     # 常驻结算进程（任务退出后结算不停止）
 ├── run_daemon.py        # 无限挂机守护进程（复用 run_llm_loop --rounds 1）
 ├── backfill_settlements.py # 兜底补结算（settle_worker 未运行时才需要）
-├── run_live_loop.py     # 5m 加密 updown 实盘循环（maker GTC post_only，挂单轮询成交）
+├── run_live_loop.py     # 5m 加密 updown 实盘循环（FOK 吃单，盘口预检 + token 校验）
 ├── run_event_live_loop.py # 通用事件盘实盘循环（maker GTC post_only）
 ├── run_equity_live_loop.py # 股票/商品日级实盘循环（FOK 吃单）
 ├── scan_event_markets.py  # 通用事件盘扫描 + LLM 评估
@@ -138,7 +138,7 @@ scripts/
 2. 充值 pUSD 到 deposit wallet（三选一）：
    - 官方桥 API：`POST https://bridge.polymarket.com/deposit`（BSC/ETH 等跨链，最小 $5，
      自动兑换 pUSD）；或链上脚本 `scripts/fund_deposit.py`（Polygon USDC→pUSD 自动转入）
-3. 下单验证：`scripts/verify_live_order_v2.py`（自动取窗口/价格，FOK $1）
+3. 下单验证：`scripts/run_live_loop.py` 实盘实测 + tests/test_order_v2.py 单测
 
 **CLOB V2 认证（新协议）**：
 - L1：ClobAuth EIP-712 签名 → `GET /auth/derive-api-key`（POLY_ADDRESS/SIGNATURE/TIMESTAMP/NONCE 头）
@@ -160,7 +160,7 @@ FOK/marketable BUY 最小 $1；每单有手续费（fee estimate ~$0.03）。
 全链路打通。充值：`fund_deposit.py`（USDC→pUSD 经 Paraswap 聚合器，$1.10 → 1.0999 pUSD，
 几乎无损）。
 
-**坏单过滤（实盘与模拟通用）**：预期成交价须在 **[0.25, 0.85]**（`run_live_loop`
+**坏单过滤（实盘与模拟通用）**：预期成交价须在 **[0.20, 0.85]**（`run_live_loop`
 按吃单侧盘口价预检，空壳盘口超范围则过滤；`simulate_*` 同规则），避免在空壳
 盘口上以极端价格成交。**实测（2026-08-14）**：5m 盘空壳盘口下 FOK 100% 无法
 成交（无对手盘，400 "couldn't be fully filled"）；改 maker GTC post_only 后
@@ -172,7 +172,7 @@ FOK/marketable BUY 最小 $1；每单有手续费（fee estimate ~$0.03）。
 （链上广播：sign + eth_sendRawTransaction + RPC 轮换）、`execution/relayer.py`
 （gasless 钱包操作）、`execution/signer.py`（ClobAuth + POLY_* L2 HMAC）、
 `data/clob_client.py`（post/get/cancel order V2）、`scripts/fund_deposit.py`（充值）、
-`scripts/verify_live_order_v2.py`（下单验证）。
+（下单验证由 run_live_loop 实盘实测 + 单测覆盖；verify_live_order_v2 已删除——无护栏真实下单的过时入口）
 
 **安全护栏**：凭证只存 `.env`（gitignore）；`SENSITIVE_FIELDS` 遮盖；链上交易
 （充值/swap）每次展示交易内容；真实下单前需确认。
@@ -183,7 +183,8 @@ HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
   scripts/run_live_loop.py --rounds 3 --min-edge 0.04 --log logs/live_loop.log
 ```
 - **单笔 $1 硬上限**（`MAX_ORDER_USD=1.0`，代码写死；`--size` 超 1 或 ≤0 直接拒绝启动）
-- **maker GTC post_only 挂单**（非 FOK），挂单后轮询成交，超时自动撤单（撤单失败重试）
+- **FOK 吃单**（marketable，立即成交或拒绝）：下单前盘口预检（预期成交价 ∉ [0.20, 0.85] 过滤）、
+  verify_token 校验（60s 缓存）、窗口剩余 <30s 跳过；成交后 mark_filled 实际成交价
 - 防重复开单（同窗口 slug 只试一次）、每轮复查余额、下单前 `verify_token` 校验
   （规避 5m 市场新建时 CLOB token 未生效的偶发 `invalid token id`）
 - 代理读 `HTTPS_PROXY` 环境变量（缺省回退 http://127.0.0.1:7897）
@@ -243,8 +244,8 @@ PYTHONPATH=. .venv/bin/python scripts/run_event_live_loop.py \
 > `run_equity_live_loop`）均涉及**真实资金**，默认每轮最多 1 笔、$1/笔，
 > 资金预检（deposit wallet pUSD 需覆盖 size + 手续费）。实盘/模拟成交均
 > 写入 `pending_trades`（`mode` 字段区分 `live`/`simulate`），由
-> `settle_worker` 常驻进程自动结算。`run_live_loop` 现为 maker 模式
-> （`--maker-offset` 挂 ref±offset、`--wait-fill` 轮询成交超时撤单），
+> `settle_worker` 常驻进程自动结算。`run_live_loop` 为 **FOK 吃单**模式
+> （`--fok-slip` 滑点容忍，默认 0.01；`--per-round` 每轮最多开单数），
 > 参数见 `--help`。
 
 ### updown 5/15 分钟快速市场（专项工具链）
@@ -347,7 +348,7 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
 7. **收敛/确定性折价无利可图**：尾段 ≥0.9 侧买入胜率 100% 但折价仅 0.1-0.2%
 8. **CLOB orderMinSize=5 shares（2026-08-14 实测）**：`--size $1` 在价格 >0.2 时
    份额 <5 被拒单（`Size (1.54) lower than the minimum: 5`）；空壳盘口过滤
-   （预期成交价 ∉ [0.25, 0.85]）在 $1/笔下拦截了绝大部分信号。待办见 docs/RUNBOOK.md 9.5
+   （预期成交价 ∉ [0.20, 0.85]）在 $1/笔下拦截了绝大部分信号。待办见 docs/RUNBOOK.md 9.5
 
 ## 配置
 

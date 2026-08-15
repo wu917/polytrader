@@ -96,8 +96,14 @@ def settle_one(rec: dict) -> bool:
         alt = target.with_name("llm_results.jsonl")
         target = alt if alt.exists() else None
     if target is None:
+        # 结果文件缺失（如 live 单未创建 results 文件）：仍要更新 DB 状态，
+        # 否则该单永久 pending、每轮空转查询（2026-08-15 实测发现）
         log(f"  [settle] {rec['slug']}: settled but results file gone — "
             f"event: {json.dumps(event, ensure_ascii=False)}")
+        try:
+            db.mark_settled(rec["trade_id"], s, 1 if win else 0, pnl)
+        except Exception as e:
+            log(f"  [db] mark_settled FAILED for {rec['trade_id']}: {e}")
         return True   # 仍视为已处理，避免无限重试
     with open(target, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, ensure_ascii=False) + "\n")

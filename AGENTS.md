@@ -68,8 +68,9 @@ backfill_settlements.py（兜底补结算）：仅当 settle_worker 未运行时
 
 实盘循环脚本（真实资金，默认关闭，需用户显式确认）：
 run_live_loop.py（5m 加密 updown）：每轮一个 5m 窗口，窗口内 --scan-interval 扫、
-  --stop-before(40s) 停；信号过坏单过滤[0.25,0.85]后走 **maker GTC post_only**（--maker-offset
-  挂 ref±offset 按 tick 0.01 取整），--wait-fill 轮询成交、超时撤单
+  --stop-before(80s) 停；信号过坏单过滤[0.20,0.85] + 盘口预检 + verify_token(60s 缓存)
+  + 窗口剩余 <30s 闸后走 **FOK 吃单**（marketable，--fok-slip 滑点容忍封顶 0.85），
+  成交后 mark_filled 实际成交价
 run_event_live_loop.py（通用事件盘）：maker GTC，--wait/--poll 轮询、未成交撤单
 run_equity_live_loop.py（股票/商品日级）：FOK 吃单
 下单精度（官方规则，order_v2.calc_amounts 实现）：tick=0.01 → 价格 2 位小数、

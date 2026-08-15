@@ -258,17 +258,11 @@ curl https://bridge.polymarket.com/supported-assets   # 确认支持链/最小�
 curl "https://bridge.polymarket.com/status/<桥地址>"   # 查到账进度
 ```
 
-### 9.3 下单验证脚本（真实下单，谨慎）
-```bash
-PYTHONPATH=. .venv/bin/python scripts/verify_live_order_v2.py
-```
-成功：HTTP 200 + `"status":"matched"` + `transactionsHashes`（链上成交）。
-注意：**这是真实下单脚本**（FOK $1），会真扣 deposit wallet 的 pUSD——验证
-链路时需用户确认金额与授权后再跑；临时验证脚本严禁直接调用下单函数（教训见
-AGENTS.md 第 5 节）。FOK 必须能立即全部成交；窗口临结束（盘口单边）会 400
-"couldn't be fully filled"，等新窗口重试即可。余额不足会报 `not enough
-balance / allowance`（需先充值）。
+### 9.3 下单验证（已由实盘实测 + 单测覆盖）
 
+下单链路验证：`run_live_loop.py` 实盘实测（FOK 真实下单全链路）+
+`tests/test_order_v2.py`（V2 订单构建/ERC-7739 签名/官方 SDK 交叉验证）。
+原 `verify_live_order_v2.py` 已删除——无护栏直接真实下单的过时入口（教训见 AGENTS.md 第 5 节）。
 ### 9.4 查订单/持仓/结算
 ```bash
 # 持仓（只读，无需认证）
