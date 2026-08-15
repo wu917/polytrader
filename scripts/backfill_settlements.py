@@ -58,9 +58,13 @@ def fetch_settle(slug: str) -> float | None:
                 return yes
             return None
     # 回退：gamma /markets 直查（衍生盘子市场）
+    # 注意：已结算市场不在默认查询结果——必须带 closed=true 才能查到
+    # （2026-08-16 实测：结算前 closed=false 可查；结算后需 closed=true，
+    #  否则 settle_worker 永远查不到 → 单子永久 pending 占持仓名额）
     try:
         resp2 = HTTP.get_json("https://gamma-api.polymarket.com/markets",
-                              params={"slug": slug, "limit": 5})
+                              params={"slug": slug, "limit": 5,
+                                      "closed": "true"})
     except Exception:
         return None
     items = resp2 if isinstance(resp2, list) else \
