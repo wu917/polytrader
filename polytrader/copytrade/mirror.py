@@ -31,6 +31,8 @@ class MirrorEngine:
         max_age_seconds: int = 600,
         slippage_per_min: float = 0.01,
         slippage_cap: float = 0.15,
+        wash_filter: bool = True,
+        wash_window_s: int = 1800,
     ):
         self.provider = provider
         self.data_api = data_api
@@ -44,8 +46,12 @@ class MirrorEngine:
         self.max_age_seconds = max_age_seconds  # 活动超龄不跟（信息已消化）
         self.slippage_per_min = slippage_per_min  # 年龄每多 1 分钟滑点容忍 +x
         self.slippage_cap = slippage_cap  # 动态滑点容忍封顶
+        self.wash_filter = wash_filter  # 过滤套利/冲单订单（默认开）
+        self.wash_window_s = wash_window_s  # 关联判断时间窗
         self._seen_trade_ids: set[str] = set()  # 已镜像交易去重
         self._target_wallets: list[str] = []
+        # 钱包交易历史：wallet -> conditionId -> [(side, outcome_index, ts)]
+        self._wallet_hist: dict[str, dict[str, list[tuple[str, int | None, float]]]] = {}
 
     # ---- 目标选择 ----
     def refresh_targets(self, profiles: list[WalletProfile] | None = None) -> list[str]:
@@ -159,6 +165,52 @@ class MirrorEngine:
                    "exec_price": exec_price},
         )
 
+    def _arb_markets_in(self, wallet: str, acts: list[dict]) -> set[str]:
+        """从一批活动中检测套利/冲单市场（conditionId 集合）。
+
+        同一钱包同一市场（批内或历史窗内）满足任一 → 该市场 BUY 全部过滤：
+        1. 出现 SELL（买卖往返/冲单）
+        2. 双 BUY 反向侧（outcomeIndex 不同，二元套利锁价）
+        """
+        if not self.wash_filter:
+            return set()
+        now = time.time()
+        groups: dict[str, list[tuple[str, int | None]]] = {}
+        # 历史累积（跨轮记忆，按钱包隔离）
+        wallet_hist = self._wallet_hist.setdefault(wallet, {})
+        for cid, items in wallet_hist.items():
+            for side, idx, ts in items:
+                if now - ts < self.wash_window_s:
+                    groups.setdefault(cid, []).append((side, idx))
+        # 当前批（同样按时间窗过滤：旧活动不参与套利判断）
+        for a in acts:
+            if str(a.get("type", "")).upper() != "TRADE":
+                continue
+            cid = str(a.get("conditionId", "") or "")
+            if not cid:
+                continue
+            try:
+                a_ts = float(a.get("timestamp", 0) or 0)
+            except (TypeError, ValueError):
+                a_ts = 0.0
+            if a_ts and now - a_ts > self.wash_window_s:
+                continue  # 超窗活动只记录不入组
+            groups.setdefault(cid, []).append(
+                (str(a.get("side", "")).upper(), a.get("outcomeIndex")))
+            # 同步累积到历史（跨轮记忆，同时清理过期）
+            hist = wallet_hist.setdefault(cid, [])
+            hist[:] = [h for h in hist if now - h[2] < self.wash_window_s]
+            hist.append((str(a.get("side", "")).upper(),
+                         a.get("outcomeIndex"), now))
+        arb: set[str] = set()
+        for cid, items in groups.items():
+            has_sell = any(side == "SELL" for side, _ in items)
+            buy_idx = {str(idx) for side, idx in items
+                       if side == "BUY" and idx is not None}
+            if has_sell or len(buy_idx) > 1:
+                arb.add(cid)
+        return arb
+
     # ---- 活动流扫描（官方 /activity 端点，带 transactionHash 可靠去重）----
     def scan_activity(self, books: dict[str, OrderBook] | None = None) -> list[Signal]:
         """按钱包轮询官方活动流，产出镜像信号。
@@ -181,6 +233,9 @@ class MirrorEngine:
             except Exception as exc:  # noqa: BLE001
                 log.warning("user activity failed for %s: %s", wallet, exc)
                 continue
+            # 套利/冲单市场预检测：批内+历史（该钱包）存在 SELL 或双 BUY 反向
+            # → 该市场全部 BUY 过滤（含先出现的，保证二元套利订单整体不跟）
+            arb_markets = self._arb_markets_in(wallet, acts)
             for a in acts:
                 if str(a.get("type", "")).upper() != "TRADE":
                     continue
@@ -195,6 +250,13 @@ class MirrorEngine:
                     continue
                 # 超龄活动不跟（轮询+索引延迟下，久远买入的信息已消化，追高无 alpha）
                 if not self._age_ok(a, trade_id):
+                    continue
+                # 二元套利/冲单过滤（同市场买卖往返或双侧买入）
+                if str(a.get("conditionId", "") or "") in arb_markets:
+                    self._seen_trade_ids.add(trade_id)  # 套利订单永久跳过
+                    log.info("mirror skip %s: arb/wash market %s (wallet %s)",
+                             trade_id[:24], str(a.get("conditionId", ""))[:16],
+                             wallet[:10])
                     continue
                 signal = self._build_activity_signal(a, wallet, books)
                 if signal is None:

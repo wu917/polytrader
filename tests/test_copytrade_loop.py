@@ -124,7 +124,8 @@ def test_activity_scan_dedup_by_transaction_hash():
 def test_activity_scan_skips_non_trade_and_sell():
     api = FakeActivityApi({"0xpro": [
         act(type="REWARD", amount="5"),
-        act(side="SELL", transactionHash="0xsell"),
+        act(side="SELL", transactionHash="0xsell", conditionId="0xcondOther",
+            outcomeIndex=1),
         act(transactionHash="0xbuy"),
     ]})
     engine = _activity_engine(api)
@@ -212,6 +213,78 @@ def test_activity_trade_id_prefers_hash():
     b = dict(a)
     del b["transactionHash"]
     assert _trade_id(b) != "transactionHash:0xhash1"  # 降级指纹
+
+
+# ---------- 套利/冲单过滤 ----------
+
+def test_wash_filter_skips_sell_roundtrip():
+    """同钱包同市场先 SELL 后 BUY → 冲单/往返，BUY 被过滤。"""
+    api = FakeActivityApi({"0xpro": [
+        act(side="SELL", transactionHash="0xsell", conditionId="0xcondA",
+            outcomeIndex=1, outcome="No"),
+        act(transactionHash="0xbuy", conditionId="0xcondA"),
+    ]})
+    engine = _activity_engine(api)
+    assert engine.scan_activity() == []
+
+
+def test_wash_filter_skips_both_side_buy():
+    """同钱包同市场 BUY YES + BUY NO → 二元套利，第二个 BUY 被过滤。"""
+    api = FakeActivityApi({"0xpro": [
+        act(transactionHash="0xbuy1", conditionId="0xcondB", outcomeIndex=0,
+            outcome="Yes"),
+        act(transactionHash="0xbuy2", conditionId="0xcondB", outcomeIndex=1,
+            outcome="No"),
+    ]})
+    engine = _activity_engine(api)
+    assert engine.scan_activity() == []  # buy2 是反向侧被过滤
+
+
+def test_wash_filter_allows_normal_same_side_buys():
+    """同市场同侧连续 BUY（加仓）不是套利，均保留。"""
+    api = FakeActivityApi({"0xpro": [
+        act(transactionHash="0xbuy1", conditionId="0xcondC", outcomeIndex=0),
+        act(transactionHash="0xbuy2", conditionId="0xcondC", outcomeIndex=0),
+    ]})
+    engine = _activity_engine(api)
+    signals = engine.scan_activity()
+    assert len(signals) == 2  # 加仓是方向性行为，两笔都正常
+
+
+def test_wash_filter_cross_market_not_affected():
+    """不同市场的买卖互不影响。"""
+    api = FakeActivityApi({"0xpro": [
+        act(side="SELL", transactionHash="0xsell", conditionId="0xcondX",
+            outcomeIndex=1),
+        act(transactionHash="0xbuy", conditionId="0xcondY", outcomeIndex=0),
+    ]})
+    engine = _activity_engine(api)
+    assert len(engine.scan_activity()) == 1
+
+
+def test_wash_filter_expiry_after_window():
+    """时间窗过期后同市场可再次跟随。"""
+    import time as _t
+    old_sell = act(side="SELL", transactionHash="0xold",
+                   conditionId="0xcondZ", outcomeIndex=1)
+    old_sell["timestamp"] = int(_t.time()) - 3600  # 1 小时前（超出 1800s 窗）
+    api = FakeActivityApi({"0xpro": [old_sell,
+                                     act(transactionHash="0xbuy",
+                                         conditionId="0xcondZ")]})
+    engine = _activity_engine(api, wash_window_s=1800)
+    assert len(engine.scan_activity()) == 1  # 过期 SELL 不影响
+
+
+def test_wash_filter_disabled():
+    """关闭过滤时套利订单不被拦截。"""
+    api = FakeActivityApi({"0xpro": [
+        act(side="SELL", transactionHash="0xsell", conditionId="0xcondW",
+            outcomeIndex=1, outcome="No"),
+        act(transactionHash="0xbuy", conditionId="0xcondW", outcomeIndex=0,
+            outcome="Yes"),
+    ]})
+    engine = _activity_engine(api, wash_filter=False)
+    assert len(engine.scan_activity()) == 1
 
 
 # ---------- 排行榜源目标资格（放宽交易数/活跃检查）----------

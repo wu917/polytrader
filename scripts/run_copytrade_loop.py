@@ -97,6 +97,10 @@ def main() -> int:
                     help="动态滑点容忍封顶")
     ap.add_argument("--max-age-seconds", type=int, default=600,
                     help="活动超龄不跟（默认 600s：10 分钟前的买入视为信息已消化）")
+    ap.add_argument("--no-wash-filter", action="store_true",
+                    help="关闭套利/冲单过滤（默认开启：同市场买卖往返或双侧买入不跟）")
+    ap.add_argument("--wash-window", type=int, default=1800,
+                    help="套利/冲单判断时间窗秒（默认 1800s）")
     ap.add_argument("--min-buy-price", type=float, default=DEFAULT_MIN_PRICE)
     ap.add_argument("--max-buy-price", type=float, default=DEFAULT_MAX_PRICE)
     ap.add_argument("--fetch-books", action="store_true",
@@ -165,6 +169,8 @@ def main() -> int:
         mirror_yes_only=True,
         max_size_usd=args.max_size_usd,
         require_activity=False,  # 排行榜源无活跃时间字段
+        wash_filter=not args.no_wash_filter,
+        wash_window_s=args.wash_window,
     )
     engine._seen_trade_ids = seen  # 载入历史去重
     risk = RiskManager(mode="paper", max_position_usd=args.max_size_usd * 4)
