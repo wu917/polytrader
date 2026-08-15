@@ -236,3 +236,42 @@ def test_count_open_filters_copytrade(monkeypatch):
                     {"window": "copytrade", "status": "pending"},
                     {"window": "5m", "status": "pending"}]
     assert rcl._count_open(FakeDB) == 2
+
+
+# ---------- 持仓上限热更新 ----------
+
+def test_hot_limit_file_overrides(monkeypatch, tmp_path):
+    """运行中改 logs/copytrade_limit.txt 即可热更新上限（无需重启）。"""
+    class Args:
+        max_live_orders = 3
+        max_open_positions = 10
+    args = Args()
+    f = rcl.ROOT / "logs" / "copytrade_limit.txt"
+    orig = f.read_text(encoding="utf-8") if f.exists() else None
+    try:
+        f.write_text("5\n", encoding="utf-8")
+        assert rcl._hot_limit(args, True) == 5
+        assert rcl._hot_limit(args, False) == 10  # paper 不受影响
+        f.write_text("2\n", encoding="utf-8")
+        assert rcl._hot_limit(args, True) == 2  # 改小立即生效
+        f.write_text("abc\n", encoding="utf-8")
+        assert rcl._hot_limit(args, True) == 3  # 非法回退启动值
+    finally:
+        if orig is not None:
+            f.write_text(orig, encoding="utf-8")
+        else:
+            f.unlink(missing_ok=True)
+
+
+def test_hot_limit_fallback_without_file(monkeypatch, tmp_path):
+    """无热更新文件时用启动参数。"""
+    class Args:
+        max_live_orders = 3
+        max_open_positions = 10
+    f = rcl.ROOT / "logs" / "copytrade_limit.txt"
+    if f.exists():
+        f.unlink()
+    try:
+        assert rcl._hot_limit(Args(), True) == 3
+    finally:
+        f.unlink(missing_ok=True)

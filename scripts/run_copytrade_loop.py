@@ -244,8 +244,7 @@ def main() -> int:
             if not args.no_db:
                 open_cnt = (_count_live_open(db) if args.live
                             else _count_open(db))
-                limit = (args.max_live_orders if args.live
-                         else args.max_open_positions)
+                limit = _hot_limit(args, args.live)
                 if open_cnt >= limit:
                     log(f"  waiting: {'live' if args.live else 'copytrade'} "
                         f"pending {open_cnt} >= max {limit}（结算释放后自动恢复）")
@@ -270,8 +269,7 @@ def main() -> int:
         for s in signals:
             if not args.no_db:
                 cur_open = open_cnt + opened
-                limit = (args.max_live_orders if args.live
-                         else args.max_open_positions)
+                limit = _hot_limit(args, args.live)
                 if cur_open >= limit:
                     log(f"  round cap reached ({cur_open}/{limit})，"
                         f"本轮剩余信号暂停（下轮释放后继续）")
@@ -328,10 +326,6 @@ def main() -> int:
                         fill_price = None
                     txs = body.get("transactionsHashes") or []
                     tx_hash = txs[0] if txs else None
-                    # delayed 响应不含成交信息：登记待轮询回填（下一轮起查）
-                    if body.get("status") == "delayed":
-                        live_ctx["pending_fills"].append(
-                            (rec_row["trade_id"], body.get("orderID"), time.time()))
                     entry = fill_price if fill_price else px
                     rec_row = {
                         "trade_id": str(uuid.uuid4())[:8],
@@ -356,6 +350,10 @@ def main() -> int:
                         "mirror_wallet": s.extra.get("mirror_wallet"),
                         "mirror_trade_id": s.extra.get("mirror_trade_id"),
                     }
+                    # delayed 响应不含成交信息：登记待轮询回填（下一轮起查）
+                    if body.get("status") == "delayed" and rec_row["order_id"]:
+                        live_ctx["pending_fills"].append(
+                            (rec_row["trade_id"], rec_row["order_id"], time.time()))
                     if not args.no_db:
                         from scripts.simulate_equity_updown import build_db_rec
                         try:
@@ -535,6 +533,28 @@ def _count_open(dbmod) -> int:
         return 0
 
 
+def _hot_limit(args, is_live: bool) -> int:
+    """持仓上限热更新：每轮读 logs/copytrade_limit.txt（数字）覆盖启动值。
+
+    仅对实盘（live）生效；paper 用启动参数。运行中改文件即生效
+    （无需重启）：改小立即收紧（waiting），改大立即放行。
+    文件缺失/非法时回退启动参数。
+    """
+    if not is_live:
+        return args.max_open_positions
+    try:
+        f = ROOT / "logs" / "copytrade_limit.txt"
+        if f.exists():
+            v = f.read_text(encoding="utf-8").strip()
+            if v:
+                n = int(v)
+                if n >= 1:
+                    return n
+    except (ValueError, OSError):
+        pass
+    return args.max_live_orders
+
+
 def _count_live_open(dbmod) -> int:
     """DB 中未结算 live 跟单单数（实盘持仓上限控制用）。"""
     try:
@@ -567,4 +587,21 @@ def _fetch_books_for_signals(engine: MirrorEngine, clob: ClobClient) -> dict:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 外层兜底：任何未捕获异常（含非 Exception 的 BaseException）记录完整
+    # traceback 到 logs/copytrade_crash.log（防止 stderr 被 nohup 丢弃导致
+    # 崩溃原因不可见——2026-08-16 连续 3 次下单后静默死亡的排查发现）
+    import traceback
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        try:
+            crash_log = ROOT / "logs" / "copytrade_crash.log"
+            crash_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(crash_log, "a", encoding="utf-8") as fh:
+                fh.write(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%S')} ===\n")
+                fh.write(traceback.format_exc())
+        except Exception:
+            pass
+        raise
