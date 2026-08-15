@@ -33,6 +33,7 @@ class MirrorEngine:
         slippage_cap: float = 0.15,
         wash_filter: bool = True,
         wash_window_s: int = 1800,
+        arb_gap_s: int = 60,
     ):
         self.provider = provider
         self.data_api = data_api
@@ -48,6 +49,7 @@ class MirrorEngine:
         self.slippage_cap = slippage_cap  # 动态滑点容忍封顶
         self.wash_filter = wash_filter  # 过滤套利/冲单订单（默认开）
         self.wash_window_s = wash_window_s  # 关联判断时间窗
+        self.arb_gap_s = arb_gap_s  # 双 BUY 反向判套利的双腿最大间隔（防对冲误判）
         self._seen_trade_ids: set[str] = set()  # 已镜像交易去重
         self._target_wallets: list[str] = []
         # 钱包交易历史：wallet -> conditionId -> [(side, outcome_index, ts)]
@@ -175,13 +177,13 @@ class MirrorEngine:
         if not self.wash_filter:
             return set()
         now = time.time()
-        groups: dict[str, list[tuple[str, int | None]]] = {}
+        groups: dict[str, list[tuple[str, int | None, float]]] = {}
         # 历史累积（跨轮记忆，按钱包隔离）
         wallet_hist = self._wallet_hist.setdefault(wallet, {})
         for cid, items in wallet_hist.items():
             for side, idx, ts in items:
                 if now - ts < self.wash_window_s:
-                    groups.setdefault(cid, []).append((side, idx))
+                    groups.setdefault(cid, []).append((side, idx, ts))
         # 当前批（同样按时间窗过滤：旧活动不参与套利判断）
         for a in acts:
             if str(a.get("type", "")).upper() != "TRADE":
@@ -196,7 +198,7 @@ class MirrorEngine:
             if a_ts and now - a_ts > self.wash_window_s:
                 continue  # 超窗活动只记录不入组
             groups.setdefault(cid, []).append(
-                (str(a.get("side", "")).upper(), a.get("outcomeIndex")))
+                (str(a.get("side", "")).upper(), a.get("outcomeIndex"), a_ts))
             # 同步累积到历史（跨轮记忆，同时清理过期）
             hist = wallet_hist.setdefault(cid, [])
             hist[:] = [h for h in hist if now - h[2] < self.wash_window_s]
@@ -204,10 +206,23 @@ class MirrorEngine:
                          a.get("outcomeIndex"), now))
         arb: set[str] = set()
         for cid, items in groups.items():
-            has_sell = any(side == "SELL" for side, _ in items)
-            buy_idx = {str(idx) for side, idx in items
-                       if side == "BUY" and idx is not None}
-            if has_sell or len(buy_idx) > 1:
+            has_sell = any(side == "SELL" for side, _, _ in items)
+            # 双 BUY 反向判套利：两条腿间隔 ≤ arb_gap_s 才算锁价套利；
+            # 间隔长的（如几分钟后买反向）视为对冲/风险管理，不判套利
+            buys = [(idx, ts) for side, idx, ts in items
+                    if side == "BUY" and idx is not None]
+            buy_idx = {str(idx) for idx, _ in buys}
+            gap_ok = False
+            if len(buy_idx) > 1:
+                if self.arb_gap_s <= 0:
+                    gap_ok = True  # 严格模式：任何间隔都判套利
+                else:
+                    ts_list = sorted(ts for _, ts in buys if ts)
+                    if ts_list and max(ts_list) - min(ts_list) <= self.arb_gap_s:
+                        gap_ok = True
+                    elif not any(ts for _, ts in buys):
+                        gap_ok = True  # 无时间戳时保守视为套利
+            if has_sell or gap_ok:
                 arb.add(cid)
         return arb
 

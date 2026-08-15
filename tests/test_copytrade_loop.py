@@ -80,6 +80,8 @@ class FakeActivityApi:
 
 
 def act(**kw):
+    if "ts" in kw:
+        kw["timestamp"] = kw.pop("ts")  # ts 快捷参数映射到 timestamp
     base = {"type": "TRADE", "side": "BUY", "size": "25", "price": "0.49",
             "asset": "tokA", "transactionHash": "0xhash1",
             "timestamp": int(time.time()), "conditionId": "0xcond1",
@@ -229,7 +231,7 @@ def test_wash_filter_skips_sell_roundtrip():
 
 
 def test_wash_filter_skips_both_side_buy():
-    """同钱包同市场 BUY YES + BUY NO → 二元套利，第二个 BUY 被过滤。"""
+    """同钱包同市场短间隔 BUY YES + BUY NO（≤60s 锁价套利）→ 全部过滤。"""
     api = FakeActivityApi({"0xpro": [
         act(transactionHash="0xbuy1", conditionId="0xcondB", outcomeIndex=0,
             outcome="Yes"),
@@ -237,7 +239,43 @@ def test_wash_filter_skips_both_side_buy():
             outcome="No"),
     ]})
     engine = _activity_engine(api)
-    assert engine.scan_activity() == []  # buy2 是反向侧被过滤
+    assert engine.scan_activity() == []  # 双腿都被过滤
+
+
+def test_hedge_gap_not_arbitrage():
+    """间隔 >60s 的双 BUY 反向 = 对冲/风险管理，不判套利——后续 BUY 保留。"""
+    import time as _t
+    t0 = int(_t.time())
+    api = FakeActivityApi({"0xpro": [
+        act(transactionHash="0xbuy1", conditionId="0xcondH", outcomeIndex=0,
+            outcome="Yes", ts=t0 - 300),  # 5 分钟前 BUY YES
+        act(transactionHash="0xbuy2", conditionId="0xcondH", outcomeIndex=1,
+            outcome="No", ts=t0 - 240),   # 4 分钟前 BUY NO（对冲）
+        act(transactionHash="0xbuy3", conditionId="0xcondH", outcomeIndex=0,
+            outcome="Yes", ts=t0),        # 现在 BUY YES（方向单）
+    ]})
+    engine = _activity_engine(api)
+    signals = engine.scan_activity()
+    # buy1 超过 max_age(600s)? 300s < 600s 未超龄；buy2 NO 跳过；buy3 正常
+    tids = [s.extra["mirror_trade_id"] for s in signals]
+    assert "transactionHash:0xbuy3" in tids  # 对冲场景后续方向单保留
+    assert len(signals) == 2  # buy1(近 5 分钟) + buy3
+
+
+def test_arb_gap_threshold_configurable():
+    """arb_gap_s=0 时任何间隔的双 BUY 反向都判套利（严格模式）。"""
+    import time as _t
+    t0 = int(_t.time())
+    api = FakeActivityApi({"0xpro": [
+        act(transactionHash="0xbuy1", conditionId="0xcondI", outcomeIndex=0,
+            outcome="Yes", ts=t0 - 300),
+        act(transactionHash="0xbuy2", conditionId="0xcondI", outcomeIndex=1,
+            outcome="No", ts=t0 - 240),
+        act(transactionHash="0xbuy3", conditionId="0xcondI", outcomeIndex=0,
+            outcome="Yes", ts=t0),
+    ]})
+    engine = _activity_engine(api, arb_gap_s=0)  # 严格：无间隔限制
+    assert engine.scan_activity() == []
 
 
 def test_wash_filter_allows_normal_same_side_buys():
