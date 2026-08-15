@@ -21,9 +21,18 @@ Polymarket 预测市场的 **updown 5m/15m 快速市场模拟交易工具链**�
 | MySQL | 8.0.46 arm64，安装于 `../mysql-8.0.46/`（workspace 下，非 brew） |
 | MySQL 连接 | `127.0.0.1:3306`，user `root`，密码见 `.env` 的 `POLY_DB_PASS`，库 `polytrader` |
 | LLM | DeepSeek（`.env`：`LLM_API_KEY` / `LLM_BASE_URL=https://api.deepseek.com/v1` / `LLM_MODEL=deepseek-chat`） |
-| 网络 | **必须走本地 SOCKS5 代理 `127.0.0.1:7890`**（.env `HTTP_PROXY`/`HTTPS_PROXY` 与代码 `_req` 均硬编码此端口）：requests 需显式 `proxies=`（默认 trust_env 有时不生效）；裸 TCP/curl 直连 Polymarket 全不通（000）。主网 CLOB/Gamma 经代理可达 |
+| 网络 | **必须走本地 HTTP 代理 `127.0.0.1:7897`**（.env `HTTP_PROXY`/`HTTPS_PROXY` 与代码 `_req` 均硬编码此端口）：requests 需显式 `proxies=`（默认 trust_env 有时不生效）；裸 TCP/curl 直连 Polymarket 全不通（000）。主网 CLOB/Gamma 经代理可达 |
 | 网络抖动 | gamma-api 偶发 `SSL EOF` 抖动（几分钟级），扫描失败**不中断循环**，重试即可 |
 | 测试网 | `clob-staging.polymarket.com` 经当前代理**不可达**（000）——测试网全链路验证需换可用代理节点 |
+
+**⚠️ 2026-08-15 迁移到新机器后的环境差异（以本条为准，上文为旧沙箱记录）**：
+
+- 仓库为**全新 clone，零运行产物**：无 `.venv/`、无 `.env`、无 `logs/`、无 `backtest_results/`、无 jsonl 结果，MySQL `polytrader` 库与 `pending_trades` 表是否已建**待确认**
+- 本机无 `../mysql-8.0.46` 目录、无 mysql 客户端命令；但 **mysqld 已在 `127.0.0.1:3306` 运行**（PID 21368，来源未知，需 pymysql 或装客户端才能查库）
+- 初始化待办：`~/.local/bin/python3.11 -m venv .venv` → `.venv/bin/pip install -r requirements.txt` → `cp .env.example .env`（填 POLY_DB_*、LLM key、代理）→ 确认 MySQL 建库建表 → 跑 `pytest` 验证
+- 网络实测：Polymarket（gamma/clob）直连 000 **需代理** `http://127.0.0.1:7897`（代理客户端不常开，用时先探测）；DeepSeek API、mcp.context7.com、mcp.grep.app **直连可达**
+- 项目级 opencode 配置已部署：`.opencode/agents/quant-guard.md`（实盘安全审查）+ `.opencode/skills/live-trading-safety/`（真实资金铁律），见全局记忆第 4 节
+- 2026-08-15 已补齐：`.env`（旧项目拷贝 + 代理补 `http://127.0.0.1:7897`）、`logs/`（旧实盘日志）、`backtest_results/seen_slugs.txt`（84 条去重）、`scripts/migrate_pending_trades_schema.py`（旧表结构迁移，已执行）；代理端口 7890 → 7897 已全量替换（代码/README/AGENTS.md）
 
 **沙箱限制（重要）**：只能写 workspace（`~/.reasonix/global-workspace/`）与 `/tmp`；
 `/opt`、home 根目录、系统级命令（如 `ps`）被禁止。装软件只能在 workspace 内解压运行。

@@ -3,7 +3,7 @@
 从 Gamma 拉取已解决（closed）市场作为标签样本，拉取历史价格构造特征，
 训练 + 校准概率模型并保存 artifact，供 polytrader run 加载使用。
 
-用法: .venv/bin/python scripts/train_ai.py [--proxy socks5h://127.0.0.1:7890]
+用法: .venv/bin/python scripts/train_ai.py [--proxy http://127.0.0.1:7897]
                                         [--samples 400] [--out models/ai_artifact.pkl]
 """
 import argparse
@@ -22,7 +22,7 @@ from polytrader.data.http_client import HttpClient
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--proxy", default="socks5h://127.0.0.1:7890")
+    ap.add_argument("--proxy", default="http://127.0.0.1:7897")
     ap.add_argument("--samples", type=int, default=400, help="最多拉取多少已解决市场")
     ap.add_argument("--out", default="models/ai_artifact.pkl")
     ap.add_argument("--no-calibrate", action="store_true")

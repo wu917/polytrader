@@ -66,7 +66,7 @@ class _Tee:
 
 # 代理：优先 HTTPS_PROXY 环境变量（缺省回退本机 socks5 7890，保持原行为）
 PROXY = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-         or "socks5h://127.0.0.1:7890")
+         or "http://127.0.0.1:7897")
 
 
 def _req(method: str, url: str, **kw):

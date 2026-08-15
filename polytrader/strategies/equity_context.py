@@ -285,7 +285,7 @@ class EquityContextFetcher:
     """拉取标的 + 大盘的日 K 并计算特征。"""
 
     def __init__(self, http: HttpClient | None = None, days: int = 250):
-        self.http = http or HttpClient(proxy="socks5h://127.0.0.1:7890", timeout=15)
+        self.http = http or HttpClient(proxy="http://127.0.0.1:7897", timeout=15)
         self.days = days
 
     def fetch_bars(self, kind: str, symbol: str) -> list[dict]:

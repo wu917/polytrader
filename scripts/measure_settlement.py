@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from polytrader.data.http_client import HttpClient
 
-HTTP = HttpClient(proxy="socks5h://127.0.0.1:7890", timeout=15)
+HTTP = HttpClient(proxy="http://127.0.0.1:7897", timeout=15)
 
 
 def main() -> int:

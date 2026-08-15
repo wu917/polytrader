@@ -12,7 +12,7 @@ from polytrader.ai.features import _parse_ts
 from polytrader.data.gamma_client import GammaClient
 from polytrader.data.http_client import HttpClient
 
-http = HttpClient(proxy="socks5h://127.0.0.1:7890")
+http = HttpClient(proxy="http://127.0.0.1:7897")
 gamma = GammaClient(http=http)
 
 ms = []

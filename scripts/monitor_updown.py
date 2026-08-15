@@ -66,7 +66,7 @@ def fetch_markets(http, coins):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--proxy", default="socks5h://127.0.0.1:7890")
+    ap.add_argument("--proxy", default="http://127.0.0.1:7897")
     ap.add_argument("--coins", default=",".join(COINS))
     ap.add_argument("--interval", type=float, default=10.0, help="轮间隔秒")
     ap.add_argument("--rounds", type=int, default=30, help="最大轮数（0=无限）")

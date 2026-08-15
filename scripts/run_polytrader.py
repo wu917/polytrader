@@ -5,7 +5,7 @@
   .venv/bin/python scripts/run_polytrader.py --offline
 
   # paper 模式：真实市场 + 真实订单簿 + 模拟成交
-  .venv/bin/python scripts/run_polytrader.py --mode paper [--proxy socks5h://127.0.0.1:7890]
+  .venv/bin/python scripts/run_polytrader.py --mode paper [--proxy http://127.0.0.1:7897]
 
   # AI 回测：已解决市场的模型质量评估
   .venv/bin/python scripts/run_polytrader.py backtest --samples 200 [--proxy ...]

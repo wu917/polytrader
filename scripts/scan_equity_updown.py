@@ -31,7 +31,7 @@ from polytrader.strategies.equity_updown import EquityUpdownStrategy
 
 SEARCH_BASE = "https://gamma-api.polymarket.com/public-search?q="
 GAMMA_MARKET = "https://gamma-api.polymarket.com/markets?slug="
-PROXY = "socks5h://127.0.0.1:7890"
+PROXY = "http://127.0.0.1:7897"
 
 
 def discover_daily_updown(http: HttpClient) -> list[dict]:

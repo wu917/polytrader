@@ -1,6 +1,6 @@
 """真实 API 冒烟测试（需网络，走代理）：Gamma 市场发现 + CLOB 订单簿。
 
-用法: .venv/bin/python scripts/smoke_data.py [--proxy socks5h://127.0.0.1:7890]
+用法: .venv/bin/python scripts/smoke_data.py [--proxy http://127.0.0.1:7897]
 """
 import argparse
 import sys
@@ -15,7 +15,7 @@ from polytrader.data.gamma_client import GammaClient
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--proxy", default="socks5h://127.0.0.1:7890")
+    ap.add_argument("--proxy", default="http://127.0.0.1:7897")
     ap.add_argument("--limit", type=int, default=20)
     args = ap.parse_args()
 

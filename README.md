@@ -29,7 +29,7 @@ python3.11 -m venv .venv
 .venv/bin/python -m pytest tests/        # 187 个测试
 ```
 
-网络说明：本机访问 Polymarket **经本地 SOCKS5 代理 127.0.0.1:7890**（.env `HTTP_PROXY`/
+网络说明：本机访问 Polymarket **经本地 HTTP 代理 127.0.0.1:7897**（.env `HTTP_PROXY`/
 `HTTPS_PROXY` 与代码 `_req`/`HttpClient` 均显式配置此端口；裸直连不通）。若在无代理
 环境运行，需在 `HttpClient(proxy=...)` 显式配置可用代理。
 
@@ -114,10 +114,10 @@ scripts/
 
 ```bash
 # paper 模式真实扫描
-.venv/bin/python scripts/run_polytrader.py paper --proxy socks5h://127.0.0.1:7890
+.venv/bin/python scripts/run_polytrader.py paper --proxy http://127.0.0.1:7897
 
 # LLM 盘口扫描（DeepSeek 双侧评估，真实市场）
-.venv/bin/python scripts/run_polytrader.py llm --proxy socks5h://127.0.0.1:7890
+.venv/bin/python scripts/run_polytrader.py llm --proxy http://127.0.0.1:7897
 ```
 
 ### 实盘交易（live / CLOB V2）
@@ -186,7 +186,7 @@ HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
 - **maker GTC post_only 挂单**（非 FOK），挂单后轮询成交，超时自动撤单（撤单失败重试）
 - 防重复开单（同窗口 slug 只试一次）、每轮复查余额、下单前 `verify_token` 校验
   （规避 5m 市场新建时 CLOB token 未生效的偶发 `invalid token id`）
-- 代理读 `HTTPS_PROXY` 环境变量（缺省回退 socks5h://127.0.0.1:7890）
+- 代理读 `HTTPS_PROXY` 环境变量（缺省回退 http://127.0.0.1:7897）
 - 成交写入 `pending_trades`（`mode='live'` + orderID + fill_price + LLM 建议），
   settle_worker 自动结算
 
@@ -316,10 +316,10 @@ logs/llm_daemon_<ts>/          ← 每次 start 一个会话目录
 
 ```bash
 # 训练（从已解决市场取标签）
-.venv/bin/python scripts/train_ai.py --samples 2000 --proxy socks5h://127.0.0.1:7890
+.venv/bin/python scripts/train_ai.py --samples 2000 --proxy http://127.0.0.1:7897
 
 # 模型质量评估（区分度 + 校准分桶）
-.venv/bin/python scripts/run_polytrader.py backtest --samples 500 --proxy socks5h://127.0.0.1:7890
+.venv/bin/python scripts/run_polytrader.py backtest --samples 500 --proxy http://127.0.0.1:7897
 ```
 
 **回测局限（诚实声明）**：当前 backtest 为 in-sample 评估（历史价格特征 + 结算标签），
@@ -371,7 +371,7 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
 - gamma-api 偶发 `SSL EOF` 瞬时抖动（分钟级）：扫描失败不中断循环、settle_worker
   自动重试，网络恢复即自愈，无需干预
 - 本机无本地代理：python requests 直连 Polymarket/OKX 实测可用；若将来需要代理，
-  可在 `HttpClient(proxy=...)` 处配置（注意 scripts 中 `socks5h://127.0.0.1:7890`
+  可在 `HttpClient(proxy=...)` 处配置（注意 scripts 中 `http://127.0.0.1:7897`
   为历史默认值，无 PySocks 时实际静默直连）
 - MySQL 8.0.46 需手动启动（见快速开始）；机器重启后 `settle_worker status` 报
   DB 错误时先启动 mysqld

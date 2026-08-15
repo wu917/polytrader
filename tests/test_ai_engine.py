@@ -219,10 +219,10 @@ def test_llm_scorer_rejects_non_https_base_url():
 def test_llm_scorer_clears_proxy_by_default():
     """安全：LLM 请求默认绕过代理（key 不经过第三方代理）。"""
     from polytrader.data.http_client import HttpClient
-    http = HttpClient(proxy="socks5h://127.0.0.1:7890")
+    http = HttpClient(proxy="http://127.0.0.1:7897")
     scorer = LLMScorer(api_key="k", http=http)
     assert scorer.http.session.proxies == {}
-    http2 = HttpClient(proxy="socks5h://127.0.0.1:7890")
+    http2 = HttpClient(proxy="http://127.0.0.1:7897")
     scorer_proxy = LLMScorer(api_key="k", http=http2, use_proxy=True)
     assert scorer_proxy.http.session.proxies != {}
 

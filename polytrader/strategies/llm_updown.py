@@ -20,7 +20,7 @@ from polytrader.strategies.llm_book import LLMBookStrategy, _outcome_price
 
 log = get_logger("strategies.llm_updown")
 
-HTTP = HttpClient(proxy="socks5h://127.0.0.1:7890", timeout=10)
+HTTP = HttpClient(proxy="http://127.0.0.1:7897", timeout=10)
 
 
 def fetch_market_context(coin: str, window_s: int = 300) -> dict | None:

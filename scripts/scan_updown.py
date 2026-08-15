@@ -19,7 +19,7 @@ COINS = ["btc", "eth", "sol", "xrp", "doge", "hype", "bnb"]
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--proxy", default="socks5h://127.0.0.1:7890")
+    ap.add_argument("--proxy", default="http://127.0.0.1:7897")
     ap.add_argument("--coins", default=",".join(COINS))
     args = ap.parse_args()
     coins = [c for c in args.coins.split(",") if c]

@@ -32,7 +32,7 @@ from polytrader.strategies.event_market import EventMarketStrategy
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "backtest_results"
-PROXY = "socks5h://127.0.0.1:7890"
+PROXY = "http://127.0.0.1:7897"
 GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
 
 # 排除：价格类（above/below/reach/hit/updown）与体育/电竞（slug 前缀 + question）

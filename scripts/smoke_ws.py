@@ -23,7 +23,7 @@ FALLBACK_TOKEN = "32338220190071351435772801779725302244575775216413325951443816
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--proxy", default="socks5h://127.0.0.1:7890")
+    ap.add_argument("--proxy", default="http://127.0.0.1:7897")
     ap.add_argument("--token", default="")
     ap.add_argument("--count", type=int, default=3)
     ap.add_argument("--timeout", type=int, default=30)

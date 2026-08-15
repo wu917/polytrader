@@ -136,7 +136,7 @@ def fetch_settlement(http, slug: str) -> float | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--proxy", default="socks5h://127.0.0.1:7890")
+    ap.add_argument("--proxy", default="http://127.0.0.1:7897")
     ap.add_argument("--wait", type=int, default=330, help="等待结算秒数（0=不等）")
     ap.add_argument("--min-edge", type=float, default=0.05)
     ap.add_argument("--coins", default=",".join(COINS))

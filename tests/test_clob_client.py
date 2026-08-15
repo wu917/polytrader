@@ -56,10 +56,10 @@ def test_to_level_variants():
 def test_ws_proxy_kwargs():
     from polytrader.data.clob_client import _ws_proxy_kwargs
     assert _ws_proxy_kwargs(None) == {}
-    http = _ws_proxy_kwargs("http://127.0.0.1:7890")
+    http = _ws_proxy_kwargs("http://127.0.0.1:7897")
     assert http["proxy_type"] == "http"
     assert http["http_proxy_host"] == "127.0.0.1"
-    socks = _ws_proxy_kwargs("socks5h://127.0.0.1:7890")
+    socks = _ws_proxy_kwargs("socks5h://127.0.0.1:7897")
     assert socks["proxy_type"] == "socks5h"
     # 不支持的 scheme 必须报错而非静默直连（安全）
     import pytest
