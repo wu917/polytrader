@@ -1,6 +1,6 @@
 # PolyTrader 操作手册（RUNBOOK）
 
-> 面向日常运维：启动/停止、日志查看、数据复盘、故障排查。版本 2026-08-14。
+> 面向日常运维：启动/停止、日志查看、数据复盘、故障排查。版本 2026-08-16。
 
 ## 1. 快速命令速查
 
@@ -13,6 +13,8 @@
 | 常驻结算进程：停止 | `.venv/bin/python scripts/settle_worker.py stop` |
 | 多轮循环测试 | `.venv/bin/python scripts/run_llm_loop.py --rounds 3 --windows 5m` |
 | 5m 加密盘实盘循环 | `PYTHONPATH=. .venv/bin/python scripts/run_live_loop.py --rounds 3` |
+| 跟单循环（paper 模拟，默认） | `.venv/bin/python scripts/run_copytrade_loop.py --rounds 5 --log logs/copytrade.log` |
+| 跟单循环（实盘 FOK，需授权） | `.venv/bin/python scripts/run_copytrade_loop.py --live --max-live-orders 2 --rounds 5` |
 | 事件盘实盘循环（maker） | `PYTHONPATH=. .venv/bin/python scripts/run_event_live_loop.py --size 1 --min-edge 0.05` |
 | 股票/商品盘日级实盘循环 | `PYTHONPATH=. .venv/bin/python scripts/run_equity_live_loop.py --size 1 --min-edge 0.05` |
 | 股票/商品盘日级模拟回测 | `PYTHONPATH=. .venv/bin/python scripts/simulate_equity_updown.py --size 100` |
@@ -134,6 +136,12 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 
 - **自动**：常驻 `settle_worker` 每 30s 轮询 MySQL 待结算队列，结算完成即写回
   结果文件并更新 DB 状态（`settle_worker status` 显示 `pending trades` 数）
+- **结算查询两级兜底**（`fetch_settle`，settle_worker 与 backfill 共用）：
+  先 `events/keyset?slug=` 主市场路径；查空时回退 `GET /markets?slug=&closed=true`
+  直查——**已结算的衍生盘市场（`-1pt5`/`-away` 后缀）默认不返回，必须带
+  `closed=true`**（2026-08-15/16 实测修复：此前衍生盘单永久 pending 占持仓名额）
+- **结果文件缺失也结算**：`results_file` 已删（如 live 单未建结果文件）时仍执行
+  `mark_settled` 更新 DB，不再永久 pending 空转（2026-08-15 修复）
 - **主任务退出后结算不停止**：run_llm_loop/run_daemon 退出不影响结算，单子一直在队列里
 - **何时需要手动 backfill**：仅当 settle_worker 未运行（如未启动/被停）且需要补结算时：
   ```bash
@@ -153,8 +161,10 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
   -e "SELECT trade_id, mode, slug, side, entry_price, status, pnl FROM pending_trades;"
 ```
 
-`mode` 字段区分实盘（`live`）与模拟（`simulate`）单——`*_live_loop` 写入 `live`，
-`simulate_*` / `run_llm_loop` 写入 `simulate`。
+`mode` 字段区分实盘（`live`）与模拟（`simulate`）单——`*_live_loop` /
+`run_copytrade_loop --live` 写入 `live`，`simulate_*` / `run_llm_loop` /
+跟单 paper 写入 `simulate`。`status` 枚举：`pending`（待结算）/ `settled` /
+`cancelled`（实盘订单最终未成交释放占坑，见 9.8）。
 
 > **MySQL 实例说明**：本机 MySQL 8.0.46 安装于 `../mysql-8.0.46/`（workspace 下），
 > 库 `polytrader` 表 `pending_trades`。机器重启后需手动启动：
@@ -191,6 +201,8 @@ grep '"event": "llm_call"' logs/llm_daemon_*/audit_all.jsonl | grep <trade_id �
 | daemon.log 大量 `ERR request ... Connection reset` | 网络抖动/被墙 | 扫描失败不中断循环，自动重试；若持续，检查网络 |
 | `ERR LLM content unparsable` | DeepSeek 瞬时返回空 content | 正常现象（有重试）；若连续出现检查 `LLM_API_KEY` 余额 |
 | `settle_worker status` 显示 `pending trades` 不降 | 结算延迟或 gamma-api 抖动 | 常驻进程每 30s 自动重试，网络恢复即入账；等待即可 |
+| 衍生盘单（`-1pt5`/`-away` 后缀）永久 pending | 已结算衍生盘不在 /markets 默认查询结果 | 已修复：`fetch_settle` 回退查询带 `closed=true`；仍有存量单可手动 `backfill_settlements.py` 补查 |
+| copytrade 进程崩溃后静默无日志 | 崩溃前无 traceback 输出（stderr 被丢弃） | 查 `logs/copytrade_crash.log`（外层兜底自动写完整 traceback，含 BaseException） |
 | `[db] insert_pending FAILED` / `[db] fetch_pending FAILED` | MySQL 未启动/连接参数错误 | 检查 mysqld 是否运行、`.env` 的 `POLY_DB_PASS` 是否与库一致 |
 | 结算一直 `still unsettled`（backfill 手动跑时） | 结算延迟 > 查询窗口 | 等 5-10 分钟后重跑 backfill（幂等安全） |
 | 面板显示"暂无结果数据" | 最新会话还没有任何轮次完成 | 等首个窗口轮次结束（≤8 分钟） |
@@ -258,11 +270,30 @@ curl https://bridge.polymarket.com/supported-assets   # 确认支持链/最小�
 curl "https://bridge.polymarket.com/status/<桥地址>"   # 查到账进度
 ```
 
+**2026-08-16 修复（充值链路）**：
+- Paraswap 为境外 API，请求走本地代理（`.env` 的 `HTTPS_PROXY`，缺省直连超时）
+- `build_tx` 只传 `slippage`、**不传 destAmount**（v5 接口两者互斥，400
+  "Cannot specify both"；且报价 destAmount 过期会导致 swap revert）——
+  执行时按最新市场价 ± 容忍
+- `wait_tx` 后校验 `status=1`：**revert 的交易不再误报成功**（此前报
+  "confirmed ✓" 但实际链上失败）
+
 ### 9.3 下单验证（已由实盘实测 + 单测覆盖）
 
 下单链路验证：`run_live_loop.py` 实盘实测（FOK 真实下单全链路）+
 `tests/test_order_v2.py`（V2 订单构建/ERC-7739 签名/官方 SDK 交叉验证）。
 原 `verify_live_order_v2.py` 已删除——无护栏直接真实下单的过时入口（教训见 AGENTS.md 第 5 节）。
+
+**统一下单入口 `place_order`**（`scripts/run_live_loop.py`，跟单/5m/事件盘/股票盘
+四个实盘循环共用）：下单前按 token 自动解析市场参数（各 600s 缓存）——
+- `GET /tick-size`：tick=0.001 市场份额按 **5 位精度**计算（calc_amounts），
+  保证隐含价落 tick 网格
+- `GET /neg-risk`：负风险市场用 **NEG_RISK_EXCHANGE_V2** 合约签名
+  （domain separator 不同），否则 CLOB 验签失败
+
+两处修复对应 2026-08-16 实测的 `invalid POLY_1271 signature` 根因
+（tick 精度错位 + negRisk 合约不匹配，此前部分事件盘下单必失败）。
+
 ### 9.4 查订单/持仓/结算
 ```bash
 # 持仓（只读，无需认证）
@@ -286,31 +317,35 @@ curl "https://data-api.polymarket.com/positions?user=<deposit wallet>&limit=10"
 - 链上广播：raw tx 需 0x 前缀；swap 交易 gas 需 estimate（300k 默认会 out of gas）
 - RPC 走系统代理时偶发 SSL EOF → 已做多端点轮换容错
 
-### 9.6 实盘循环脚本（三套）
+### 9.6 实盘循环脚本（四套）
 
 | 脚本 | 盘面 | 执行方式 | 典型调用 |
 |---|---|---|---|
-| `run_live_loop.py` | 5m 加密 updown | maker GTC（post_only，--maker-offset 挂价） | `--rounds 3 --size 1 --min-edge 0.04 --wait-fill 90` |
+| `run_live_loop.py` | 5m 加密 updown | **FOK 吃单**（--fok-slip 滑点容忍，默认 0.01） | `--rounds 3 --size 1 --min-edge 0.04 --fok-slip 0.01` |
 | `run_event_live_loop.py` | 通用事件盘 | maker GTC（post_only） | `--size 1 --min-edge 0.05 --min-rr 1.5 --wait 600` |
 | `run_equity_live_loop.py` | 股票/商品日级 | FOK 吃单 | `--size 1 --min-edge 0.05 --min-liquidity 200` |
+| `run_copytrade_loop.py --live` | 全品类跟单 | FOK 吃单（镜像目标成交） | `--live --max-live-orders 2 --rounds 5` |
 
-三者默认每轮最多 1 笔、$1/笔；成交写入 `pending_trades`（`mode='live'`），
+四者默认每轮最多 1 笔、$1/笔；成交写入 `pending_trades`（`mode='live'`），
 由 `settle_worker` 自动结算。maker 单挂单后轮询订单状态（`--wait`/`--poll`/
-`--wait-fill`），未成交自动撤单。坏单过滤：预期成交价须在 [0.25, 0.85]，超范围跳过。
-**均为真实资金脚本**——验证阶段严禁直接运行或调用其下单函数（见 AGENTS.md 第 5 节）。
+`--wait-fill`），未成交自动撤单。坏单过滤：预期成交价须在 [0.20, 0.85]（跟单
+为 [0.30, 0.90]），超范围跳过。**均为真实资金脚本**——验证阶段严禁直接运行
+或调用其下单函数（见 AGENTS.md 第 5 节）。
 
-### 9.7 实盘运行要点（run_live_loop，2026-08-14 实测补充）
+### 9.7 实盘运行要点（run_live_loop）
 
 ```bash
-# 启动 3 轮实盘（本机代理 7897；代理走 HTTPS_PROXY 环境变量，缺省 7890）
+# 启动 3 轮实盘（本机代理 7897；代理走 HTTPS_PROXY 环境变量，缺省回退 7897）
 HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
   scripts/run_live_loop.py --rounds 3 --min-edge 0.04 --size 1 --log logs/live_loop.log
 ```
 
 **硬性风控（代码写死，不可覆盖）**：
 - 单笔 `$1` 上限（`MAX_ORDER_USD=1.0`）；`--size` >1 或 ≤0 直接拒绝启动
-- 同窗口 slug 只尝试一次（防重复开单）；每轮复查余额，不足跳过
+- 同窗口 slug 只尝试一次（防重复开单）；每 2 轮复查余额，不足跳过
 - 下单前 `verify_token`（GET /tick-size）校验，CLOB 侧无效跳过
+- 坏单过滤 [0.20, 0.85] 按**吃单侧自身 ask** 预检（买 NO 看 NO 侧 ask，勿用
+  1-bid 估算——空壳盘 bid/ask 不对称时失真，曾致 FOK 以 0.01 档成交，已修复）
 
 **常见现象与处理**：
 | 现象 | 原因 | 处理 |
@@ -327,3 +362,56 @@ HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
 SELECT trade_id, slug, side, entry_price, fill_price, llm_p, edge, win, pnl
 FROM pending_trades WHERE mode='live' ORDER BY created_at DESC LIMIT 20;
 ```
+
+### 9.8 跟单实盘（run_copytrade_loop --live，2026-08-16）
+
+```bash
+# 实盘试跑（⚠️ 需用户显式授权：FOK 真实下单，$1/笔，总上限 2 笔）
+.venv/bin/python scripts/run_copytrade_loop.py --live --max-live-orders 2 --rounds 5
+
+# 无限挂机（--rounds 0）
+.venv/bin/python scripts/run_copytrade_loop.py --live --max-live-orders 5 --rounds 0
+
+# paper 模式（默认，模拟成交不碰资金）：--rounds N / --poll 20 / --refresh-interval 1800
+.venv/bin/python scripts/run_copytrade_loop.py --rounds 5 --log logs/copytrade.log
+```
+
+**开单决策链**：排行榜（data-api `/v1/leaderboard`，默认 MONTH/PNL，`--period`/
+`--category`/`--top-n`/`--min-profit` 可选）→ 钱包画像 → `/activity?user=<wallet>`
+活动流轮询（`--poll` 秒）→ 套利/冲单过滤 → 吃单侧 ask 预检 + 价格带
+[0.30, 0.90]（`--min-buy-price`/`--max-buy-price`）→ FOK 下单（沿用
+`run_live_loop.place_order`，自动 tick/negRisk 解析）→ 入库
+`pending_trades`（`window='copytrade'`、`mode='live'`）→ settle_worker 结算。
+
+**持仓上限与热更新**：
+- `--max-live-orders`（默认 2）：实盘总开单硬上限，按 DB **未结算 live 跟单单**
+  数控制，结算释放自动补单；paper 模式用 `--max-open-positions`（默认 10）
+- **热更新（仅 live）**：运行中改 `logs/copytrade_limit.txt`（纯数字）即生效，
+  无需重启——改小立即收紧（waiting）、改大立即放行；文件缺失/非法回退启动参数
+- 每轮与轮内逐笔双重复查上限（防一轮内多信号突破）
+
+**套利/冲单过滤（默认开启）**：同一钱包同一市场 `--wash-window`（默认 1800s）
+内出现 SELL（买卖往返/冲单），或双 BUY 反向且双腿间隔 ≤ `--arb-gap`（默认
+60s，防对冲误判）→ 该市场 BUY 全部过滤；`--no-wash-filter` 关闭。
+
+**delayed 成交回填**：FOK 返回 `delayed`（排队确认中、无成交价）→ 登记
+`pending_fills` → 每轮 `get_order_auth` 轮询 → MATCHED 回填 fill_price/tx
+（`mark_filled` + `order_status='matched'`）；**600s 超时**仍未成交 → 最终
+确认一次，MATCHED 则回填，否则 DB 置 `status='cancelled'` 释放占坑（避免
+delayed 假单永久 pending 占持仓名额）。
+
+**护栏**：单笔 $1 硬上限（`MAX_ORDER_USD`，`--live` 时 `--size` >1 拒绝启动）；
+凭证只从 `.env`（缺 key 拒绝启动）；资金预检（pUSD 需覆盖 size + 手续费）；
+崩溃 traceback 自动写 `logs/copytrade_crash.log`（含 BaseException，防 stderr
+被 nohup 丢弃——2026-08-16 连续 3 次下单后静默死亡的排查即靠此文件定位
+UnboundLocalError 并已修复）。
+
+**常见现象与处理**：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 启动即停（`资金不足`） | deposit wallet pUSD 不够 size + 手续费 | `fund_deposit.py` 充值后重跑（9.2） |
+| 一直 `waiting: live pending N >= max M` | 未结算 live 单已满上限 | 结算释放自动恢复；或改 `logs/copytrade_limit.txt` 调大 |
+| `filter(live): ... ∉ [0.30, 0.90]` | 吃单侧 ask 超价格带（空壳盘口） | 正常过滤，等有流动性 |
+| `❌ 下单失败: invalid POLY_1271 signature` | 罕见残余：tick/negRisk 缓存过期 | 已修复自动解析；重启进程清缓存 |
+| 进程静默死亡无日志 | 未捕获异常 | 查 `logs/copytrade_crash.log` 尾部 traceback |

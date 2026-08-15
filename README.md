@@ -59,9 +59,11 @@ polytrader/
 │   ├── convergence.py   # 收敛/确定性折价回测（尾段确定侧买入）
 │   └── llm_scorer.py    # OpenAI 兼容 LLM 概率评分（含 reason 提取与审计）
 ├── copytrade/
-│   ├── wallet_analysis.py  # FIFO 盈亏 / 胜率 / 评分
-│   ├── leaderboard.py      # 从市场成交聚合钱包（排行榜私有 API 的替代）
-│   └── mirror.py           # 目标资格过滤 / 去重 / 滑点容忍 / 镜像信号
+│   ├── wallet_analysis.py  # 钱包画像：FIFO 盈亏 / 胜率 / 评分
+│   ├── leaderboard.py      # 目标钱包发现：官方排行榜（/v1/leaderboard，MONTH/PNL）
+│   │                       #   + 市场成交聚合（私有排行榜 API 的公开替代）
+│   └── mirror.py           # 镜像引擎：资格过滤 / 去重 / 滑点容忍 / 套利冲单过滤 /
+│                           #   活动流（/activity）轮询信号
 ├── risk/
 │   ├── kelly.py         # 分数 Kelly 仓位
 │   └── risk_manager.py  # 敞口 / 日损熔断 / 回撤熔断 / 冷却 / 价格带
@@ -79,6 +81,7 @@ scripts/
 ├── run_daemon.py        # 无限挂机守护进程（复用 run_llm_loop --rounds 1）
 ├── backfill_settlements.py # 兜底补结算（settle_worker 未运行时才需要）
 ├── run_live_loop.py     # 5m 加密 updown 实盘循环（FOK 吃单，盘口预检 + token 校验）
+├── run_copytrade_loop.py # 跟单循环：排行榜 → 活动流轮询 → 镜像 BUY（paper 默认，--live 实盘 FOK）
 ├── run_event_live_loop.py # 通用事件盘实盘循环（maker GTC post_only）
 ├── run_equity_live_loop.py # 股票/商品日级实盘循环（FOK 吃单）
 ├── scan_event_markets.py  # 通用事件盘扫描 + LLM 评估
@@ -88,8 +91,10 @@ scripts/
 ```
 
 **存储**：已开单队列存于本地 MySQL（`polytrader.pending_trades` 表）——
-`run_llm_loop`/`run_daemon`/`*_live_loop`/`simulate_*` 开单写入，`settle_worker` 常驻轮询结算，
-多进程共享、不随任务删除。
+`run_llm_loop`/`run_daemon`/`*_live_loop`/`run_copytrade_loop`/`simulate_*` 开单写入，
+`settle_worker` 常驻轮询结算，多进程共享、不随任务删除。`window` 枚举含
+`5m/15m/daily/event/copytrade`；`status` 除 `pending/settled` 外新增
+`cancelled`（实盘订单最终未成交时释放占坑，见"跟单交易"）。
 
 ## 使用
 
@@ -103,7 +108,7 @@ scripts/
 | LLM updown | 实时行情（Binance/OKX）→ LLM 判断窗口方向 vs 市场 ref | `llm_updown`（见下） |
 | 事件盘 | 全量二元市场（选举/宏观/地缘），LLM 世界知识判 P(YES)，双侧 edge + RR/EV 过滤 | `event_market`（`scan_event_markets`） |
 | 股票/商品盘 | 日 K 特征 + 大盘局势（SPY/QQQ/VXX）→ LLM 判日级涨跌 vs 隐含价 | `equity_updown`（`scan_equity_updown`） |
-| 跟单 | 聚合市场成交找出盈利钱包 → 镜像其 BUY（去重/滑点过滤） | `copytrade.*` |
+| 跟单 | 官方排行榜（/v1/leaderboard MONTH/PNL）选聪明钱 → 活动流轮询 → 镜像其 BUY（去重/滑点容忍/套利冲单过滤） | `copytrade.*`（`run_copytrade_loop`） |
 
 ### 模式
 
@@ -137,7 +142,9 @@ scripts/
    - `POLYMARKET_RELAYER_API_KEY` / `_ADDRESS`（settings?tab=api-keys 创建，gasless 钱包操作）
 2. 充值 pUSD 到 deposit wallet（三选一）：
    - 官方桥 API：`POST https://bridge.polymarket.com/deposit`（BSC/ETH 等跨链，最小 $5，
-     自动兑换 pUSD）；或链上脚本 `scripts/fund_deposit.py`（Polygon USDC→pUSD 自动转入）
+     自动兑换 pUSD）；或链上脚本 `scripts/fund_deposit.py`（Polygon USDC→pUSD 自动转入，
+     走本地代理访问 Paraswap、`wait_tx` 后校验 status=1——revert 不再误报成功，
+     见 RUNBOOK 9.2）
 3. 下单验证：`scripts/run_live_loop.py` 实盘实测 + tests/test_order_v2.py 单测
 
 **CLOB V2 认证（新协议）**：
@@ -154,6 +161,10 @@ deposit wallet 订单签名 = ERC-7739 wrapped（EOA 签嵌套 TypedDataSign，6
 份额 ≤2 位小数（BUY 份额向上取整保证隐含价精确落 tick）、USD ≤4 位小数；
 FOK/marketable BUY 最小 $1；每单有手续费（fee estimate ~$0.03）。
 5m 盘实测约束：`orderPriceMinTickSize=0.01`、`orderMinSize=5 shares`（book API 返回）。
+**tick/negRisk 自动解析**（`place_order` 统一入口，2026-08-16 修复）：下单前按 token 查
+`GET /tick-size` 与 `GET /neg-risk`（各 600s 缓存），tick=0.001 市场份额按 5 位精度计算、
+负风险市场改用 NEG_RISK_EXCHANGE_V2 合约签名（domain separator 不同）——修复了部分市场
+`invalid POLY_1271 signature`（tick 精度错位 + negRisk 合约不匹配）。
 
 **已实测（2026-08-14，$1 真实成交）**：
 认证 → 签名 → 下单（200 matched）→ 链上成交（tx status=1）→ 持仓 2.2222 shares
@@ -162,7 +173,10 @@ FOK/marketable BUY 最小 $1；每单有手续费（fee estimate ~$0.03）。
 
 **坏单过滤（实盘与模拟通用）**：预期成交价须在 **[0.20, 0.85]**（`run_live_loop`
 按吃单侧盘口价预检，空壳盘口超范围则过滤；`simulate_*` 同规则），避免在空壳
-盘口上以极端价格成交。**实测（2026-08-14）**：5m 盘空壳盘口下 FOK 100% 无法
+盘口上以极端价格成交。**注意**：买 NO 时预检须看 **NO 侧自身 ask**（勿用
+1-bid 对称估算——空壳盘 bid/ask 不对称时失真，曾致 FOK 以 0.01 档极端价成交，
+2026-08-16 修复）。
+**实测（2026-08-14）**：5m 盘空壳盘口下 FOK 100% 无法
 成交（无对手盘，400 "couldn't be fully filled"）；改 maker GTC post_only 后
 挂单可成功，但远价 maker 单可能被对手盘吃掉（$1@0.10 曾被 MATCHED 后结算归零，
 损失 $1）——maker 单的风险不在价格远近而在有无对手盘，验证脚本严禁真实下单
@@ -171,7 +185,10 @@ FOK/marketable BUY 最小 $1；每单有手续费（fee estimate ~$0.03）。
 **实现**：`execution/order_v2.py`（V2 订单 + ERC-7739 签名）、`execution/chain.py`
 （链上广播：sign + eth_sendRawTransaction + RPC 轮换）、`execution/relayer.py`
 （gasless 钱包操作）、`execution/signer.py`（ClobAuth + POLY_* L2 HMAC）、
-`data/clob_client.py`（post/get/cancel order V2）、`scripts/fund_deposit.py`（充值）、
+`data/clob_client.py`（post/get/cancel order V2）、`scripts/fund_deposit.py`（充值）。
+`scripts/run_live_loop.py` 的 `place_order` 是四个实盘循环（5m/事件盘/股票盘/跟单）
+**共用的统一下单入口**（FOK 吃单 / GTC maker post_only 二选一，自动解析 tick 与
+negRisk，见上）。
 （下单验证由 run_live_loop 实盘实测 + 单测覆盖；verify_live_order_v2 已删除——无护栏真实下单的过时入口）
 
 **安全护栏**：凭证只存 `.env`（gitignore）；`SENSITIVE_FIELDS` 遮盖；链上交易
@@ -199,6 +216,57 @@ HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
   （市场结算自动取消，**资金自动释放无残留**）
 - **结构性现实**：updown 5m/15m 盘口几乎总是空壳 → 坏单过滤下实盘成交机会极少；
   过滤后的机会（50 轮模拟）胜率极高，但需盘口出现真实流动性才可成交
+
+### 跟单交易（copytrade）
+
+第四策略：**官方月度排行榜选聪明钱 → 活动流轮询 → 镜像其 BUY**。数据链路
+（2026-08 官方文档确认的公开端点，均在 data-api）：
+
+1. **目标发现**：`/v1/leaderboard?timePeriod=MONTH&orderBy=PNL`（官方每月排行榜，
+   pnl 为官方口径期间盈亏）；`--period DAY/WEEK/MONTH/ALL`、`--category`（OVERALL/
+   POLITICS/SPORTS/CRYPTO 等）、`--top-n`（默认 20）、`--min-profit` 过滤。
+   排行榜源无交易数/活跃时间字段 → `min_trades` 与活跃度检查自动跳过
+2. **钱包画像**：`wallet_analysis.py`（FIFO 盈亏/胜率/评分）供聚合数据源使用；
+   官方排行榜直接取 pnl 排序
+3. **实时监听**：`/activity?user=<wallet>` 每 `--poll` 秒轮询，TRADE 事件含
+   `transactionHash`，可靠去重（`copytrade_seen` 表持久化，跨轮生效）
+4. **镜像信号**（`MirrorEngine.scan_activity`）：仅 BUY 侧、仅 YES
+   （outcomeIndex=0）、滑点容忍（基础 `--max-slippage` 0.05，随活动年龄每
+   分钟 +0.01 动态放宽、封顶 0.15）、超龄不跟（`--max-age-seconds` 默认 600s）
+5. **套利/冲单过滤**（默认开启）：同一钱包同一市场 `--wash-window`（默认
+   1800s）内出现 SELL（买卖往返/冲单），或双 BUY 反向且双腿间隔 ≤ `--arb-gap`
+   （默认 60s，防对冲误判为套利）→ 该市场 BUY 全部过滤；`--no-wash-filter` 关闭
+6. **执行**：默认 **paper**（DryRunBroker 模拟成交）；`--live` 时 FOK 真实下单
+   （吃单侧 ask 预检 + 价格带 [0.30, 0.90]，沿用 run_live_loop 的 `place_order`
+   统一下单入口）→ 入库 MySQL（`window='copytrade'`，live 单 `mode='live'`）
+   → settle_worker 自动结算
+
+```bash
+# paper 模拟（默认，不碰真实资金）
+.venv/bin/python scripts/run_copytrade_loop.py --rounds 5 --log logs/copytrade.log
+
+# 实盘试跑（⚠️ 需用户显式授权：FOK 真实下单，$1/笔）
+.venv/bin/python scripts/run_copytrade_loop.py --live --max-live-orders 2 --rounds 5
+
+# 无限挂机（--rounds 0；持仓上限热更新见下）
+.venv/bin/python scripts/run_copytrade_loop.py --live --max-live-orders 5 --rounds 0
+```
+
+**持仓上限（实盘）**：`--max-live-orders`（默认 2）为实盘总开单硬上限，按 DB
+未结算 live 单数控制——**结算释放自动补单**，保持同时持仓 ≤ 上限。paper 模式用
+`--max-open-positions`（默认 10）控制未结算 copytrade 单数。**热更新**：运行中
+改 `logs/copytrade_limit.txt`（一个数字）即生效，无需重启（仅 live 生效，改小
+立即收紧、改大立即放行）。
+
+**delayed 成交回填**：FOK 返回 `delayed`（排队确认中、无成交价）时登记
+`pending_fills`，每轮 `get_order_auth` 轮询；MATCHED 后回填 fill_price/tx；
+**600s 超时仍未成交 → DB 置 `status='cancelled'` 释放占坑**（避免假单永久
+pending 占持仓名额）。
+
+**护栏**：单笔 $1 硬上限（`MAX_ORDER_USD`，`--live` 时 `--size` 超 1 拒绝启动）；
+凭证只从 `.env`；结果写 `backtest_results/copytrade_results_*.jsonl`；
+**崩溃兜底**：未捕获异常（含 BaseException）traceback 写
+`logs/copytrade_crash.log`（防 stderr 被 nohup 丢弃导致崩溃原因不可见）。
 
 ### 股票/商品盘（日级 updown）与通用事件盘
 
@@ -240,8 +308,9 @@ PYTHONPATH=. .venv/bin/python scripts/run_event_live_loop.py \
     --size 1 --min-edge 0.05 --min-rr 1.5 --wait 600
 ```
 
-> ⚠️ 三个实盘循环脚本（`run_live_loop` / `run_event_live_loop` /
-> `run_equity_live_loop`）均涉及**真实资金**，默认每轮最多 1 笔、$1/笔，
+> ⚠️ 四个实盘循环脚本（`run_live_loop` / `run_event_live_loop` /
+> `run_equity_live_loop` / `run_copytrade_loop --live`）均涉及**真实资金**，
+> 默认每轮最多 1 笔、$1/笔，
 > 资金预检（deposit wallet pUSD 需覆盖 size + 手续费）。实盘/模拟成交均
 > 写入 `pending_trades`（`mode` 字段区分 `live`/`simulate`），由
 > `settle_worker` 常驻进程自动结算。`run_live_loop` 为 **FOK 吃单**模式
@@ -354,7 +423,8 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
 
 - `config/config.yaml`：全部参数（策略开关、风控阈值、执行参数）
 - `.env`（复制自 `.env.example`）：Polymarket 凭证、代理、LLM key
-  （`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL=deepseek-v4-flash`）
+  （`LLM_API_KEY` / `LLM_BASE_URL=https://opencode.ai/zen/go/v1` /
+  `LLM_MODEL=deepseek-v4-flash`；OpenAI 兼容端点，实测直连可达）
 - 环境变量覆盖：`POLY_RISK__MAX_DAILY_LOSS_USD=50`（`POLY_` + `__` 分隔路径）
 
 ## 风控清单
