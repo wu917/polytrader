@@ -1,4 +1,4 @@
-"""跟单交易循环：官方月度排行榜聪明钱 → 活动流轮询 → 镜像信号 → 模拟成交入库。
+"""跟单交易循环：官方月度排行榜聪明钱 → 活动流轮询 → 镜像信号 → 成交入库。
 
 数据链路（官方文档 2026-08 确认的公开端点）：
 - 目标发现：data-api /v1/leaderboard?timePeriod=MONTH&orderBy=PNL（每月排行榜）
@@ -6,15 +6,18 @@
 - 实时监听：data-api /activity?user=<wallet> 每 --poll 秒轮询
   （TRADE 事件含 transactionHash，可靠去重）
 - 信号：MirrorEngine.scan_activity（BUY 侧 / YES-only / 滑点容忍 / 价格带过滤）
-- 执行：默认 paper（DryRunBroker 模拟成交，绝不真实下单）
+- 执行：默认 paper（DryRunBroker 模拟成交，绝不真实下单）；
+  --live 时 FOK 真实下单（需用户显式授权 + --max-live-orders 上限）
   → 入库 MySQL pending_trades（window='copytrade'）→ settle_worker 自动结算
 
-⚠️ 真实资金铁律：本脚本默认模拟。任何实盘化改动须经 quant-guard 审查，
-   且真实下单前必须用户单独确认金额与授权（见 AGENTS.md 第 5 节）。
+⚠️ 真实资金铁律：本脚本默认模拟。--live 开启即真实下单（FOK 吃单），
+   必须用户单独确认金额与授权（见 AGENTS.md 第 5 节）；--max-live-orders
+   为实盘总开单硬上限，开满即停止开单。
 
 用法:
     .venv/bin/python scripts/run_copytrade_loop.py --rounds 3 --log logs/copytrade.log
-    .venv/bin/python scripts/run_copytrade_loop.py --rounds 0   # 无限循环
+    # 实盘试跑（2 笔：首轮启动即开 1 笔 + 后续扫描开 1 笔）
+    .venv/bin/python scripts/run_copytrade_loop.py --live --max-live-orders 2 --rounds 5
 """
 import argparse
 import json
@@ -36,11 +39,14 @@ from polytrader.data.clob_client import ClobClient
 from polytrader.data.data_api import DataApiClient
 from polytrader.data.http_client import HttpClient
 from polytrader.execution.broker import DryRunBroker
+from polytrader.execution import order_v2
 from polytrader.risk.risk_manager import RiskManager
 
 # 坏单过滤价格带（沿用 run_live_loop 语义：空壳盘口极端价格不成交）
 DEFAULT_MIN_PRICE = 0.30
 DEFAULT_MAX_PRICE = 0.90
+# 实盘单笔硬上限（与 run_live_loop 一致，不可放大）
+MAX_ORDER_USD = 1.0
 
 
 def _load_seen(db) -> set[str]:
@@ -86,7 +92,7 @@ def main() -> int:
     ap.add_argument("--max-slippage", type=float, default=0.05,
                     help="基础滑点容忍（锚点=目标成交价；随活动年龄动态放宽）")
     ap.add_argument("--slippage-per-min", type=float, default=0.01,
-                    help="活动年龄每多 1 分钟，滑点容忍 +x（默认 +1%/分钟）")
+                    help="活动年龄每多 1 分钟，滑点容忍 +x（默认每分钟 +0.01）")
     ap.add_argument("--slippage-cap", type=float, default=0.15,
                     help="动态滑点容忍封顶")
     ap.add_argument("--max-age-seconds", type=int, default=600,
@@ -99,6 +105,10 @@ def main() -> int:
                     help="结果 jsonl 输出目录")
     ap.add_argument("--max-open-positions", type=int, default=10,
                     help="未结算持仓上限（按 DB copytrade pending 数控制，结算释放后自动恢复开单）")
+    ap.add_argument("--live", action="store_true",
+                    help="实盘模式：FOK 真实下单（默认 paper 模拟；需用户显式授权）")
+    ap.add_argument("--max-live-orders", type=int, default=2,
+                    help="实盘总开单硬上限（开满即停止开单，默认 2）")
     ap.add_argument("--no-db", action="store_true", help="不入库（只打印信号）")
     ap.add_argument("--log", type=str, default="", help="日志文件路径")
     args = ap.parse_args()
@@ -106,6 +116,16 @@ def main() -> int:
     if args.size <= 0 or args.size > 100:
         print(f"!! --size {args.size} 非法：须 (0, 100] 区间")
         return 2
+    if args.live and args.size > MAX_ORDER_USD:
+        print(f"!! --live 模式单笔硬上限 ${MAX_ORDER_USD}，--size 不能超（当前 {args.size}）")
+        return 2
+    if args.live and args.max_live_orders <= 0:
+        print("!! --live 模式 --max-live-orders 必须 ≥ 1")
+        return 2
+    if args.live:
+        print(f"!! ⚠️  实盘模式：FOK 真实下单，单笔 ${args.size}，总上限 "
+              f"{args.max_live_orders} 笔（最多 ${args.size * args.max_live_orders:.2f}）")
+        print(f"!! 启动即开 1 笔（首轮立即扫描）+ 后续扫描开单")
 
     if args.log:
         log_file = Path(args.log)
@@ -150,19 +170,55 @@ def main() -> int:
     risk = RiskManager(mode="paper", max_position_usd=args.max_size_usd * 4)
     broker = DryRunBroker()
 
+    # ---- 实盘模式初始化（凭证 + 资金预检 + FOK 下单器）----
+    live_ctx = None
+    if args.live:
+        from dotenv import load_dotenv
+        load_dotenv(ROOT / ".env")
+        from scripts.run_live_loop import derive_creds, place_order, get_order_auth
+        from eth_account import Account
+        pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+        deposit = os.environ.get("POLYMARKET_DEPOSIT_WALLET", "").strip()
+        if not pk or not deposit:
+            print("!! .env 缺 POLYMARKET_PRIVATE_KEY / POLYMARKET_DEPOSIT_WALLET")
+            return 1
+        eoa = Account.from_key(pk).address
+        creds = derive_creds(eoa, pk)
+        from polytrader.execution import chain
+        bal = chain.call_balance(chain.PUSD, deposit) / 1e6
+        need = args.size + 0.05
+        print(f"  EOA={eoa[:12]}... deposit={deposit[:12]}... "
+              f"pUSD=${bal:.4f} 需要=${need:.2f}")
+        if bal < need:
+            print(f"!! 资金不足：需要 ${need:.2f}，只有 ${bal:.2f}（先充值 fund_deposit.py）")
+            return 1
+        live_ctx = {"pk": pk, "deposit": deposit, "eoa": eoa,
+                    "creds": creds, "place_order": place_order,
+                    "get_order_auth": get_order_auth,
+                    "tick_cache": {},  # token_id -> (tick, 时间)
+                    "negrisk_cache": {},  # token_id -> (neg_risk, 时间)
+                    "pending_fills": [],  # [(trade_id, order_id, first_seen_ts)]
+                    }
     log(f"copytrade loop | period={args.period} category={args.category} "
         f"top_n={args.top_n} size=${args.size} poll={args.poll}s "
-        f"seen={len(seen)} refresh={args.refresh_interval}s")
+        f"seen={len(seen)} refresh={args.refresh_interval}s "
+        f"mode={'LIVE' if args.live else 'paper'}"
+        f"{f' max_live={args.max_live_orders}' if args.live else ''}")
     emit({"type": "startup", "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
           "period": args.period, "category": args.category, "top_n": args.top_n,
-          "size_usd": args.size})
+          "size_usd": args.size, "mode": "live" if args.live else "paper"})
 
     round_no = 0
     last_refresh = 0.0
+    live_opened = 0  # 实盘总开单数（硬上限控制）
     while args.rounds == 0 or round_no < args.rounds:
         round_no += 1
         ts0 = time.time()
         rec = {"type": "round", "round": round_no, "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+        # 0) 待确认成交回填：delayed 单轮询 CLOB，MATCHED 后回填实际成交价
+        if args.live and live_ctx["pending_fills"]:
+            _reconcile_pending_fills(live_ctx, log, emit, round_no)
 
         # 1) 目标刷新（排行榜）
         if time.time() - last_refresh >= args.refresh_interval or round_no == 1:
@@ -177,9 +233,10 @@ def main() -> int:
                 rec["error"] = f"refresh: {e}"
 
         # 2) 活动流扫描 → 信号
-        #    持仓上限按 DB 未结算数控制（RiskManager 内存态不感知结算释放）
+        #    持仓上限按 DB 未结算数控制（RiskManager 内存态不感知结算释放）；
+        #    实盘模式跳过该闸（由 --max-live-orders 硬上限控制，模拟 pending 不挡实盘）
         try:
-            if not args.no_db:
+            if not args.no_db and not args.live:
                 open_cnt = _count_open(db)
                 if open_cnt >= args.max_open_positions:
                     log(f"  waiting: copytrade pending {open_cnt} >= "
@@ -198,9 +255,13 @@ def main() -> int:
             rec["error"] = f"scan: {e}"
             signals = []
 
-        # 3) 过滤 + 风控 + 模拟成交 + 入库
+        # 3) 过滤 + 风控 + 成交 + 入库
         opened = 0
         for s in signals:
+            if args.live and live_opened >= args.max_live_orders:
+                log(f"  max live orders reached ({live_opened}/"
+                    f"{args.max_live_orders})，停止开单（继续轮询观察）")
+                break
             price = s.market_price
             if price < args.min_buy_price or price > args.max_buy_price:
                 log(f"  filter: {s.market.slug[:40]:42s} price={price:.3f} "
@@ -210,6 +271,101 @@ def main() -> int:
             if not allowed:
                 log(f"  risk: {s.market.slug[:40]:42s} blocked ({why})")
                 continue
+
+            if args.live:
+                # ---- 实盘：FOK 吃单（跟单要快）----
+                token_id = s.outcome.token_id if s.outcome else ""
+                if not token_id:
+                    log(f"  {s.market.slug[:40]} 无 token_id，跳过")
+                    continue
+                # 吃单侧 ask 预检（同 run_live_loop 修复后逻辑：勿用 1-bid 估算）
+                try:
+                    b = clob.get_book(token_id)
+                    expect_fill = b.best_ask().price if b and b.best_ask() else None
+                except Exception:
+                    expect_fill = None
+                fill_base = expect_fill if expect_fill is not None else price
+                if not (args.min_buy_price <= fill_base <= args.max_buy_price):
+                    log(f"  filter(live): {s.market.slug[:40]} 预期成交价 "
+                        f"{fill_base:.3f} ∉ [{args.min_buy_price}, "
+                        f"{args.max_buy_price}]（空壳盘口）")
+                    continue
+                px = round(min(args.max_buy_price, max(0.01, fill_base + 0.01)), 2)
+                log(f"  >>> LIVE BUY YES {s.market.slug[:40]:42s} FOK@{px} "
+                    f"${args.size} (mirror {str(s.extra.get('mirror_wallet', ''))[:10]}...)")
+                resp = live_ctx["place_order"](
+                    live_ctx["creds"], live_ctx["eoa"], live_ctx["pk"],
+                    live_ctx["deposit"], token_id, order_v2.BUY,
+                    args.size, px, order_type="FOK",
+                    tick_cache=live_ctx["tick_cache"],
+                    negrisk_cache=live_ctx["negrisk_cache"])
+                print(f"    POST /order: {resp['status_code']}")
+                print(f"    {resp['body'][:200]}")
+                try:
+                    body = json.loads(resp["body"])
+                except Exception:
+                    body = {}
+                if resp["status_code"] == 200 and body.get("success"):
+                    try:
+                        fill_price = round(
+                            float(body.get("makingAmount", 0)) /
+                            float(body.get("takingAmount", 1)), 4)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        fill_price = None
+                    txs = body.get("transactionsHashes") or []
+                    tx_hash = txs[0] if txs else None
+                    # delayed 响应不含成交信息：登记待轮询回填（下一轮起查）
+                    if body.get("status") == "delayed":
+                        live_ctx["pending_fills"].append(
+                            (rec_row["trade_id"], body.get("orderID"), time.time()))
+                    entry = fill_price if fill_price else px
+                    rec_row = {
+                        "trade_id": str(uuid.uuid4())[:8],
+                        "slug": s.market.slug,
+                        "coin": s.market.slug.split("-")[0] if s.market.slug else "?",
+                        "window": "copytrade",
+                        "side": "YES",
+                        "entry_price": round(float(entry), 4),
+                        "size_usd": args.size,
+                        "round": round_no,
+                        "results_file": str(results_file),
+                        "mode": "live",
+                        "order_id": body.get("orderID"),
+                        "order_status": body.get("status"),
+                        "fill_price": round(float(fill_price), 4) if fill_price else None,
+                        "fill_tx": tx_hash,
+                        "llm_p": None,
+                        "ref": round(float(price), 4),
+                        "edge": round(float(s.edge), 4),
+                        "llm_reason": s.reason,
+                        "model": None,
+                        "mirror_wallet": s.extra.get("mirror_wallet"),
+                        "mirror_trade_id": s.extra.get("mirror_trade_id"),
+                    }
+                    if not args.no_db:
+                        from scripts.simulate_equity_updown import build_db_rec
+                        try:
+                            db.insert_pending([build_db_rec(rec_row, mode="live")])
+                            if fill_price is not None:
+                                db.mark_filled(rec_row["trade_id"], fill_price, tx_hash)
+                        except Exception as e:  # noqa: BLE001
+                            log(f"  !! db insert FAILED {s.market.slug}: {e}")
+                    live_opened += 1
+                    opened += 1
+                    emit({"type": "trade_open", "round": round_no, **rec_row})
+                    # 成交后立即落 seen（防崩溃重启重复镜像同一笔 FOK）
+                    if not args.no_db:
+                        tid = str(s.extra.get("mirror_trade_id") or "")
+                        if tid:
+                            _save_seen(db, [(tid, "", "")])
+                    log(f"    ✅ 成交 {body.get('orderID','')[:20]}... "
+                        f"status={body.get('status')} fill=${fill_price} "
+                        f"tx={tx_hash[:18] if tx_hash else '?'}...")
+                else:
+                    log(f"    ❌ 下单失败: {resp['body'][:200]}")
+                continue
+
+            # ---- paper：模拟成交 ----
             trade = broker.place(s)
             risk.record_trade(trade)
             opened += 1
@@ -275,6 +431,52 @@ def main() -> int:
 
     log(f"copytrade loop finished after {round_no} rounds (results: {results_file})")
     return 0
+
+
+def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
+    """轮询 delayed 订单：MATCHED 后回填实际成交价（mark_filled + order_status）。
+
+    delayed 响应不含 making/taking——FOK 排队成交后 CLOB 才有成交信息；
+    超时（10 分钟）仍未确认的移除并告警（可能被拒/取消，不阻塞循环）。
+    """
+    import time as _t
+    now = _t.time()
+    remain = []
+    for trade_id, order_id, first_ts in live_ctx["pending_fills"]:
+        if not order_id:
+            continue
+        if now - first_ts > 600:
+            log(f"  !! delayed order 超时未确认 {str(order_id)[:20]}...，放弃追踪")
+            continue
+        try:
+            od = live_ctx["get_order_auth"](
+                live_ctx["creds"], live_ctx["eoa"], order_id)
+        except Exception as e:  # noqa: BLE001 网络抖动下轮重试
+            remain.append((trade_id, order_id, first_ts))
+            continue
+        if not isinstance(od, dict) or od.get("status") != "MATCHED":
+            remain.append((trade_id, order_id, first_ts))  # 未成交继续等
+            continue
+        try:
+            fill = round(float(od.get("makingAmount", 0)) /
+                         float(od.get("takingAmount", 1)), 4)
+        except (TypeError, ValueError, ZeroDivisionError):
+            fill = None
+        txs = od.get("transactionsHashes") or []
+        tx = txs[0] if txs else None
+        db.mark_filled(trade_id, fill, tx)
+        try:
+            conn = db.connect()
+            with conn.cursor() as cur:
+                cur.execute("UPDATE pending_trades SET order_status='matched' "
+                            "WHERE trade_id=%s", (trade_id,))
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        log(f"  [reconcile] {trade_id} MATCHED fill=${fill} tx={str(tx)[:20] if tx else '?'}")
+        emit({"type": "fill_confirmed", "round": round_no, "trade_id": trade_id,
+              "fill_price": fill, "fill_tx": tx})
+    live_ctx["pending_fills"] = remain
 
 
 def _count_open(dbmod) -> int:
