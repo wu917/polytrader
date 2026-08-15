@@ -263,8 +263,8 @@ def main() -> int:
             signals = []
 
         # 3) 过滤 + 风控 + 成交 + 入库
-        #    轮内逐笔复查持仓上限：open_cnt 为轮开始存量，opened 为本轮已开，
-        #    防止一轮内多信号突破上限（P1 修复）
+        #    每市场仅跟 1 笔：同 slug 已有 live 单则跳过加仓（集中度受控）
+        live_slugs = _live_slugs(db) if (args.live and not args.no_db) else set()
         opened = 0
         for s in signals:
             if not args.no_db:
@@ -275,6 +275,10 @@ def main() -> int:
                         f"本轮剩余信号暂停（下轮释放后继续）")
                     break
             price = s.market_price
+            # 每市场仅跟 1 笔：同 slug 已开过 live 单（含本轮）→ 跳过
+            if args.live and s.market.slug in live_slugs:
+                log(f"  skip: {s.market.slug[:40]} 已跟过（每市场仅一单）")
+                continue
             if price < args.min_buy_price or price > args.max_buy_price:
                 log(f"  filter: {s.market.slug[:40]:42s} price={price:.3f} "
                     f"∉ [{args.min_buy_price}, {args.max_buy_price}]")
@@ -363,6 +367,7 @@ def main() -> int:
                         except Exception as e:  # noqa: BLE001
                             log(f"  !! db insert FAILED {s.market.slug}: {e}")
                     opened += 1
+                    live_slugs.add(s.market.slug)  # 每市场仅一单
                     emit({"type": "trade_open", "round": round_no, **rec_row})
                     # 成交后立即落 seen（防崩溃重启重复镜像同一笔 FOK）
                     if not args.no_db:
@@ -489,14 +494,26 @@ def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
 
 def _fill_and_release(live_ctx: dict, trade_id: str, od: dict,
                       log, emit, round_no: int) -> None:
-    """MATCHED 订单：回填成交价 + 更新 order_status。"""
+    """MATCHED 订单：回填成交价 + 更新 order_status。
+
+    注意：/data/order 端点（get_order_auth）不含 making/taking 成交金额——
+    用它解析 fill 恒为 0（2026-08-16 实测，曾致 4 笔 fill_price=0.0）。
+    正确数据源是认证 /data/trades（按 taker_order_id 匹配实际成交价）。
+    """
+    fill, tx = None, None
     try:
-        fill = round(float(od.get("makingAmount", 0)) /
-                     float(od.get("takingAmount", 1)), 4)
+        making = od.get("makingAmount")
+        taking = od.get("takingAmount")
+        if making is not None and taking is not None:
+            fill = round(float(making) / float(taking), 4)
     except (TypeError, ValueError, ZeroDivisionError):
         fill = None
-    txs = od.get("transactionsHashes") or []
-    tx = txs[0] if txs else None
+    if fill is None or fill == 0:
+        # /data/order 无成交金额：从 /data/trades 按 order_id 匹配
+        fill, tx = _find_fill_by_order(live_ctx, od.get("orderID"))
+    if tx is None:
+        txs = od.get("transactionsHashes") or []
+        tx = txs[0] if txs else None
     db.mark_filled(trade_id, fill, tx)
     try:
         conn = db.connect()
@@ -509,6 +526,40 @@ def _fill_and_release(live_ctx: dict, trade_id: str, od: dict,
     log(f"  [reconcile] {trade_id} MATCHED fill=${fill} tx={str(tx)[:20] if tx else '?'}")
     emit({"type": "fill_confirmed", "round": round_no, "trade_id": trade_id,
           "fill_price": fill, "fill_tx": tx})
+
+
+def _find_fill_by_order(live_ctx: dict, order_id: str | None) -> tuple[float | None, str | None]:
+    """从认证 /data/trades 按 taker_order_id 匹配实际成交价（fill, tx）。"""
+    if not order_id:
+        return None, None
+    try:
+        import requests
+        proxies = {"http": "http://127.0.0.1:7897",
+                   "https": "http://127.0.0.1:7897"}
+        from polytrader.execution.signer import (sign_clob_auth,
+                                                 derive_api_key_headers,
+                                                 l2_headers_new)
+        from eth_account import Account
+        pk = live_ctx["pk"]
+        eoa = live_ctx["eoa"]
+        ts = int(time.time())
+        sig = sign_clob_auth(eoa, pk, timestamp=ts, nonce=0)
+        creds = requests.get(
+            "https://clob.polymarket.com/auth/derive-api-key",
+            headers=derive_api_key_headers(eoa, sig, ts),
+            proxies=proxies, timeout=20).json()
+        h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
+                            creds["secret"], "GET", "/data/trades")
+        r = requests.get("https://clob.polymarket.com/data/trades",
+                         params={"limit": 50, "sort": "desc"},
+                         headers=h2, proxies=proxies, timeout=20)
+        for t in r.json().get("data", []):
+            if t.get("taker_order_id") == order_id and \
+                    t.get("status") == "CONFIRMED":
+                return float(t["price"]), t.get("transaction_hash")
+    except Exception:  # noqa: BLE001 下轮重试
+        pass
+    return None, None
 
 
 def _release_pending(trade_id: str, final_status: str) -> None:
@@ -553,6 +604,23 @@ def _hot_limit(args, is_live: bool) -> int:
     except (ValueError, OSError):
         pass
     return args.max_live_orders
+
+
+def _live_slugs(dbmod) -> set[str]:
+    """已开过 live 跟单的市场 slug 集合（每市场仅跟 1 笔的判定依据）。"""
+    try:
+        conn = dbmod.connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT slug FROM pending_trades "
+                        "WHERE mode='live' AND `window`='copytrade'")
+            return {str(r["slug"]) for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        return set()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _count_live_open(dbmod) -> int:

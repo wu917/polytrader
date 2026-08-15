@@ -238,6 +238,35 @@ def test_count_open_filters_copytrade(monkeypatch):
     assert rcl._count_open(FakeDB) == 2
 
 
+def test_live_slugs_collects_followed_markets():
+    """_live_slugs 返回已开过 live 单的市场 slug（每市场仅一单判定依据）。"""
+    class FakeDB:
+        @staticmethod
+        def connect():
+            class Cur:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def execute(self, sql, *a): pass
+                def fetchall(self):
+                    return [{"slug": "m1-2026-08-15"}, {"slug": "m2-2026-08-15"},
+                            {"slug": "m1-2026-08-15"}]
+            class Conn:
+                def cursor(self): return Cur()
+                def close(self): pass
+            return Conn()
+    slugs = rcl._live_slugs(FakeDB)
+    assert slugs == {"m1-2026-08-15", "m2-2026-08-15"}  # 去重
+
+
+def test_live_slugs_empty_on_error(monkeypatch):
+    """查询失败返回空集（不阻塞开单）。"""
+    class BadDB:
+        @staticmethod
+        def connect():
+            raise RuntimeError("db down")
+    assert rcl._live_slugs(BadDB) == set()
+
+
 # ---------- 持仓上限热更新 ----------
 
 def test_hot_limit_file_overrides(monkeypatch, tmp_path):
