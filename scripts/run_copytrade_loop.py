@@ -264,8 +264,18 @@ def main() -> int:
             signals = []
 
         # 3) 过滤 + 风控 + 成交 + 入库
+        #    轮内逐笔复查持仓上限：open_cnt 为轮开始存量，opened 为本轮已开，
+        #    防止一轮内多信号突破上限（P1 修复）
         opened = 0
         for s in signals:
+            if not args.no_db:
+                cur_open = open_cnt + opened
+                limit = (args.max_live_orders if args.live
+                         else args.max_open_positions)
+                if cur_open >= limit:
+                    log(f"  round cap reached ({cur_open}/{limit})，"
+                        f"本轮剩余信号暂停（下轮释放后继续）")
+                    break
             price = s.market_price
             if price < args.min_buy_price or price > args.max_buy_price:
                 log(f"  filter: {s.market.slug[:40]:42s} price={price:.3f} "
@@ -449,7 +459,22 @@ def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
         if not order_id:
             continue
         if now - first_ts > 600:
-            log(f"  !! delayed order 超时未确认 {str(order_id)[:20]}...，放弃追踪")
+            # 超时：做最终状态确认——MATCHED 则回填成交；否则释放 DB 占坑
+            # （delayed 假单曾永久 pending 占持仓名额，只能人工清理）
+            try:
+                od = live_ctx["get_order_auth"](
+                    live_ctx["creds"], live_ctx["eoa"], order_id)
+            except Exception:  # noqa: BLE001 查询失败下轮重试，不误释放
+                remain.append((trade_id, order_id, first_ts))
+                continue
+            if isinstance(od, dict) and od.get("status") == "MATCHED":
+                _fill_and_release(live_ctx, trade_id, od, log, emit, round_no)
+                log(f"  [reconcile] {trade_id} 超时后确认 MATCHED，已回填成交")
+            else:
+                final_st = od.get("status") if isinstance(od, dict) else "unknown"
+                _release_pending(trade_id, final_st)
+                log(f"  [reconcile] {trade_id} 超时未成交（{final_st}），"
+                    f"已释放占坑名额")
             continue
         try:
             od = live_ctx["get_order_auth"](
@@ -460,26 +485,45 @@ def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
         if not isinstance(od, dict) or od.get("status") != "MATCHED":
             remain.append((trade_id, order_id, first_ts))  # 未成交继续等
             continue
-        try:
-            fill = round(float(od.get("makingAmount", 0)) /
-                         float(od.get("takingAmount", 1)), 4)
-        except (TypeError, ValueError, ZeroDivisionError):
-            fill = None
-        txs = od.get("transactionsHashes") or []
-        tx = txs[0] if txs else None
-        db.mark_filled(trade_id, fill, tx)
-        try:
-            conn = db.connect()
-            with conn.cursor() as cur:
-                cur.execute("UPDATE pending_trades SET order_status='matched' "
-                            "WHERE trade_id=%s", (trade_id,))
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
-        log(f"  [reconcile] {trade_id} MATCHED fill=${fill} tx={str(tx)[:20] if tx else '?'}")
-        emit({"type": "fill_confirmed", "round": round_no, "trade_id": trade_id,
-              "fill_price": fill, "fill_tx": tx})
+        _fill_and_release(live_ctx, trade_id, od, log, emit, round_no)
     live_ctx["pending_fills"] = remain
+
+
+def _fill_and_release(live_ctx: dict, trade_id: str, od: dict,
+                      log, emit, round_no: int) -> None:
+    """MATCHED 订单：回填成交价 + 更新 order_status。"""
+    try:
+        fill = round(float(od.get("makingAmount", 0)) /
+                     float(od.get("takingAmount", 1)), 4)
+    except (TypeError, ValueError, ZeroDivisionError):
+        fill = None
+    txs = od.get("transactionsHashes") or []
+    tx = txs[0] if txs else None
+    db.mark_filled(trade_id, fill, tx)
+    try:
+        conn = db.connect()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE pending_trades SET order_status='matched' "
+                        "WHERE trade_id=%s", (trade_id,))
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    log(f"  [reconcile] {trade_id} MATCHED fill=${fill} tx={str(tx)[:20] if tx else '?'}")
+    emit({"type": "fill_confirmed", "round": round_no, "trade_id": trade_id,
+          "fill_price": fill, "fill_tx": tx})
+
+
+def _release_pending(trade_id: str, final_status: str) -> None:
+    """释放占坑：订单最终未成交 → 从 pending 队列移除（释放持仓名额）。"""
+    try:
+        conn = db.connect()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE pending_trades SET status='cancelled', "
+                        "order_status=%s WHERE trade_id=%s AND status='pending'",
+                        (str(final_status)[:32], trade_id))
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _count_open(dbmod) -> int:

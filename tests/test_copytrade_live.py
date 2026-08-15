@@ -126,14 +126,44 @@ class _FakeConn:
 
 
 def test_reconcile_drops_timeout_order(monkeypatch, capsys):
-    """超过 600s 未确认的订单放弃追踪并告警。"""
+    """超过 600s 未确认：最终查询——未成交则释放 DB 占坑并移出队列。"""
     auth = FakeAuth({"0xorder1": {"status": "OPEN"}})
     ctx = _mk_ctx(auth)
     ctx["pending_fills"][0] = ("t1", "0xorder1", time.time() - 700)
-    monkeypatch.setattr(rcl.db, "connect", lambda: _FakeConn())
+    released = []
+
+    class FakeCur2:
+        def __init__(self, conn): self.conn = conn
+        def execute(self, sql, args):
+            if "status='cancelled'" in sql:
+                released.append(args)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    class FakeConn2:
+        def cursor(self): return FakeCur2(self)
+        def close(self): pass
+
+    monkeypatch.setattr(rcl.db, "mark_filled", lambda *a: None)
+    monkeypatch.setattr(rcl.db, "connect", lambda: FakeConn2())
     rcl._reconcile_pending_fills(ctx, print, lambda rec: None, 1)
     assert len(ctx["pending_fills"]) == 1  # 超时的已移除
-    assert "超时未确认" in capsys.readouterr().out
+    assert released, "未成交单应释放占坑（status='cancelled'）"
+    assert "已释放占坑名额" in capsys.readouterr().out
+
+
+def test_reconcile_timeout_matched_backfills(monkeypatch):
+    """超时但最终 MATCHED → 回填成交（不释放）。"""
+    auth = FakeAuth({"0xorder1": _matched_order(0.71, "0xtx1")})
+    ctx = _mk_ctx(auth)
+    ctx["pending_fills"][0] = ("t1", "0xorder1", time.time() - 700)
+    marked = []
+    monkeypatch.setattr(rcl.db, "mark_filled",
+                        lambda tid, fill, tx: marked.append((tid, fill, tx)))
+    monkeypatch.setattr(rcl.db, "connect", lambda: _FakeConn())
+    rcl._reconcile_pending_fills(ctx, print, lambda rec: None, 1)
+    assert marked == [("t1", 0.71, "0xtx1")]
+    assert len(ctx["pending_fills"]) == 1  # 超时单已处理移除
 
 
 def test_reconcile_no_pending_noop():
