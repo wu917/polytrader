@@ -67,3 +67,53 @@ class SeedProvider(LeaderboardProvider):
 
     def fetch_profiles(self) -> list[WalletProfile]:
         return list(self.seed)
+
+
+class OfficialLeaderboardProvider(LeaderboardProvider):
+    """官方交易员排行榜 → 聪明钱钱包（默认 MONTH 周期 + PNL 排序）。
+
+    data-api /v1/leaderboard（2026-08 文档确认公开）：
+    - time_period=MONTH 即"每月排行榜"维度，pnl 为官方口径的期间盈亏
+    - 排行榜不提供交易数/活跃时间 → total_trades=0、recent_activity 空，
+      mirror.refresh_targets 对这两种字段放宽（见 mirror 实现）
+    """
+
+    def __init__(self, data_api: DataApiClient, time_period: str = "MONTH",
+                 order_by: str = "PNL", category: str = "OVERALL",
+                 top_n: int = 50):
+        self.data_api = data_api
+        self.time_period = time_period
+        self.order_by = order_by
+        self.category = category
+        self.top_n = top_n
+
+    def fetch_profiles(self) -> list[WalletProfile]:
+        rows = self.data_api.get_leaderboard(
+            limit=self.top_n, time_period=self.time_period,
+            order_by=self.order_by, category=self.category)
+        profiles: list[WalletProfile] = []
+        for r in rows:
+            addr = str(r.get("proxyWallet", "") or "")
+            if not addr:
+                continue
+            try:
+                pnl = float(r.get("pnl", 0) or 0)
+                vol = float(r.get("vol", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            profile = WalletProfile(
+                address=addr,
+                realized_profit_usd=pnl,
+                roi_pct=(pnl / vol * 100.0) if vol > 0 else 0.0,
+                source="leaderboard",
+                score=pnl,
+            )
+            profiles.append(profile)
+        profiles.sort(key=lambda p: p.score, reverse=True)
+        log.info("leaderboard[%s/%s/%s] profiles=%d top1=%s pnl=%.2f",
+                 self.time_period, self.order_by, self.category,
+                 len(profiles),
+                 profiles[0].address[:10] if profiles else "-",
+                 profiles[0].score if profiles else 0.0)
+        return profiles[: self.top_n]
+

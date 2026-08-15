@@ -11,7 +11,7 @@ import time
 from polytrader.copytrade.leaderboard import LeaderboardProvider
 from polytrader.data.data_api import DataApiClient
 from polytrader.logging_setup import get_logger
-from polytrader.models import Market, OrderBook, Side, Signal, SignalType, WalletProfile
+from polytrader.models import Market, OrderBook, Outcome, Side, Signal, SignalType, WalletProfile
 
 log = get_logger("copytrade.mirror")
 
@@ -24,9 +24,13 @@ class MirrorEngine:
         min_profit_usd: float = 5000.0,
         min_trades: int = 30,
         lookback_days: int = 90,
-        max_slippage: float = 0.03,
+        max_slippage: float = 0.05,
         mirror_yes_only: bool = True,
         max_size_usd: float = 200.0,
+        require_activity: bool = True,
+        max_age_seconds: int = 600,
+        slippage_per_min: float = 0.01,
+        slippage_cap: float = 0.15,
     ):
         self.provider = provider
         self.data_api = data_api
@@ -36,22 +40,43 @@ class MirrorEngine:
         self.max_slippage = max_slippage
         self.mirror_yes_only = mirror_yes_only
         self.max_size_usd = max_size_usd
+        self.require_activity = require_activity  # 排行榜源无活跃时间，可关
+        self.max_age_seconds = max_age_seconds  # 活动超龄不跟（信息已消化）
+        self.slippage_per_min = slippage_per_min  # 年龄每多 1 分钟滑点容忍 +x
+        self.slippage_cap = slippage_cap  # 动态滑点容忍封顶
         self._seen_trade_ids: set[str] = set()  # 已镜像交易去重
         self._target_wallets: list[str] = []
 
     # ---- 目标选择 ----
     def refresh_targets(self, profiles: list[WalletProfile] | None = None) -> list[str]:
-        """更新合格目标钱包列表，返回地址列表。"""
+        """更新合格目标钱包列表，返回地址列表。
+
+        门槛说明：
+        - realized_profit_usd >= min_profit_usd 恒校验
+        - min_trades 仅在画像有交易数时校验（排行榜源 total_trades=0 跳过）
+        - require_activity 为 True 时才校验 lookback_days 内活跃
+          （排行榜源 recent_activity 为空，调用方应关掉该检查）
+        """
         profiles = profiles if profiles is not None else self.provider.fetch_profiles()
         since = time.time() - self.lookback_days * 86400
-        self._target_wallets = [
-            p.address for p in profiles
-            if p.address
-            and p.realized_profit_usd >= self.min_profit_usd
-            and p.total_trades >= self.min_trades
-            and p.recent_activity
-            and float(p.recent_activity[-1].get("timestamp", 0)) >= since
-        ]
+        qualified: list[str] = []
+        for p in profiles:
+            if not p.address or p.realized_profit_usd < self.min_profit_usd:
+                continue
+            if p.total_trades and p.total_trades < self.min_trades:
+                continue
+            if self.require_activity:
+                recent = p.recent_activity or []
+                last_ts = 0.0
+                for r in recent:
+                    try:
+                        last_ts = max(last_ts, float(r.get("timestamp", 0)))
+                    except (TypeError, ValueError):
+                        continue
+                if last_ts < since:
+                    continue
+            qualified.append(p.address)
+        self._target_wallets = qualified
         log.info("mirror targets: %d/%d wallets qualified",
                  len(self._target_wallets), len(profiles))
         return self._target_wallets
@@ -134,6 +159,143 @@ class MirrorEngine:
                    "exec_price": exec_price},
         )
 
+    # ---- 活动流扫描（官方 /activity 端点，带 transactionHash 可靠去重）----
+    def scan_activity(self, books: dict[str, OrderBook] | None = None) -> list[Signal]:
+        """按钱包轮询官方活动流，产出镜像信号。
+
+        与 scan() 的差异：
+        - 数据源为 data-api /activity（含 transactionHash/title/slug/
+          conditionId/outcome/outcomeIndex），无需 markets 参数即可构造信号
+        - books 可选：提供 token_id -> OrderBook 时做滑点过滤并用 ask 成交价；
+          缺省按目标钱包成交价直接跟随（跟单语义）
+        """
+        if not self._target_wallets:
+            self.refresh_targets()
+        if not self._target_wallets:
+            return []
+
+        signals: list[Signal] = []
+        for wallet in self._target_wallets:
+            try:
+                acts = self.data_api.get_user_activity(wallet, limit=50)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("user activity failed for %s: %s", wallet, exc)
+                continue
+            for a in acts:
+                if str(a.get("type", "")).upper() != "TRADE":
+                    continue
+                if str(a.get("side", "")).upper() != "BUY":
+                    continue
+                trade_id = _trade_id(a)
+                if not trade_id or trade_id in self._seen_trade_ids:
+                    continue
+                # 非 YES 侧永久跳过（outcome 不会变化），入去重集
+                if self.mirror_yes_only and not _is_yes_activity(a):
+                    self._seen_trade_ids.add(trade_id)
+                    continue
+                # 超龄活动不跟（轮询+索引延迟下，久远买入的信息已消化，追高无 alpha）
+                if not self._age_ok(a, trade_id):
+                    continue
+                signal = self._build_activity_signal(a, wallet, books)
+                if signal is None:
+                    # 滑点超限等临时原因：不入去重集，下轮可重试
+                    continue
+                self._seen_trade_ids.add(trade_id)
+                signals.append(signal)
+        return signals
+
+    def _age_ok(self, act: dict, trade_id: str) -> bool:
+        """活动年龄检查：距今 > max_age_seconds 不跟（信息已消化）。
+
+        无时间戳时视为新活动（不过滤，避免误杀索引延迟的条目）。
+        """
+        try:
+            ts = float(act.get("timestamp", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        if ts <= 0:
+            return True
+        age = time.time() - ts
+        if age > self.max_age_seconds:
+            log.info("mirror skip %s: activity age %.0fs > %ds (stale, no alpha)",
+                     trade_id[:24], age, self.max_age_seconds)
+            return False
+        return True
+
+    def _allowed_slippage(self, act: dict) -> float:
+        """动态滑点容忍：基础 max_slippage + 活动年龄每多 1 分钟 +slippage_per_min。
+
+        轮询+索引延迟下，发现越晚的市场位移越大——按年龄放宽容忍，
+        避免"刚买的 3% 行情"被误判为追高；封顶 slippage_cap。
+        """
+        try:
+            ts = float(act.get("timestamp", 0) or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts <= 0:
+            return self.max_slippage
+        age = max(0.0, time.time() - ts)
+        extra = (age / 60.0) * self.slippage_per_min
+        return min(self.max_slippage + extra, self.slippage_cap)
+
+    def _build_activity_signal(self, act: dict, wallet: str,
+                               books: dict[str, OrderBook] | None = None) -> Signal | None:
+        asset = str(act.get("asset", "") or "")
+        if not asset:
+            log.warning("mirror: activity without asset (wallet=%s), skipping",
+                        wallet[:10])
+            return None
+        try:
+            exec_price = float(act.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            exec_price = 0.0
+
+        outcome_index = act.get("outcomeIndex")
+        outcome_name = str(act.get("outcome", "") or "")
+        if self.mirror_yes_only:
+            if str(outcome_index) != "0" and outcome_name.upper() != "YES":
+                log.info("mirror skip %s: not YES side (outcomeIndex=%s, outcome=%s)",
+                         asset[:16], outcome_index, outcome_name)
+                return None
+
+        book = (books or {}).get(asset)
+        ask_price = book.best_ask().price if book and book.best_ask() else None
+        if ask_price is not None and exec_price > 0:
+            allowed = self._allowed_slippage(act)
+            slippage = ask_price / exec_price - 1.0
+            if slippage > allowed:
+                log.info("mirror skip %s: slippage %.1f%% > allowed %.1f%% "
+                         "(age %.0fs)", asset[:16], slippage * 100,
+                         allowed * 100, _activity_age(act))
+                return None
+        fill_price = ask_price if ask_price is not None else exec_price
+
+        market = Market(condition_id=str(act.get("conditionId", "") or ""),
+                        question=str(act.get("title", "") or ""),
+                        slug=str(act.get("slug", "") or ""))
+        outcome = Outcome(outcome_id=str(act.get("conditionId", "") or ""),
+                          token_id=asset,
+                          price=str(exec_price) if exec_price else "0",
+                          name=outcome_name or ("YES" if str(outcome_index) == "0" else "NO"))
+        try:
+            shares = float(act.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        return Signal(
+            type=SignalType.COPYTRADE,
+            market=market, outcome=outcome,
+            side=Side.BUY,
+            probability=1.0, fair_price=fill_price,
+            edge=max(fill_price - (exec_price or fill_price), 0.0),
+            market_price=fill_price,
+            size_usd=min(self.max_size_usd, (exec_price or fill_price) * shares),
+            reason=f"mirror {wallet[:10]}... @${fill_price:.3f}",
+            extra={"mirror_wallet": wallet,
+                   "mirror_trade_id": _trade_id(act),
+                   "exec_price": exec_price,
+                   "outcome_index": outcome_index},
+        )
+
 
 def _trade_id(t: dict) -> str:
     """成交唯一 id：优先交易 hash/order id，否则按内容生成指纹。"""
@@ -141,6 +303,15 @@ def _trade_id(t: dict) -> str:
         if t.get(key):
             return f"{key}:{t[key]}"
     return f"{t.get('proxyWallet')}:{t.get('asset')}:{t.get('timestamp')}:{t.get('price')}:{t.get('size')}"
+
+
+def _activity_age(act: dict) -> float:
+    """活动距今秒数（无时间戳返回 0）。"""
+    try:
+        ts = float(act.get("timestamp", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, time.time() - ts) if ts > 0 else 0.0
 
 
 def _is_yes_token(asset: str, markets: list[Market]) -> bool:
@@ -151,3 +322,17 @@ def _is_yes_token(asset: str, markets: list[Market]) -> bool:
     log.warning("mirror: token %s not found in known markets, skipping (unknown token)",
                 asset[:16])
     return False
+
+
+def _is_yes_activity(act: dict) -> bool:
+    """activity 事件是否为 YES 侧（outcomeIndex=0 或 outcome=YES）。
+
+    官方 /activity 事件带 outcomeIndex（0=YES/1=NO）与 outcome 名称。
+    """
+    try:
+        idx = act.get("outcomeIndex")
+        if idx is not None and str(idx) == "0":
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(act.get("outcome", "") or "").upper() == "YES"

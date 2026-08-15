@@ -85,6 +85,57 @@ class DataApiClient:
                                   params={"user": address, "limit": min(limit, 500)})
         return data if isinstance(data, list) else []
 
+    # ---- 官方交易员排行榜（data-api /v1/leaderboard，跟单目标发现）----
+    def get_leaderboard(self, limit: int = 25, offset: int = 0,
+                        time_period: str = "MONTH", order_by: str = "PNL",
+                        category: str = "OVERALL") -> list[dict]:
+        """官方交易员排行榜（2026-08 文档确认的公开端点）。
+
+        time_period: DAY/WEEK/MONTH/ALL；order_by: PNL/VOL；
+        category: OVERALL/POLITICS/SPORTS/ESPORTS/CRYPTO/CULTURE/
+                  MENTIONS/WEATHER/ECONOMICS/TECH/FINANCE。
+        响应字段：rank/proxyWallet/userName/vol/pnl/xUsername/verifiedBadge。
+        """
+        data = self.http.get_json(f"{self.api_base}/v1/leaderboard", params={
+            "limit": min(limit, 50), "offset": max(offset, 0),
+            "timePeriod": time_period, "orderBy": order_by, "category": category,
+        })
+        return data if isinstance(data, list) else []
+
+    # ---- 钱包活动/持仓（data-api，跟单画像与实时监听）----
+    def get_user_activity(self, address: str, limit: int = 50) -> list[dict]:
+        """钱包活动时间线（官方 /activity 端点）。
+
+        TRADE 事件字段：type/side/size/price/asset(token_id)/transactionHash/
+        timestamp/conditionId/title/slug/outcome/outcomeIndex。
+        还有 SPLIT/MERGE/REDEEM/REWARD 等非交易事件需过滤。
+        """
+        data = self.http.get_json(f"{self.api_base}/activity",
+                                  params={"user": address, "limit": min(limit, 500)})
+        return data if isinstance(data, list) else []
+
+    def get_positions(self, address: str, limit: int = 50) -> list[dict]:
+        """钱包未平仓持仓（avgPrice/currentValue/percentPnl/curPrice）。"""
+        data = self.http.get_json(f"{self.api_base}/positions",
+                                  params={"user": address, "limit": min(limit, 500)})
+        return data if isinstance(data, list) else []
+
+    def get_closed_positions(self, address: str, limit: int = 50) -> list[dict]:
+        """钱包已平仓持仓（realizedPnl 官方口径）。"""
+        data = self.http.get_json(f"{self.api_base}/closed-positions",
+                                  params={"user": address, "limit": min(limit, 500)})
+        return data if isinstance(data, list) else []
+
+    def get_portfolio_value(self, address: str) -> float | None:
+        """钱包组合总价值（/value 端点）。"""
+        data = self.http.get_json(f"{self.api_base}/value", params={"user": address})
+        if isinstance(data, list) and data:
+            try:
+                return float(data[0].get("value", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def trades_to_history(self, trades: list[dict], token_id: str,
                           bucket_s: int = 3600) -> list[dict]:
         """把成交记录聚合成价格序列 [{t: 秒, p: 价格}]。

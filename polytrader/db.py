@@ -172,3 +172,62 @@ def count_pending() -> int:
             return int(cur.fetchone()["n"])
     finally:
         conn.close()
+
+
+# ---- 跟单去重（copytrade_seen：已镜像交易，替代 seen 文件持久化）----
+
+_seen_schema_checked = False
+
+
+def ensure_copytrade_seen_schema() -> None:
+    """幂等建表：copytrade_seen 不存在则创建（进程内只检查一次）。
+
+    存已镜像的 transactionHash（含钱包与 token），跟单循环重启不重复跟单。
+    """
+    global _seen_schema_checked
+    if _seen_schema_checked:
+        return
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS copytrade_seen (
+                    trade_id    VARCHAR(96)  NOT NULL PRIMARY KEY COMMENT '镜像交易唯一 ID（transactionHash 等）',
+                    wallet      VARCHAR(64)  COMMENT '目标钱包地址',
+                    asset       VARCHAR(96)  COMMENT 'outcome token_id',
+                    seen_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP COMMENT '首次发现时间',
+                    INDEX idx_seen_wallet (wallet)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                  COMMENT='跟单已镜像交易去重（跨轮持久，替代 seen 文件）'
+            """)
+        _seen_schema_checked = True
+    finally:
+        conn.close()
+
+
+def load_copytrade_seen() -> set[str]:
+    """加载全部已镜像交易 ID（跟单循环启动时恢复去重集）。"""
+    ensure_copytrade_seen_schema()
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT trade_id FROM copytrade_seen")
+            return {str(r["trade_id"]) for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def add_copytrade_seen(entries: list[tuple[str, str, str]]) -> int:
+    """批量记录已镜像交易（INSERT IGNORE 幂等）。entries: [(trade_id, wallet, asset)]。"""
+    if not entries:
+        return 0
+    ensure_copytrade_seen_schema()
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT IGNORE INTO copytrade_seen (trade_id, wallet, asset) "
+                "VALUES (%s, %s, %s)", entries)
+        return cur.rowcount
+    finally:
+        conn.close()
