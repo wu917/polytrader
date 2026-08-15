@@ -38,41 +38,11 @@ from polytrader.config import load_config  # noqa: E402
 from polytrader.execution import order_v2  # noqa: E402
 from polytrader.execution.signer import (  # noqa: E402
     ZERO_BYTES32, l2_headers_new, sign_clob_auth)
-from scripts.run_live_loop import _Tee, _req, derive_creds  # noqa: E402
+from scripts.run_live_loop import _Tee, _req, derive_creds, place_order  # noqa: E402
 from scripts.simulate_equity_updown import build_db_rec  # noqa: E402
 from scripts.scan_event_markets import (  # noqa: E402
     PROXY, fetch_all_active, is_event_market, to_market)
 from polytrader.strategies.event_market import EventMarketStrategy  # noqa: E402
-
-
-def place_maker(creds: dict, eoa: str, pk: str, deposit: str,
-                token_id: str, side: int, size_usd: float,
-                price: float) -> dict:
-    """maker GTC 限价单（post_only=True）：挂单不成交则留在订单簿。
-
-    与 run_live_loop.place_fok 的区别：orderType=GTC + postOnly=true，
-    价格是限价（期望成交价），不会以更差价格吃单。
-    """
-    maker_amt, taker_amt = order_v2.calc_amounts(side, size_usd, price)
-    ts_ms = str(time.time_ns() // 1_000_000)
-    td = order_v2.build_order_typed_data(
-        maker=deposit, signer=deposit, token_id=token_id,
-        maker_amount=maker_amt, taker_amount=taker_amt,
-        side=side, signature_type=order_v2.POLY_1271,
-        timestamp_ms=ts_ms, contract=order_v2.CTF_EXCHANGE_V2)
-    sig1271 = order_v2.sign_order_poly1271(td, pk, order_v2.CTF_EXCHANGE_V2, 137)
-    order = {**td["message"], "signature": sig1271,
-             "salt": str(td["message"]["salt"]), "timestamp": ts_ms,
-             "metadata": ZERO_BYTES32, "builder": ZERO_BYTES32}
-    payload = order_v2.order_to_json_v2(order, owner=creds["apiKey"],
-                                        order_type="GTC", post_only=True)
-    serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
-                        creds["secret"], "POST", "/order", body=serialized)
-    h2["Content-Type"] = "application/json"
-    r = _req("POST", "https://clob.polymarket.com/order", data=serialized,
-             headers=h2)
-    return {"status_code": r.status_code, "body": r.text}
 
 
 def cancel_order(creds: dict, eoa: str, order_id: str) -> dict:
@@ -115,6 +85,8 @@ def main() -> int:
         return 1
     eoa = Account.from_key(pk).address
     creds = derive_creds(eoa, pk)
+    tick_cache: dict = {}  # token_id -> (tick, 时间)
+    negrisk_cache: dict = {}  # token_id -> (neg_risk, 时间)
     print(f"EOA={eoa} deposit={deposit} 认证 OK")
 
     from polytrader.execution import chain
@@ -197,8 +169,10 @@ def main() -> int:
         print(f"  {m.slug[:48]:48s} {side} llm_p={s.extra.get('llm_p', 0):.3f} "
               f"buy@{price} rr={s.extra.get('rr')} ev={s.extra.get('ev'):+} "
               f"${args.size} [maker GTC]")
-        resp = place_maker(creds, eoa, pk, deposit, token_id,
-                           order_v2.BUY, args.size, price)
+        resp = place_order(creds, eoa, pk, deposit, token_id,
+                           order_v2.BUY, args.size, price,
+                           order_type="GTC", post_only=True,
+                           tick_cache=tick_cache, negrisk_cache=negrisk_cache)
         print(f"    POST /order: {resp['status_code']} {resp['body'][:160]}")
         try:
             body = json.loads(resp["body"])

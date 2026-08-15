@@ -64,7 +64,7 @@ class _Tee:
         self.fh.flush()
 
 
-# 代理：优先 HTTPS_PROXY 环境变量（缺省回退本机 socks5 7890，保持原行为）
+# 代理：优先 HTTPS_PROXY 环境变量（缺省回退本机 http 7897）
 PROXY = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
          or "http://127.0.0.1:7897")
 
@@ -95,68 +95,92 @@ def derive_creds(eoa: str, pk: str) -> dict:
     return r.json()
 
 
-def place_fok(creds: dict, eoa: str, pk: str, deposit: str,
-              token_id: str, side: int, size_usd: float, price: float) -> dict:
-    """FOK 真实下单，返回响应（成功含 orderID/status/transactionsHashes）。"""
-    maker_amt, taker_amt = order_v2.calc_amounts(side, size_usd, price,
-                                                 marketable=True)
-    ts_ms = str(time.time_ns() // 1_000_000)
-    td = order_v2.build_order_typed_data(
-        maker=deposit, signer=deposit, token_id=token_id,
-        maker_amount=maker_amt, taker_amount=taker_amt,
-        side=side, signature_type=order_v2.POLY_1271,
-        timestamp_ms=ts_ms, contract=order_v2.CTF_EXCHANGE_V2)
-    sig1271 = order_v2.sign_order_poly1271(td, pk, order_v2.CTF_EXCHANGE_V2, 137)
-    order = {**td["message"], "signature": sig1271,
-             "salt": str(td["message"]["salt"]), "timestamp": ts_ms,
-             "metadata": order_v2.ZERO_BYTES32, "builder": order_v2.ZERO_BYTES32}
-    payload = order_v2.order_to_json_v2(order, owner=creds["apiKey"],
-                                        order_type="FOK")
-    serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    h2 = signer.l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
-                               creds["secret"], "POST", "/order",
-                               body=serialized)
-    h2["Content-Type"] = "application/json"
-    r = _req("POST", "https://clob.polymarket.com/order", data=serialized,
-             headers=h2)
-    return {"status_code": r.status_code, "body": r.text}
+def _get_tick_size(token_id: str, cache: dict[str, tuple[float, float]] | None = None,
+                   ttl: float = 600.0) -> float:
+    """查询 token 的 orderPriceMinTickSize（CLOB /tick-size 公开端点）。
 
-
-def verify_token(token_id: str) -> bool:
-    """下单前只读校验 token 在 CLOB 有效（GET /tick-size，公开端点）。
-
-    规避偶发 invalid token id：5m 市场新创建时 gamma 已返回 clobTokenIds
-    但 CLOB 侧可能尚未生效，直接下单会 400 invalid token id。
+    官方 clob-client-v2 同款（_resolveTickSize）：tick 因市场而异
+    （5m 盘 0.01、部分事件盘 0.001），calc_amounts 需按 tick 计算份额精度。
+    600s 缓存：token 的 tick 生命周期内固定。
     """
+    if cache is not None:
+        hit = cache.get(token_id)
+        if hit and time.time() - hit[1] < ttl:
+            return hit[0]
+    tick = order_v2.DEFAULT_TICK_SIZE
     try:
         r = _req("GET", "https://clob.polymarket.com/tick-size",
                  params={"token_id": token_id})
-        return r.status_code == 200
+        if r.status_code == 200:
+            tick = float(r.json().get("minimum_tick_size", tick))
+            if cache is not None:
+                cache[token_id] = (tick, time.time())  # 仅成功结果入缓存
     except Exception:
-        return False
+        pass
+    return tick
 
 
-def place_maker(creds: dict, eoa: str, pk: str, deposit: str,
-                token_id: str, side: int, size_usd: float,
-                price: float) -> dict:
-    """maker GTC 限价单（post_only=True）：挂单不成交则留在订单簿。
+def _get_neg_risk(token_id: str, cache: dict[str, tuple[bool, float]] | None = None,
+                  ttl: float = 600.0) -> bool:
+    """查询 token 是否负风险市场（GET /neg-risk 公开端点）。
 
-    与 place_fok 的区别：orderType=GTC + postOnly=true，价格是限价
-    （期望成交价），不会以更差价格吃单；空壳盘口下先挂单等对手盘。
+    官方 clob-client-v2 同款（getNegRisk）：负风险市场必须用
+    NEG_RISK_EXCHANGE_V2 合约签名（domain separator 不同），否则
+    CLOB 验签失败（invalid POLY_1271 signature）。查询失败默认 False
+    （与历史行为一致，非 negRisk 市场不受影响）。
     """
-    maker_amt, taker_amt = order_v2.calc_amounts(side, size_usd, price)
+    if cache is not None:
+        hit = cache.get(token_id)
+        if hit and time.time() - hit[1] < ttl:
+            return hit[0]
+    neg = False
+    try:
+        r = _req("GET", "https://clob.polymarket.com/neg-risk",
+                 params={"token_id": token_id})
+        if r.status_code == 200:
+            neg = bool(r.json().get("neg_risk", False))
+            if cache is not None:
+                cache[token_id] = (neg, time.time())  # 仅成功结果入缓存
+    except Exception:
+        pass
+    return neg
+
+
+def place_order(creds: dict, eoa: str, pk: str, deposit: str,
+                token_id: str, side: int, size_usd: float, price: float,
+                order_type: str = "FOK", post_only: bool = False,
+                tick_cache: dict | None = None,
+                negrisk_cache: dict | None = None) -> dict:
+    """CLOB V2 下单（FOK 吃单 / GTC maker post_only 统一入口）。
+
+    构造 ERC-7739 订单 → POLY_1271 签名 → POST /order（POLY_* L2 认证）。
+    order_type: FOK（立即成交或拒绝）/ GTC（挂单等成交，post_only=True 只挂不吃）。
+    下单前自动解析该 token 的市场参数（600s 缓存）：
+    - tick size（/tick-size）：calc_amounts 按 tick 计算份额精度
+      （tick=0.001 市场需 5 位份额），保证隐含价落 tick 网格
+    - neg_risk（/neg-risk）：负风险市场用 NEG_RISK_EXCHANGE_V2 合约签名
+      （domain separator 不同），否则 CLOB 验签 hash 不匹配
+    """
+    marketable = order_type == "FOK"
+    tick = _get_tick_size(token_id, tick_cache)
+    neg_risk = _get_neg_risk(token_id, negrisk_cache)
+    contract = (order_v2.NEG_RISK_EXCHANGE_V2 if neg_risk
+                else order_v2.CTF_EXCHANGE_V2)
+    maker_amt, taker_amt = order_v2.calc_amounts(side, size_usd, price,
+                                                  marketable=marketable,
+                                                  tick_size=tick)
     ts_ms = str(time.time_ns() // 1_000_000)
     td = order_v2.build_order_typed_data(
         maker=deposit, signer=deposit, token_id=token_id,
         maker_amount=maker_amt, taker_amount=taker_amt,
         side=side, signature_type=order_v2.POLY_1271,
-        timestamp_ms=ts_ms, contract=order_v2.CTF_EXCHANGE_V2)
-    sig1271 = order_v2.sign_order_poly1271(td, pk, order_v2.CTF_EXCHANGE_V2, 137)
+        timestamp_ms=ts_ms, contract=contract)
+    sig1271 = order_v2.sign_order_poly1271(td, pk, contract, 137)
     order = {**td["message"], "signature": sig1271,
              "salt": str(td["message"]["salt"]), "timestamp": ts_ms,
              "metadata": order_v2.ZERO_BYTES32, "builder": order_v2.ZERO_BYTES32}
     payload = order_v2.order_to_json_v2(order, owner=creds["apiKey"],
-                                        order_type="GTC", post_only=True)
+                                        order_type=order_type, post_only=post_only)
     serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
                         creds["secret"], "POST", "/order", body=serialized)
@@ -164,6 +188,32 @@ def place_maker(creds: dict, eoa: str, pk: str, deposit: str,
     r = _req("POST", "https://clob.polymarket.com/order", data=serialized,
              headers=h2)
     return {"status_code": r.status_code, "body": r.text}
+
+
+def verify_token(token_id: str, cache: dict[str, tuple[bool, float]] | None = None,
+                 ttl: float = 60.0) -> bool:
+    """下单前只读校验 token 在 CLOB 有效（GET /tick-size，公开端点）。
+
+    规避偶发 invalid token id：5m 市场新创建时 gamma 已返回 clobTokenIds
+    但 CLOB 侧可能尚未生效，直接下单会 400 invalid token id。
+    60s 缓存：同一窗口内 token 状态不会变化，避免每 30s 扫描重复预检。
+    """
+    if cache is not None:
+        hit = cache.get(token_id)
+        if hit and time.time() - hit[1] < ttl:
+            return hit[0]
+    try:
+        r = _req("GET", "https://clob.polymarket.com/tick-size",
+                 params={"token_id": token_id})
+        ok = r.status_code == 200
+    except Exception:
+        ok = False
+    if cache is not None:
+        # 仅缓存 True：网络抖动导致预检失败时不缓存 False，
+        # 避免本窗口机会被 60s 错误缓存整段错过
+        if ok:
+            cache[token_id] = (ok, time.time())
+    return ok
 
 
 def cancel_order(creds: dict, eoa: str, order_id: str) -> dict:
@@ -273,6 +323,10 @@ def main() -> int:
     if not deposit:
         print("!! .env 缺 POLYMARKET_DEPOSIT_WALLET")
         return 1
+    # 结果文件预先创建：settle_worker 结算时写回（缺失会降级到无文件分支）
+    live_results_file = str(ROOT / "backtest_results"
+                            / f"llm_results_live_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
+    Path(live_results_file).touch()
     eoa = Account.from_key(pk).address
     creds = derive_creds(eoa, pk)
     print(f"EOA={eoa} deposit={deposit} 认证 OK")
@@ -298,7 +352,7 @@ def main() -> int:
         print("!! LLM not configured (LLM_API_KEY missing)")
         return 1
     strat = LLMUpdownStrategy(scorer, min_edge=args.min_edge, max_markets=20,
-                              coin_map=cm)
+                              coin_map=cm, max_workers=6, cache_ttl=45.0)
     http = HttpClient(timeout=15)
     from polytrader.data.clob_client import ClobClient
     clob = ClobClient(http=http)
@@ -312,6 +366,9 @@ def main() -> int:
     win_secs = 300 if "5m" in args.windows else 900
     results = []
     seen = load_seen(args.seen_file)
+    token_cache: dict[str, tuple[bool, float]] = {}  # token_id -> (有效, 时间)
+    tick_cache: dict = {}  # token_id -> (tick, 时间)
+    negrisk_cache: dict = {}  # token_id -> (neg_risk, 时间)
     try:
         for i in range(1, args.rounds + 1):
             print(f"\n=== LOOP {i}/{args.rounds} ===")
@@ -319,19 +376,21 @@ def main() -> int:
             w_start = (now // win_secs) * win_secs     # 当前窗口起点（不做对齐等待）
             w_end = w_start + win_secs
             print(f"  window {w_start} -> {w_end} (enter mid-window at {now})")
-            # ⚠️ 每轮复查余额（成交会扣款，防止资金不足时无效下单）
-            try:
-                bal_now = chain.call_balance(chain.PUSD, deposit) / 1e6
-            except Exception as e:
-                print(f"  (余额查询失败 {str(e)[:40]}，按预算假设继续)")
-                bal_now = bal
-            if bal_now < args.size + 0.05:
-                print(f"  !! 资金不足（${bal_now:.2f} < ${args.size + 0.05}），"
-                      f"本轮跳过，等下一窗口")
-                d = (w_end + 2) - int(time.time())
-                if d > 0 and i < args.rounds:
-                    time.sleep(d)
-                continue
+            # ⚠️ 余额复查降频（每 2 轮一次；RPC 多节点轮换较慢；缺口最坏
+            # 2 轮×per_round 笔，CLOB 侧余额硬校验兜底拒绝，不成交不扣款）
+            if i == 1 or i % 2 == 0:
+                try:
+                    bal_now = chain.call_balance(chain.PUSD, deposit) / 1e6
+                except Exception as e:
+                    print(f"  (余额查询失败 {str(e)[:40]}，按预算假设继续)")
+                    bal_now = bal
+                if bal_now < args.size * args.per_round + 0.05 * args.per_round:
+                    print(f"  !! 资金不足（${bal_now:.2f} < ${args.size + 0.05}），"
+                          f"本轮跳过，等下一窗口")
+                    d = (w_end + 2) - int(time.time())
+                    if d > 0 and i < args.rounds:
+                        time.sleep(d)
+                    continue
 
             scans = 0
             while True:
@@ -379,15 +438,13 @@ def main() -> int:
                     idx = 0 if side_str == "YES" else 1
                     token_id = m.outcomes[idx].token_id
                     # 预期成交价（吃单侧盘口价）：过滤坏单 [0.20, 0.85]
+                    # 买 YES 吃 YES ask；买 NO 吃 NO ask（勿用 1-bid 对称估算——
+                    # 空壳盘 bid/ask 不对称时失真，曾致 FOK 以 0.01 档成交）
                     expect_fill = None
                     try:
                         b = clob.get_book(token_id)
-                        if b:
-                            if side_str == "YES":
-                                expect_fill = b.best_ask().price if b.best_ask() else None
-                            else:
-                                expect_fill = (1.0 - b.best_bid().price
-                                               if b.best_bid() else None)
+                        if b and b.best_ask():
+                            expect_fill = b.best_ask().price
                     except Exception:
                         expect_fill = None
                     if expect_fill is not None and not (0.20 <= expect_fill <= 0.85):
@@ -407,22 +464,23 @@ def main() -> int:
                         print(f"  {m.slug} {side_str} 窗口剩余 "
                               f"{w_end - int(time.time())}s <30s，跳过下单")
                         continue
-                    # ⚠️ 下单前校验 token 在 CLOB 有效（防偶发 invalid token id）
-                    if not verify_token(token_id):
+                    # ⚠️ 下单前校验 token 在 CLOB 有效（60s 缓存防重复预检）
+                    if not verify_token(token_id, token_cache):
                         print(f"  {m.slug} {side_str} token 在 CLOB 无效/未生效，跳过")
                         continue
                     # 注：FOK/市价单 BUY 按 USD 金额（$1）驱动，豁免
                     # min_order_size 份额约束（实测 $1@0.54=1.85 份成交，
                     # 而 GTC 3.45 份被拒）——故不做份额预检
                     # ⚠️ 防重复：无论下单成败，本窗口该 slug 立即记入 seen，
-                    # 避免 30s 后同窗口重复开单
+                    # 避免 30s 后同窗口重复开单（文件每轮末统一写）
                     seen.add(m.slug)
-                    save_seen(args.seen_file, seen)
                     print(f"  {m.slug} {side_str} llm_p={s.extra.get('llm_p',0):.3f} "
                           f"ref={s.market_price:.3f} edge={s.edge:+.3f} "
                           f"FOK@{price} ${args.size} (slip {args.fok_slip:+.2f})")
-                    resp = place_fok(creds, eoa, pk, deposit, token_id,
-                                     order_v2.BUY, args.size, price)
+                    resp = place_order(creds, eoa, pk, deposit, token_id,
+                                       order_v2.BUY, args.size, price,
+                                       order_type="FOK", tick_cache=tick_cache,
+                                       negrisk_cache=negrisk_cache)
                     print(f"    POST /order: {resp['status_code']}")
                     print(f"    {resp['body'][:220]}")
                     try:
@@ -461,8 +519,7 @@ def main() -> int:
                             "edge": round(float(s.edge), 4),
                             "llm_reason": s.extra.get("llm_reason"),
                             "llm_model": s.extra.get("model"),
-                            "results_file": str(ROOT / "backtest_results"
-                                                / f"llm_results_live_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"),
+                            "results_file": live_results_file,
                         }
                         db.insert_pending([rec])
                         if fill_price is not None:
@@ -475,8 +532,8 @@ def main() -> int:
                                         "fill_price": fill_price,
                                         "tx": tx_hash})
                         placed += 1
-                        # 成交后记入 seen，避免同窗口后续扫描重复开单
-                        seen.add(m.slug)
+                        # 成交后立即落盘 seen：防窗口内崩溃/重启后重复开单
+                        # （slug 带时间戳，跨窗口无重复风险，仅同窗口需保护）
                         save_seen(args.seen_file, seen)
                         print(f"    ✅ 成交 {body.get('orderID','')[:20]}... "
                               f"status={body.get('status')} "
@@ -487,7 +544,9 @@ def main() -> int:
                     break
                 time.sleep(args.scan_interval)
 
-            # 窗口结束：睡到下一个窗口开始（结算由常驻 settle_worker 处理）
+            # 窗口结束：本窗口 seen 变更统一落盘（避免每笔全量写文件），
+            # 然后睡到下一个窗口开始（结算由常驻 settle_worker 处理）
+            save_seen(args.seen_file, seen)
             sleep_to = w_end + 2
             d = sleep_to - int(time.time())
             if d > 0 and i < args.rounds:
@@ -495,6 +554,11 @@ def main() -> int:
                 time.sleep(d)
     except KeyboardInterrupt:
         print("\n中断")
+        # 中断也要落盘 seen（防下次启动重复开单）
+        try:
+            save_seen(args.seen_file, seen)
+        except Exception:
+            pass
 
     print("\n=== 汇总 ===")
     print(json.dumps(results, ensure_ascii=False, indent=1))

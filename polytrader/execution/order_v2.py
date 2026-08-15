@@ -95,62 +95,115 @@ def round_price_tick(price: float, tick_size: float = 0.01) -> float:
     return round(ticks * tick_size, 4)
 
 
+# 官方 @polymarket/clob-client-v2 ROUNDING_CONFIG：tick → (price 位, size 位, amount 位)
+# amount = 份额/金额的小数位上限（marketable 订单）。2026-08-15 实测对齐：
+# tick=0.001 的市场（如 dota2/lol 事件盘）份额精度是 5 位而非 4 位——
+# 硬编码 4 位会导致隐含价偏离 tick 网格 → CLOB round-trip 重建 hash 不匹配
+# → "invalid POLY_1271 signature: signature does not match order hash"
+ROUNDING_BY_TICK: dict[str, tuple[int, int, int]] = {
+    "0.1": (1, 2, 3),
+    "0.01": (2, 2, 4),
+    "0.005": (3, 2, 5),
+    "0.0025": (4, 2, 6),
+    "0.001": (3, 2, 5),
+    "0.0001": (4, 2, 6),
+}
+DEFAULT_TICK_SIZE = 0.01
+
+
+def rounding_for_tick(tick_size: float | None) -> tuple[int, int, int]:
+    """按 tick 返回 (price 位, size 位, amount 位)；未知 tick 回退 0.01 配置。"""
+    key = str(tick_size) if tick_size else str(DEFAULT_TICK_SIZE)
+    return ROUNDING_BY_TICK.get(key, ROUNDING_BY_TICK[str(DEFAULT_TICK_SIZE)])
+
+
+def _round_down(v: Decimal, places: int) -> Decimal:
+    from decimal import Decimal as _D, ROUND_DOWN
+    return v.quantize(_D(10) ** -places, rounding=ROUND_DOWN)
+
+
+def _round_up(v: Decimal, places: int) -> Decimal:
+    from decimal import Decimal as _D, ROUND_UP
+    return v.quantize(_D(10) ** -places, rounding=ROUND_UP)
+
+
+def _decimal_places(v: Decimal) -> int:
+    """小数位数量（0.0001 → 4）。"""
+    s = format(v.normalize(), "f")
+    return len(s.rsplit(".", 1)[1]) if "." in s else 0
+
+
 def calc_amounts(side: int, size: float, price: float,
-                 marketable: bool = False) -> tuple[int, int]:
+                 marketable: bool = False,
+                 tick_size: float | None = None) -> tuple[int, int]:
     """(maker_amount, taker_amount)（6 decimals）。
 
-    精度规则分两类（CLOB 实测 + 官方文档）：
-    - limit (GTC/GTD)：tick=0.01 → Price 2 位 / Size(份额) 2 位 / Amount(USD) 4 位
-    - marketable (FOK/FAK)：**market buy 金额 ≤2 位、份额 ≤4 位**
-      （CLOB 拒绝消息：market buy orders maker amount max 2 decimals,
-       taker amount max 4 decimals）；market sell 对称（份额 4 位、金额 2 位）
+    精度规则（与官方 @polymarket/clob-client-v2 对齐，tick 驱动）：
+    - limit (GTC/GTD)：Price 按 tick 取整 / Size(份额) 按 size 位向上取整 /
+      Amount(USD) 按 amount 位（round UP 8 位再 DOWN 到 amount 位）
+    - marketable (FOK/FAK)：金额按 size 位、份额按 amount 位——
+      **份额小数位精度由 tick 决定**（tick=0.01→4 位；tick=0.001→5 位），
+      官方算法：先算全精度 usd/price，若小数位超 amount 则先 roundUp 到
+      amount+4 位、仍超则 roundDown 到 amount 位（保证隐含价 round-trip
+      精确落 tick 网格，CLOB 验签重建 hash 才会一致）
 
     BUY:  maker=USD，taker=shares；SELL: maker=shares，taker=USD
     """
-    from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING
+    from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_CEILING, ROUND_UP
 
-    def _usd_4(v: Decimal) -> Decimal:
-        # Amount 4 位：先 round UP 到 8 位再 DOWN 到 4 位
-        return v.quantize(Decimal("0.00000001"),
-                          rounding=ROUND_HALF_UP).quantize(Decimal("0.0001"),
-                                                           rounding=ROUND_DOWN)
+    price_places, size_places, amount_places = rounding_for_tick(tick_size)
+
+    def _usd_amt(v: Decimal) -> Decimal:
+        # Amount：先 round UP 到 amount+4 位再 DOWN 到 amount 位
+        return v.quantize(Decimal(10) ** -(amount_places + 4),
+                          rounding=ROUND_HALF_UP).quantize(
+                              Decimal(10) ** -amount_places, rounding=ROUND_DOWN)
 
     def _to_6(v: Decimal) -> int:
         return int((v * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
 
-    price_d = Decimal(str(round_price_tick(price)))
+    price_d = Decimal(str(round_price_tick(price, tick_size or DEFAULT_TICK_SIZE)))
     if marketable:
-        # marketable：金额 ≤2 位、份额 ≤4 位（与 limit 相反）
+        # marketable：金额按 size 位、份额按 amount 位（官方 getMarketOrderRawAmounts）
         if side == BUY:
-            usd = Decimal(str(size)).quantize(Decimal("0.01"),
+            usd = Decimal(str(size)).quantize(Decimal(10) ** -size_places,
                                               rounding=ROUND_HALF_UP)
-            shares = (usd / price_d).quantize(Decimal("0.0001"),
-                                              rounding=ROUND_DOWN)
+            raw = usd / price_d
+            if _decimal_places(raw) > amount_places:
+                raw = _round_up(raw, amount_places + 4)
+                if _decimal_places(raw) > amount_places:
+                    raw = _round_down(raw, amount_places)
+            shares = raw
             if shares == 0:
-                shares = Decimal("0.0001")
+                shares = Decimal(10) ** -amount_places
             return _to_6(usd), _to_6(shares)
         else:
-            shares = Decimal(str(size)).quantize(Decimal("0.0001"),
+            # 官方 SELL：shares 按 size 位、usd 按 amount 位（与 BUY 对称）
+            shares = Decimal(str(size)).quantize(Decimal(10) ** -size_places,
                                                  rounding=ROUND_DOWN)
-            usd = (shares * price_d).quantize(Decimal("0.01"),
-                                              rounding=ROUND_HALF_UP)
+            raw = shares * price_d
+            if _decimal_places(raw) > amount_places:
+                raw = _round_up(raw, amount_places + 4)
+                if _decimal_places(raw) > amount_places:
+                    raw = _round_down(raw, amount_places)
+            usd = raw
             return _to_6(shares), _to_6(usd)
     if side == BUY:
-        # BUY: size = 美元金额；shares = ceil(usd/price, 2 位)（向上取整保证
-        # 金额不缩水），usd = shares×price（4 位）→ 隐含价精确 = price。
-        usd_in = Decimal(str(size)).quantize(Decimal("0.01"),
+        # BUY: size = 美元金额；shares = ceil(usd/price, size 位)（向上取整保证
+        # 金额不缩水），usd = shares×price（amount 位）→ 隐含价精确 = price。
+        usd_in = Decimal(str(size)).quantize(Decimal(10) ** -size_places,
                                              rounding=ROUND_HALF_UP)
-        shares = (usd_in / price_d).quantize(Decimal("0.01"),
+        shares = (usd_in / price_d).quantize(Decimal(10) ** -size_places,
                                              rounding=ROUND_CEILING)
         if shares == 0:
-            shares = Decimal("0.01")
-        usd = _usd_4(shares * price_d)
+            shares = Decimal(10) ** -size_places
+        usd = _usd_amt(shares * price_d)
         maker, taker = _to_6(usd), _to_6(shares)
     else:
-        # SELL: size = 份额数；maker=shares（2 位），taker=USD=shares×price
-        shares = Decimal(str(size)).quantize(Decimal("0.01"),
+        # SELL: size = 份额数；maker=shares（size 位），taker=USD=shares×price
+        shares = Decimal(str(size)).quantize(Decimal(10) ** -size_places,
                                              rounding=ROUND_DOWN)
-        usd = _usd_4(shares * price_d)
+        usd = _usd_amt(shares * price_d)
         maker, taker = _to_6(shares), _to_6(usd)
     return maker, taker
 

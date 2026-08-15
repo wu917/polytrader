@@ -31,7 +31,7 @@ from polytrader.ai.llm_scorer import LLMScorer  # noqa: E402
 from polytrader.config import load_config  # noqa: E402
 from polytrader.data.http_client import HttpClient  # noqa: E402
 from polytrader.execution import order_v2  # noqa: E402
-from scripts.run_live_loop import _Tee, _req, derive_creds, place_fok  # noqa: E402
+from scripts.run_live_loop import _Tee, _req, derive_creds, place_order  # noqa: E402
 from scripts.scan_equity_updown import (  # noqa: E402
     PROXY, discover_daily_updown, to_market)
 from scripts.simulate_equity_updown import build_db_rec  # noqa: E402
@@ -61,6 +61,8 @@ def main() -> int:
         return 1
     eoa = Account.from_key(pk).address
     creds = derive_creds(eoa, pk)
+    tick_cache: dict = {}  # token_id -> (tick, 时间)
+    negrisk_cache: dict = {}  # token_id -> (neg_risk, 时间)
     print(f"EOA={eoa} deposit={deposit} 认证 OK")
 
     from polytrader.execution import chain
@@ -134,8 +136,9 @@ def main() -> int:
         price = round(min(0.99, float(s.market_price) + 0.01), 3)
         print(f"  {m.slug} {side} llm_p={s.extra.get('llm_p', 0):.3f} "
               f"ref={s.market_price:.3f} edge={s.edge:+.3f} BUY@{price} ${args.size}")
-        resp = place_fok(creds, eoa, pk, deposit, token_id,
-                         order_v2.BUY, args.size, price)
+        resp = place_order(creds, eoa, pk, deposit, token_id,
+                         order_v2.BUY, args.size, price, tick_cache=tick_cache,
+                         negrisk_cache=negrisk_cache)
         print(f"    POST /order: {resp['status_code']}")
         print(f"    {resp['body'][:220]}")
         try:

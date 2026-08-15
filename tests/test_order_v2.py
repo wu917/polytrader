@@ -32,6 +32,40 @@ def test_calc_amounts():
     assert (m, t) == (2_000_000, 1_000_000)
 
 
+def test_calc_amounts_marketable_tick_variants():
+    """marketable 份额精度随 tick 变化（官方 ROUNDING_CONFIG 对齐）。
+
+    2026-08-15 实测 bug：tick=0.001 市场（dota2/lol 事件盘）份额需 5 位，
+    硬编码 4 位导致隐含价偏离网格 → CLOB 验签 hash 不匹配
+    （invalid POLY_1271 signature）。
+    """
+    # tick=0.01：4 位份额（原行为不变）
+    m, t = order_v2.calc_amounts(order_v2.BUY, 1.0, 0.76, marketable=True,
+                                 tick_size=0.01)
+    assert t == 1_315_700  # 1.3157（4 位）
+    # tick=0.001：5 位份额（官方 roundDown 5 位 = 1.31578）
+    m, t = order_v2.calc_amounts(order_v2.BUY, 1.0, 0.76, marketable=True,
+                                 tick_size=0.001)
+    assert t == 1_315_780  # 1.31578（5 位）
+
+
+def test_calc_amounts_marketable_implied_price_on_tick():
+    """marketable 隐含价受控：tick=0.001 严格落网格，tick=0.01 偏离远小于半 tick。"""
+    for tick in (0.001, 0.01):
+        for px in (0.45, 0.60, 0.76, 0.89):
+            m, t = order_v2.calc_amounts(order_v2.BUY, 1.0, px,
+                                         marketable=True, tick_size=tick)
+            implied = (m / 1e6) / (t / 1e6)
+            # 隐含价必须落在该 tick 的最近网格附近（偏离 ≤ 1e-4，远小于半 tick）
+            ticks = round(implied / tick)
+            assert abs(implied - ticks * tick) < 1e-4, \
+                f"tick={tick} px={px}: implied={implied:.6f} 偏离网格 {abs(implied - ticks*tick):.6f}"
+            if tick == 0.001:
+                # tick=0.001 市场（lol/dota2 事件盘）需 5 位份额精度
+                assert t % 10 == 0 or (t / 1e6) * 1e5 % 1 == 0, \
+                    f"tick={tick} px={px}: taker={t} 非 5 位精度"
+
+
 def test_build_order_typed_data():
     td = _td()
     assert td["domain"]["version"] == "2"
