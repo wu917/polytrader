@@ -494,17 +494,22 @@ def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
         if not isinstance(od, dict) or od.get("status") != "MATCHED":
             remain.append((trade_id, order_id, first_ts))  # 未成交继续等
             continue
-        _fill_and_release(live_ctx, trade_id, od, log, emit, round_no)
+        # MATCHED：回填成交价。fill 查询可能因 /data/trades 索引延迟失败
+        # （下单后几秒内查询常查不到）——失败则保留队列下轮重试
+        ok = _fill_and_release(live_ctx, trade_id, od, log, emit, round_no)
+        if not ok:
+            remain.append((trade_id, order_id, first_ts))
     live_ctx["pending_fills"] = remain
 
 
 def _fill_and_release(live_ctx: dict, trade_id: str, od: dict,
-                      log, emit, round_no: int) -> None:
-    """MATCHED 订单：回填成交价 + 更新 order_status。
+                      log, emit, round_no: int) -> bool:
+    """MATCHED 订单：回填成交价 + 更新 order_status。返回是否回填成功。
 
     注意：/data/order 端点（get_order_auth）不含 making/taking 成交金额——
     用它解析 fill 恒为 0（2026-08-16 实测，曾致 4 笔 fill_price=0.0）。
-    正确数据源是认证 /data/trades（按 taker_order_id 匹配实际成交价）。
+    正确数据源是认证 /data/trades（按 taker_order_id 匹配实际成交价）；
+    索引有延迟（下单后几秒查不到）——失败返回 False，调用方保留重试。
     """
     fill, tx = None, None
     try:
@@ -517,6 +522,8 @@ def _fill_and_release(live_ctx: dict, trade_id: str, od: dict,
     if fill is None or fill == 0:
         # /data/order 无成交金额：从 /data/trades 按 order_id 匹配
         fill, tx = _find_fill_by_order(live_ctx, od.get("orderID"))
+    if fill is None:
+        return False  # 索引延迟未查到：调用方保留队列下轮重试
     if tx is None:
         txs = od.get("transactionsHashes") or []
         tx = txs[0] if txs else None
@@ -532,6 +539,7 @@ def _fill_and_release(live_ctx: dict, trade_id: str, od: dict,
     log(f"  [reconcile] {trade_id} MATCHED fill=${fill} tx={str(tx)[:20] if tx else '?'}")
     emit({"type": "fill_confirmed", "round": round_no, "trade_id": trade_id,
           "fill_price": fill, "fill_tx": tx})
+    return True
 
 
 def _find_fill_by_order(live_ctx: dict, order_id: str | None) -> tuple[float | None, str | None]:

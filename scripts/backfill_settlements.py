@@ -76,6 +76,106 @@ def fetch_settle(slug: str) -> float | None:
     return None
 
 
+# ---- settle_v2：CLOB 持仓结算（权威数据源，gamma 降级为回退）----
+# 2026-08-16 设计：live 单（有 order_id）优先用 CLOB 持仓判定——
+#   positions（当前持仓 curPrice ∈ {0,1}）= 结算结果；
+#   closed-positions + activity REDEEM = 已结算赎回；
+#   gamma slug 查询仅作为回退（衍生盘/延迟问题由此根治）。
+
+def fetch_clob_positions_map(user: str) -> dict[str, dict]:
+    """当前持仓：asset -> {curPrice, size, avgPrice}（data-api 公开端点）。"""
+    try:
+        data = HTTP.get_json("https://data-api.polymarket.com/positions",
+                             params={"user": user, "limit": 500})
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for p in (data if isinstance(data, list) else []):
+        asset = str(p.get("asset", "") or "")
+        if asset:
+            out[asset] = {"curPrice": p.get("curPrice"),
+                          "size": p.get("size"),
+                          "avgPrice": p.get("avgPrice")}
+    return out
+
+
+def fetch_clob_closed_map(user: str) -> dict[str, dict]:
+    """已平仓/已结算：asset -> {curPrice, realizedPnl}（公开端点）。"""
+    try:
+        data = HTTP.get_json("https://data-api.polymarket.com/closed-positions",
+                             params={"user": user, "limit": 500})
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for p in (data if isinstance(data, list) else []):
+        asset = str(p.get("asset", "") or "")
+        if asset:
+            out[asset] = {"curPrice": p.get("curPrice"),
+                          "realizedPnl": p.get("realizedPnl")}
+    return out
+
+
+def fetch_asset_actions(user: str, lookback_h: float = 48.0) -> dict[str, set[str]]:
+    """钱包活动中的资产动作（REDEEM=结算赎回 / SELL=手动平仓）——区分依据。
+
+    公开 /activity 端点；仅统计 lookback_h 内的动作。
+    """
+    try:
+        data = HTTP.get_json("https://data-api.polymarket.com/activity",
+                             params={"user": user, "limit": 500})
+    except Exception:
+        return {}
+    import time
+    cutoff = time.time() - lookback_h * 3600
+    out: dict[str, set[str]] = {}
+    for a in (data if isinstance(data, list) else []):
+        try:
+            ts = float(a.get("timestamp", 0) or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts and ts < cutoff:
+            continue
+        asset = str(a.get("asset", "") or "")
+        if not asset:
+            continue
+        atype = str(a.get("type", "")).upper()
+        side = str(a.get("side", "")).upper()
+        if atype == "REDEEM":
+            out.setdefault(asset, set()).add("REDEEM")
+        elif atype == "TRADE" and side == "SELL":
+            out.setdefault(asset, set()).add("SELL")
+    return out
+
+
+def settle_from_clob(asset: str, positions: dict, closed: dict,
+                     actions: dict) -> float | None:
+    """按 CLOB 持仓判定结算价（YES 结算 1.0/0.0；无法判定 None）。
+
+    优先级：
+    1. 当前持仓 curPrice ∈ {0,1} → 直接结算（权威，无平仓歧义）
+    2. 持仓消失 + closed 有该资产 + activity 有 REDEEM → 结算赎回
+       （closed curPrice=1 → 1.0；=0 → 0.0）
+    3. 其余（含手动平仓 SELL）→ None（由调用方回退 gamma）
+    """
+    pos = positions.get(asset)
+    if pos is not None:
+        try:
+            cur = float(pos.get("curPrice"))
+        except (TypeError, ValueError):
+            cur = None
+        if cur in (0.0, 1.0):
+            return cur
+    cl = closed.get(asset)
+    if cl is not None and "REDEEM" in (actions.get(asset) or set()):
+        try:
+            cur = float(cl.get("curPrice"))
+        except (TypeError, ValueError):
+            cur = None
+        if cur in (0.0, 1.0):
+            return cur
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", type=str, default="")

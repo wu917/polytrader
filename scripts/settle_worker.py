@@ -35,6 +35,85 @@ _spec = importlib.util.spec_from_file_location(
 _backfill = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_backfill)
 fetch_settle = _backfill.fetch_settle
+fetch_clob_positions_map = _backfill.fetch_clob_positions_map
+fetch_clob_closed_map = _backfill.fetch_clob_closed_map
+fetch_asset_actions = _backfill.fetch_asset_actions
+settle_from_clob = _backfill.settle_from_clob
+
+
+def _clob_order_assets(creds: dict, eoa: str) -> dict[str, str]:
+    """认证 /data/trades：order_id -> asset_id（settle_v2 关联用）。"""
+    import requests
+    from polytrader.execution.signer import l2_headers_new
+    try:
+        proxies = {"http": "http://127.0.0.1:7897",
+                   "https": "http://127.0.0.1:7897"}
+        h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
+                            creds["secret"], "GET", "/data/trades")
+        r = requests.get("https://clob.polymarket.com/data/trades",
+                         params={"limit": 200, "sort": "desc"},
+                         headers=h2, proxies=proxies, timeout=20)
+        out: dict[str, str] = {}
+        for t in r.json().get("data", []):
+            oid = t.get("taker_order_id")
+            asset = t.get("asset_id")
+            if oid and asset:
+                out[oid] = str(asset)
+        return out
+    except Exception:
+        return {}
+
+
+# settle_v2 数据缓存（每轮拉一次，全部 pending 单共用）
+_clob_ctx: dict = {"creds": None, "assets": {}, "positions": {},
+                   "closed": {}, "actions": {}, "ts": 0.0}
+
+
+def _refresh_clob_ctx(force: bool = False) -> dict:
+    """每 5 分钟刷新一次 settle_v2 数据（认证 trades + 公开 positions 等）。"""
+    import time as _t
+    now = _t.time()
+    if not force and now - _clob_ctx["ts"] < 300 and _clob_ctx["assets"]:
+        return _clob_ctx
+    if _clob_ctx["creds"] is None:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(ROOT / ".env")
+            from eth_account import Account
+            from scripts.run_live_loop import derive_creds
+            pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+            deposit = os.environ.get("POLYMARKET_DEPOSIT_WALLET", "").strip()
+            if pk and deposit:
+                _clob_ctx["deposit"] = deposit
+                _clob_ctx["eoa"] = Account.from_key(pk).address
+                _clob_ctx["creds"] = derive_creds(_clob_ctx["eoa"], pk)
+        except Exception:
+            _clob_ctx["creds"] = None  # 认证失败：v2 不可用，纯 gamma 降级
+    if _clob_ctx["creds"]:
+        _clob_ctx["assets"] = _clob_order_assets(
+            _clob_ctx["creds"], _clob_ctx["eoa"])
+        deposit = _clob_ctx.get("deposit", "")
+        if deposit:
+            _clob_ctx["positions"] = fetch_clob_positions_map(deposit)
+            _clob_ctx["closed"] = fetch_clob_closed_map(deposit)
+            _clob_ctx["actions"] = fetch_asset_actions(deposit)
+    _clob_ctx["ts"] = now
+    return _clob_ctx
+
+
+def fetch_settle_v2(rec: dict) -> float | None:
+    """settle_v2：live 单（order_id→asset）优先 CLOB 持仓判定；失败回退 gamma。"""
+    order_id = rec.get("order_id")
+    if not order_id:
+        return fetch_settle(rec["slug"])  # simulate 单无 order_id：直接 gamma
+    ctx = _refresh_clob_ctx()
+    asset = ctx["assets"].get(order_id)
+    if asset:
+        s = settle_from_clob(asset, ctx["positions"], ctx["closed"],
+                             ctx["actions"])
+        if s is not None:
+            return s
+    return fetch_settle(rec["slug"])
 
 
 def _now() -> str:
@@ -70,8 +149,13 @@ def _alive(pid: int | None) -> bool:
 
 # ---- pending 队列（MySQL polytrader.pending_trades，多进程共享）----
 def settle_one(rec: dict) -> bool:
-    """结算一条 pending：查到结算则写回结果文件并更新 DB 状态。返回是否已结算。"""
-    s = fetch_settle(rec["slug"])
+    """结算一条 pending：查到结算则写回结果文件并更新 DB 状态。返回是否已结算。
+
+    settle_v2（2026-08-16）：live 单优先 CLOB 持仓判定（positions/closed +
+    REDEEM 区分结算与平仓），gamma slug 查询仅作回退——根治衍生盘查询
+    脆弱、结算延迟、slug 变更等导致的"已结算但 DB 未结算"。
+    """
+    s = fetch_settle_v2(rec)
     if s is None:
         return False
     # DB DECIMAL 列读出为 Decimal，统一转 float 参与运算

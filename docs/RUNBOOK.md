@@ -25,7 +25,7 @@
 | 补结算（仅 settle_worker 未运行时需要） | `.venv/bin/python scripts/backfill_settlements.py --results logs/llm_daemon_*/llm_results.jsonl` |
 | 收益率统计 | `.venv/bin/python scripts/summarize_rounds.py` |
 | 查询待结算队列 | `.venv/bin/python scripts/settle_worker.py status`（pending trades 数） |
-| 运行测试 | `.venv/bin/python -m pytest tests/`（187 个） |
+| 运行测试 | `.venv/bin/python -m pytest tests/`（254 个） |
 
 > **结算分工**：`run_llm_loop` / `run_daemon` / `*_live_loop` / `simulate_*` 只负责开单
 > （写入 MySQL `pending_trades`），**结算由常驻进程 `settle_worker` 独立处理**——
@@ -136,10 +136,38 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 
 - **自动**：常驻 `settle_worker` 每 30s 轮询 MySQL 待结算队列，结算完成即写回
   结果文件并更新 DB 状态（`settle_worker status` 显示 `pending trades` 数）
-- **结算查询两级兜底**（`fetch_settle`，settle_worker 与 backfill 共用）：
-  先 `events/keyset?slug=` 主市场路径；查空时回退 `GET /markets?slug=&closed=true`
-  直查——**已结算的衍生盘市场（`-1pt5`/`-away` 后缀）默认不返回，必须带
-  `closed=true`**（2026-08-15/16 实测修复：此前衍生盘单永久 pending 占持仓名额）
+
+**settle_v2 两级判定（2026-08-16，live 单优先 CLOB 持仓判定）**：
+`fetch_settle_v2` 按 `order_id` 分流——有 order_id（live 单）走 CLOB 持仓判定，
+无（simulate 单）直接 gamma：
+
+```
+live 单（有 order_id）
+ ├─ ① 当前持仓判定：GET data-api/positions?user=<deposit wallet>
+ │     该 asset 的 curPrice ∈ {0,1} → 直接结算（1.0 赢 / 0.0 输）★权威
+ ├─ ② 结算赎回判定：持仓消失 + closed-positions 有该资产 + activity 有 REDEEM
+ │     → 结算赎回（closed curPrice=1 → 1.0；=0 → 0.0）
+ ├─ ③ 其余（如仅 SELL 手动平仓，无 REDEEM）→ 判定不了，回退 gamma
+ └─ ④ gamma 回退：events/keyset?slug= → /markets?slug=&closed=true 直查
+simulate 单（无 order_id）→ 直接 gamma（第 ④ 步）
+```
+
+- **order_id→asset 关联**：认证 `GET clob/data/trades`（每 **5 分钟刷新**缓存，
+  200 笔窗口）按 `taker_order_id` 映射——**settle_worker 需 `.env` 配好
+  `POLYMARKET_PRIVATE_KEY` / `POLYMARKET_DEPOSIT_WALLET`**（复用 run_live_loop
+  的 derive_creds），否则无法判定 live 单，纯 gamma 降级
+- **手动平仓不误判**：② 要求 activity 有 **REDEEM** 事件（结算赎回），
+  仅 SELL（手动平仓）不会触发结算（单测 `test_closed_without_redeem_is_manual_close` 覆盖）——
+  手动平仓单需人工处理，见 9.9
+- **意义**：根治 gamma 查询脆弱性（衍生盘查不到 / 结算价延迟 / slug 变更，
+  如 ufc-isl-ian1 曾长期 pending）；覆盖测试见 `tests/test_settle_v2.py`（7 个：
+  curPrice 0/1/中间价 / closed+REDEEM / 平仓不结算 / REDEEM 归零 / 未知资产）
+- **gamma 两级兜底**（`fetch_settle`，settle_worker 与 backfill 共用，settle_v2
+  第 ④ 步）：
+  1. `events/keyset?slug=` 主市场路径
+  2. 查空时回退 `GET /markets?slug=&closed=true` 直查——**已结算的衍生盘市场
+     （`-1pt5`/`-away` 后缀）默认不返回，必须带 `closed=true`**
+     （2026-08-15/16 实测修复：此前衍生盘单永久 pending 占持仓名额）
 - **结果文件缺失也结算**：`results_file` 已删（如 live 单未建结果文件）时仍执行
   `mark_settled` 更新 DB，不再永久 pending 空转（2026-08-15 修复）
 - **主任务退出后结算不停止**：run_llm_loop/run_daemon 退出不影响结算，单子一直在队列里
@@ -164,7 +192,8 @@ daemon RUNNING pid=12340 (pid file: .../logs/llm_daemon.pid)
 `mode` 字段区分实盘（`live`）与模拟（`simulate`）单——`*_live_loop` /
 `run_copytrade_loop --live` 写入 `live`，`simulate_*` / `run_llm_loop` /
 跟单 paper 写入 `simulate`。`status` 枚举：`pending`（待结算）/ `settled` /
-`cancelled`（实盘订单最终未成交释放占坑，见 9.8）。
+`cancelled`（实盘订单最终未成交释放占坑，见 9.8）；`order_status` 记录
+实盘订单状态（`delayed`/`matched`），delayed 单重启后恢复回填追踪（见 9.8）。
 
 > **MySQL 实例说明**：本机 MySQL 8.0.46 安装于 `../mysql-8.0.46/`（workspace 下），
 > 库 `polytrader` 表 `pending_trades`。机器重启后需手动启动：
@@ -200,8 +229,10 @@ grep '"event": "llm_call"' logs/llm_daemon_*/audit_all.jsonl | grep <trade_id �
 | `status` 显示 stale pid | 守护被强杀（SIGKILL）| 直接重新 `start`（旧 pid 自动覆盖） |
 | daemon.log 大量 `ERR request ... Connection reset` | 网络抖动/被墙 | 扫描失败不中断循环，自动重试；若持续，检查网络 |
 | `ERR LLM content unparsable` | DeepSeek 瞬时返回空 content | 正常现象（有重试）；若连续出现检查 `LLM_API_KEY` 余额 |
-| `settle_worker status` 显示 `pending trades` 不降 | 结算延迟或 gamma-api 抖动 | 常驻进程每 30s 自动重试，网络恢复即入账；等待即可 |
-| 衍生盘单（`-1pt5`/`-away` 后缀）永久 pending | 已结算衍生盘不在 /markets 默认查询结果 | 已修复：`fetch_settle` 回退查询带 `closed=true`；仍有存量单可手动 `backfill_settlements.py` 补查 |
+| `settle_worker status` 显示 `pending trades` 不降 | 结算延迟或 gamma-api 抖动 | live 单已走 settle_v2（CLOB 持仓判定，见 5.1），常驻进程每 30s 自动重试；仍不降的多为 simulate 单 gamma 回退路径或手动平仓单（见 9.9），等待或人工处理 |
+| 衍生盘单（`-1pt5`/`-away` 后缀）永久 pending | 已结算衍生盘不在 /markets 默认查询结果 | 已修复：live 单走 settle_v2（CLOB 持仓判定，不依赖 gamma）；gamma 回退带 `closed=true`；仍有存量单可手动 `backfill_settlements.py` 补查 |
+| live 单已结算但 DB 一直 pending | gamma 查询脆弱（衍生盘查不到/slug 变更，如 ufc-isl-ian1） | 已修复：settle_v2 优先 CLOB 持仓判定（positions/closed+REDEEM）；确认 `.env` 已配 `POLYMARKET_PRIVATE_KEY`/`POLYMARKET_DEPOSIT_WALLET`（无则纯 gamma 降级） |
+| 手动平仓（SELL）单一直 pending | settle_v2 用 REDEEM 区分结算与平仓，SELL 不误判结算 | 人工标记 DB（见 9.9），settle_worker 不再重复处理 |
 | copytrade 进程崩溃后静默无日志 | 崩溃前无 traceback 输出（stderr 被丢弃） | 查 `logs/copytrade_crash.log`（外层兜底自动写完整 traceback，含 BaseException） |
 | `[db] insert_pending FAILED` / `[db] fetch_pending FAILED` | MySQL 未启动/连接参数错误 | 检查 mysqld 是否运行、`.env` 的 `POLY_DB_PASS` 是否与库一致 |
 | 结算一直 `still unsettled`（backfill 手动跑时） | 结算延迟 > 查询窗口 | 等 5-10 分钟后重跑 backfill（幂等安全） |
@@ -357,7 +388,8 @@ HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
 | DeepSeek 偶发超时（30-90s） | 代理通道慢 | 自动重试（最多 3 次），主循环不崩 |
 
 **结算查询**：成交单 `mode='live'` 入库，含 orderID/fill_price/LLM 建议
-（llm_p/ref_price/edge/llm_reason/llm_model），settle_worker 自动结算：
+（llm_p/ref_price/edge/llm_reason/llm_model），settle_worker 自动结算
+（live 单走 **settle_v2**：CLOB 持仓判定，gamma 仅回退，见 5.1）：
 ```sql
 SELECT trade_id, slug, side, entry_price, fill_price, llm_p, edge, win, pnl
 FROM pending_trades WHERE mode='live' ORDER BY created_at DESC LIMIT 20;
@@ -387,18 +419,34 @@ FROM pending_trades WHERE mode='live' ORDER BY created_at DESC LIMIT 20;
 - `--max-live-orders`（默认 2）：实盘总开单硬上限，按 DB **未结算 live 跟单单**
   数控制，结算释放自动补单；paper 模式用 `--max-open-positions`（默认 10）
 - **热更新（仅 live）**：运行中改 `logs/copytrade_limit.txt`（纯数字）即生效，
-  无需重启——改小立即收紧（waiting）、改大立即放行；文件缺失/非法回退启动参数
+  无需重启——改小立即收紧（waiting）、改大立即放行；文件缺失/非法回退启动参数：
+  ```bash
+  echo "4" > logs/copytrade_limit.txt   # 立即生效，无需重启
+  ```
+- **上限选择实践（2026-08-16）**：`上限 ≈ floor(余额 × 0.6~0.7)`（下单冻结
+  名义 vs 余额缓冲）——余额 $4-5 建议上限 3-4，充值 $10 后可提到 5-6
 - 每轮与轮内逐笔双重复查上限（防一轮内多信号突破）
+
+**每市场仅跟 1 笔（slug 去重，2026-08-16）**：DB 中同 slug 已开过 live 跟单
+（含本轮）→ 跳过加仓（`skip: <slug> 已跟过`）——控制单一赛事/市场风险集中；
+成交后立即落 `copytrade_seen`（防崩溃重启重复镜像同一笔 FOK）。
 
 **套利/冲单过滤（默认开启）**：同一钱包同一市场 `--wash-window`（默认 1800s）
 内出现 SELL（买卖往返/冲单），或双 BUY 反向且双腿间隔 ≤ `--arb-gap`（默认
 60s，防对冲误判）→ 该市场 BUY 全部过滤；`--no-wash-filter` 关闭。
 
-**delayed 成交回填**：FOK 返回 `delayed`（排队确认中、无成交价）→ 登记
-`pending_fills` → 每轮 `get_order_auth` 轮询 → MATCHED 回填 fill_price/tx
-（`mark_filled` + `order_status='matched'`）；**600s 超时**仍未成交 → 最终
-确认一次，MATCHED 则回填，否则 DB 置 `status='cancelled'` 释放占坑（避免
-delayed 假单永久 pending 占持仓名额）。
+**delayed 成交回填（完整生命周期，2026-08-16 完善）**：
+- **登记**：FOK 返回 `delayed`（排队确认中、无成交价）→ 登记 `pending_fills`
+  内存队列，每轮轮询
+- **重启恢复追踪**：进程重启时从 DB 恢复 `order_status='delayed'` 的 live 单
+  重新登记（pending_fills 是内存态，曾致重启后孤儿订单无法回填成交价）
+- **成交价回填**：MATCHED 后回填——`/data/order` 端点（get_order_auth）不含
+  making/taking（曾致 4 笔 fill_price=0.0），改从**认证 `/data/trades`** 按
+  `taker_order_id` 匹配实际成交价（`mark_filled` + `order_status='matched'`）；
+  trades 索引有延迟（下单后几秒内查不到）→ 返回未查到，**保留队列下轮重试**
+  （不丢失、不误释放）
+- **超时释放**：600s 仍未成交 → 最终状态确认一次，MATCHED 则回填，否则 DB
+  置 `status='cancelled'` 释放占坑（避免 delayed 假单永久 pending 占持仓名额）
 
 **护栏**：单笔 $1 硬上限（`MAX_ORDER_USD`，`--live` 时 `--size` >1 拒绝启动）；
 凭证只从 `.env`（缺 key 拒绝启动）；资金预检（pUSD 需覆盖 size + 手续费）；
@@ -415,3 +463,31 @@ UnboundLocalError 并已修复）。
 | `filter(live): ... ∉ [0.30, 0.90]` | 吃单侧 ask 超价格带（空壳盘口） | 正常过滤，等有流动性 |
 | `❌ 下单失败: invalid POLY_1271 signature` | 罕见残余：tick/negRisk 缓存过期 | 已修复自动解析；重启进程清缓存 |
 | 进程静默死亡无日志 | 未捕获异常 | 查 `logs/copytrade_crash.log` 尾部 traceback |
+
+### 9.9 手动平仓处理（数据维护）
+
+settle_v2 的 REDEEM 判定**不会把手动平仓（SELL）误判为结算**（单测
+`test_closed_without_redeem_is_manual_close` 覆盖）——手动平仓后该资产出现在
+`closed-positions` 但 activity 无 REDEEM，判定为 None 回退 gamma；市场未结算时
+gamma 也查不到，该单会**一直 pending**（属预期，非故障）。
+
+手动平仓后需人工标记 DB，settle_worker 不再重复处理：
+
+```bash
+# ① 查出该单（按 slug 定位，password 见 .env 的 POLY_DB_PASS）
+../mysql-8.0.46/bin/mysql -h127.0.0.1 -P3306 -uroot -p"$POLY_DB_PASS" \
+  --default-character-set=utf8mb4 polytrader \
+  -e "SELECT trade_id, slug, side, entry_price, fill_price, size_usd, status \
+      FROM pending_trades WHERE slug='<slug>' AND mode='live' AND status='pending';"
+
+# ② 标记结算 + 平仓亏损 + 备注（win=0；pnl = 卖出回款 − 投入，为负）
+../mysql-8.0.46/bin/mysql -h127.0.0.1 -P3306 -uroot -p"$POLY_DB_PASS" \
+  --default-character-set=utf8mb4 polytrader \
+  -e "UPDATE pending_trades SET status='settled', win=0, pnl=-0.35, \
+      llm_reason='手动平仓 SELL 3x@0.65', settled_at=NOW() \
+      WHERE trade_id='<trade_id>' AND status='pending';"
+```
+
+- `llm_reason` 注明格式：`手动平仓 SELL <份额>x@<卖出价>`（便于复盘区分结算单）
+- `pnl` 填实际平仓亏损（负值；如卖出回款 $1.95 − 投入 $2.30 = -0.35）
+- ② 的 `AND status='pending'` 防并发误更新；若该单已由 settle_v2 结算则跳过

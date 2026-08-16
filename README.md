@@ -26,7 +26,7 @@ python3.11 -m venv .venv
 .venv/bin/python scripts/run_polytrader.py offline
 
 # 运行测试
-.venv/bin/python -m pytest tests/        # 187 个测试
+.venv/bin/python -m pytest tests/        # 254 个测试
 ```
 
 网络说明：本机访问 Polymarket **经本地 HTTP 代理 127.0.0.1:7897**（.env `HTTP_PROXY`/
@@ -77,11 +77,14 @@ polytrader/
 
 scripts/
 ├── run_llm_loop.py      # 多轮循环主任务（窗口内扫描 + 开单写 MySQL）
-├── settle_worker.py     # 常驻结算进程（任务退出后结算不停止）
+├── settle_worker.py     # 常驻结算进程（任务退出后结算不停止；settle_v2：live 单
+│                        #   优先 CLOB 持仓判定（positions/closed+REDEEM），gamma 回退）
 ├── run_daemon.py        # 无限挂机守护进程（复用 run_llm_loop --rounds 1）
-├── backfill_settlements.py # 兜底补结算（settle_worker 未运行时才需要）
+├── backfill_settlements.py # 兜底补结算（settle_worker 未运行时才需要）+
+│                        #   settle_v2 CLOB 判定实现（settle_worker 复用）
 ├── run_live_loop.py     # 5m 加密 updown 实盘循环（FOK 吃单，盘口预检 + token 校验）
-├── run_copytrade_loop.py # 跟单循环：排行榜 → 活动流轮询 → 镜像 BUY（paper 默认，--live 实盘 FOK）
+├── run_copytrade_loop.py # 跟单循环：排行榜 → 活动流轮询 → 镜像 BUY（paper 默认，
+│                        #   --live 实盘 FOK；delayed 单重启恢复追踪 + 每市场仅跟 1 笔）
 ├── run_event_live_loop.py # 通用事件盘实盘循环（maker GTC post_only）
 ├── run_equity_live_loop.py # 股票/商品日级实盘循环（FOK 吃单）
 ├── scan_event_markets.py  # 通用事件盘扫描 + LLM 评估
@@ -94,7 +97,11 @@ scripts/
 `run_llm_loop`/`run_daemon`/`*_live_loop`/`run_copytrade_loop`/`simulate_*` 开单写入，
 `settle_worker` 常驻轮询结算，多进程共享、不随任务删除。`window` 枚举含
 `5m/15m/daily/event/copytrade`；`status` 除 `pending/settled` 外新增
-`cancelled`（实盘订单最终未成交时释放占坑，见"跟单交易"）。
+`cancelled`（实盘订单最终未成交时释放占坑，见"跟单交易"）；`order_status`
+记录实盘订单状态（`delayed`/`matched`），delayed 单重启后恢复回填追踪。
+**live 单结算走 settle_v2**（2026-08-16）：优先 CLOB 持仓判定（权威数据源），
+gamma 查询仅作回退——根治衍生盘查不到/结算价延迟/slug 变更导致的"已结算但
+DB 未结算"（详见 RUNBOOK 5.1）。
 
 ## 使用
 
@@ -239,7 +246,8 @@ HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
 6. **执行**：默认 **paper**（DryRunBroker 模拟成交）；`--live` 时 FOK 真实下单
    （吃单侧 ask 预检 + 价格带 [0.30, 0.90]，沿用 run_live_loop 的 `place_order`
    统一下单入口）→ 入库 MySQL（`window='copytrade'`，live 单 `mode='live'`）
-   → settle_worker 自动结算
+   → settle_worker 自动结算（live 单走 **settle_v2**：CLOB 持仓权威判定，
+   见 RUNBOOK 5.1）
 
 ```bash
 # paper 模拟（默认，不碰真实资金）
@@ -256,12 +264,28 @@ HTTPS_PROXY=http://127.0.0.1:7897 PYTHONPATH=. .venv/bin/python -u \
 未结算 live 单数控制——**结算释放自动补单**，保持同时持仓 ≤ 上限。paper 模式用
 `--max-open-positions`（默认 10）控制未结算 copytrade 单数。**热更新**：运行中
 改 `logs/copytrade_limit.txt`（一个数字）即生效，无需重启（仅 live 生效，改小
-立即收紧、改大立即放行）。
+立即收紧、改大立即放行）：
 
-**delayed 成交回填**：FOK 返回 `delayed`（排队确认中、无成交价）时登记
-`pending_fills`，每轮 `get_order_auth` 轮询；MATCHED 后回填 fill_price/tx；
-**600s 超时仍未成交 → DB 置 `status='cancelled'` 释放占坑**（避免假单永久
-pending 占持仓名额）。
+```bash
+echo "4" > logs/copytrade_limit.txt   # 立即生效（仅 live），文件缺失/非法回退启动参数
+```
+
+**持仓上限实践建议（2026-08-16 结论）**：上限 ≈ `floor(余额 × 0.6~0.7)`
+（下单冻结名义 vs 余额缓冲）。当前 deposit wallet 余额 $4-5 时建议上限
+3-4；充值 $10 后可提到 5-6（`--max-live-orders`）。
+
+**delayed 成交回填（完整生命周期，2026-08-16 完善）**：
+- **登记与重启恢复**：FOK 返回 `delayed`（排队确认中、无成交价）→ 登记
+  `pending_fills` 每轮轮询；**进程重启时从 DB 恢复 `order_status='delayed'`
+  的 live 单重新登记**（pending_fills 是内存态，曾致重启后孤儿订单无法回填）
+- **成交价回填**：MATCHED 后 `/data/order` 端点不含 making/taking（曾致
+  fill_price=0.0），改从**认证 `/data/trades`** 按 order_id 匹配实际成交价
+  （`mark_filled` + `order_status='matched'`）；trades 索引延迟（下单后几秒
+  查不到）→ 保留队列下轮重试，不丢失
+- **超时释放**：600s 仍未成交 → 最终确认一次，MATCHED 则回填，否则 DB 置
+  `status='cancelled'` 释放占坑（避免 delayed 假单永久 pending 占持仓名额）
+- **每市场仅跟 1 笔（slug 去重）**：DB 中同 slug 已开过 live 跟单（含本轮）
+  → 跳过加仓，控制单一赛事风险集中
 
 **护栏**：单笔 $1 硬上限（`MAX_ORDER_USD`，`--live` 时 `--size` 超 1 拒绝启动）；
 凭证只从 `.env`；结果写 `backtest_results/copytrade_results_*.jsonl`；
@@ -338,6 +362,8 @@ PYTHONPATH=. .venv/bin/python scripts/run_event_live_loop.py \
 
 # 4.5) 常驻结算进程：主任务只开单，结算由它独立持续处理（任务退出后继续结算）
 #       run_llm_loop / run_daemon 启动时自动拉起，一般无需手动启动
+#       live 单结算走 settle_v2（CLOB 持仓判定），需 .env 已配
+#       POLYMARKET_PRIVATE_KEY / POLYMARKET_DEPOSIT_WALLET，否则纯 gamma 降级
 .venv/bin/python scripts/settle_worker.py status  # 查看运行状态 + pending 单数
 .venv/bin/python scripts/settle_worker.py stop    # 停止常驻结算（pending 会保留）
 # 待结算队列存于本地 MySQL：polytrader.pending_trades 表（多进程共享，不随任务删除）
@@ -450,5 +476,5 @@ accuracy/校准曲线偏乐观。真实可交易回测需滚动时间切片（tr
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/        # 187 个测试（含端到端离线全链路、审计、reason 解析）
+.venv/bin/python -m pytest tests/        # 254 个测试（含端到端离线全链路、审计、reason 解析、settle_v2 持仓判定）
 ```
