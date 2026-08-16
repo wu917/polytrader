@@ -297,6 +297,31 @@ def test_load_delayed_orders_error_safe():
     assert rcl._load_delayed_orders(BadDB) == []
 
 
+# ---------- 持仓对账 diff ----------
+
+def test_diff_finds_orphan_and_missing():
+    """对账 diff：孤儿（CLOB 有持仓 DB 无）+ 疑似结算（DB 有但 CLOB 无）。"""
+    pos = {"assetA", "assetB"}
+    trades = {
+        "0xa1": {"asset": "assetA", "price": "0.5"},   # 孤儿：CLOB 持仓但 DB 无
+        "0xa2": {"asset": "assetB", "price": "0.6"},
+        "0xa3": {"asset": "assetC", "price": "0.7"},   # DB 有但 CLOB 无持仓
+    }
+    db_pending = {"0xa2": {"trade_id": "t2"}, "0xa3": {"trade_id": "t3"}}
+    orphan, missing = rcl._diff_positions_vs_db(pos, trades, db_pending)
+    assert orphan == ["0xa1"]
+    assert missing == ["0xa3"]
+
+
+def test_diff_no_mismatch():
+    """完全一致时无孤儿/缺失。"""
+    pos = {"assetA"}
+    trades = {"0xa1": {"asset": "assetA", "price": "0.5"}}
+    db_pending = {"0xa1": {"trade_id": "t1"}}
+    orphan, missing = rcl._diff_positions_vs_db(pos, trades, db_pending)
+    assert orphan == [] and missing == []
+
+
 # ---------- 持仓上限热更新 ----------
 
 def test_hot_limit_file_overrides(monkeypatch, tmp_path):

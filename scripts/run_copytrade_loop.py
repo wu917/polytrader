@@ -101,6 +101,8 @@ def main() -> int:
                     help="关闭套利/冲单过滤（默认开启：同市场买卖往返或双侧买入不跟）")
     ap.add_argument("--wash-window", type=int, default=1800,
                     help="套利/冲单判断时间窗秒（默认 1800s）")
+    ap.add_argument("--reconcile-interval", type=int, default=300,
+                    help="持仓对账子线程间隔秒（默认 300s：CLOB positions ↔ DB 对账）")
     ap.add_argument("--min-buy-price", type=float, default=DEFAULT_MIN_PRICE)
     ap.add_argument("--max-buy-price", type=float, default=DEFAULT_MAX_PRICE)
     ap.add_argument("--fetch-books", action="store_true",
@@ -223,6 +225,14 @@ def main() -> int:
             live_ctx["pending_fills"].append((tid, oid, time.time()))
         if live_ctx["pending_fills"]:
             print(f"  恢复 {len(live_ctx['pending_fills'])} 笔 delayed 单追踪")
+        # 持仓对账子线程：CLOB positions ↔ DB 定期对账（孤儿补录/疑似结算触发）
+        import threading
+        t = threading.Thread(
+            target=_reconcile_positions_loop,
+            args=(live_ctx, log, emit, args.reconcile_interval),
+            daemon=True, name="copytrade-reconcile")
+        t.start()
+        print(f"  持仓对账线程已启动（{args.reconcile_interval}s 间隔）")
     log(f"copytrade loop | period={args.period} category={args.category} "
         f"top_n={args.top_n} size=${args.size} poll={args.poll}s "
         f"seen={len(seen)} refresh={args.refresh_interval}s "
@@ -480,8 +490,11 @@ def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
         if not order_id:
             continue
         if now - first_ts > 600:
-            # 超时：做最终状态确认——MATCHED 则回填成交；否则释放 DB 占坑
-            # （delayed 假单曾永久 pending 占持仓名额，只能人工清理）
+            # 超时：最终确认——成交权威是 /data/trades（get_order_auth 对
+            # 已成交单常返回 null，2026-08-16 实测误释放 itf-pielean-brea）
+            if _backfill_from_trades(live_ctx, trade_id, order_id,
+                                     log, emit, round_no):
+                continue
             try:
                 od = live_ctx["get_order_auth"](
                     live_ctx["creds"], live_ctx["eoa"], order_id)
@@ -512,6 +525,34 @@ def _reconcile_pending_fills(live_ctx: dict, log, emit, round_no: int) -> None:
         if not ok:
             remain.append((trade_id, order_id, first_ts))
     live_ctx["pending_fills"] = remain
+
+
+def _backfill_from_trades(live_ctx: dict, trade_id: str, order_id: str | None,
+                          log, emit, round_no: int) -> bool:
+    """从认证 /data/trades 回填成交价（成交权威数据源）。成功返回 True。
+
+    get_order_auth（/data/order）对已成交订单常返回 null——判定成交
+    必须以 /data/trades 的 CONFIRMED 记录为准（2026-08-16 误释放教训）。
+    """
+    if not order_id:
+        return False
+    fill, tx = _find_fill_by_order(live_ctx, order_id)
+    if fill is None:
+        return False
+    db.mark_filled(trade_id, fill, tx)
+    try:
+        conn = db.connect()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE pending_trades SET order_status='matched' "
+                        "WHERE trade_id=%s", (trade_id,))
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    log(f"  [reconcile] {trade_id} trades 确认成交 fill=${fill} "
+        f"tx={str(tx)[:20] if tx else '?'}")
+    emit({"type": "fill_confirmed", "round": round_no, "trade_id": trade_id,
+          "fill_price": fill, "fill_tx": tx})
+    return True
 
 
 def _fill_and_release(live_ctx: dict, trade_id: str, od: dict,
@@ -668,6 +709,160 @@ def _live_slugs(dbmod) -> set[str]:
             conn.close()
         except Exception:
             pass
+
+
+def _diff_positions_vs_db(pos_assets: set[str], trades_map: dict[str, dict],
+                          db_pending: dict[str, dict]) -> tuple[list[str], list[str]]:
+    """对账 diff：返回 (孤儿订单 order_id 列表, 疑似已结算 order_id 列表)。
+
+    - 孤儿：CLOB 有持仓（trades_map 有该 order_id 的成交）但 DB 无记录
+    - 疑似结算：DB pending 的 order_id 在 trades 有 CONFIRMED 成交，
+      但 CLOB 当前无持仓（已结算赎回或平仓）
+    """
+    db_oids = set(db_pending.keys())
+    orphan_oids = []
+    for oid, t in trades_map.items():
+        if oid not in db_oids and t.get("asset") in pos_assets:
+            orphan_oids.append(oid)
+    missing_oids = []
+    for oid in db_oids:
+        if oid in trades_map and trades_map[oid].get("asset") not in pos_assets:
+            missing_oids.append(oid)
+    return orphan_oids, missing_oids
+
+
+def _reconcile_positions_loop(live_ctx: dict, log, emit,
+                              interval: int = 300) -> None:
+    """持仓对账子线程：定期拉 CLOB positions ↔ DB 对账。
+
+    - 孤儿订单（CLOB 有持仓、DB 无）：自动补录（trades 权威成交价）
+    - 疑似结算（DB pending 但 CLOB 无持仓）：触发 settle_v2 判定结算
+    线程异常兜底：记录后继续下一轮，不中断主循环。
+    """
+    import requests
+    import threading
+    proxies = {"http": "http://127.0.0.1:7897",
+               "https": "http://127.0.0.1:7897"}
+    deposit = live_ctx.get("deposit", "")
+    while True:
+        time.sleep(max(30, interval))
+        try:
+            # 1) CLOB 当前持仓（公开端点）
+            r = requests.get("https://data-api.polymarket.com/positions",
+                             params={"user": deposit, "limit": 500},
+                             proxies=proxies, timeout=20)
+            pos_assets = {str(p.get("asset")) for p in (r.json() if r.status_code == 200 else [])}
+            # 2) 认证 trades（order_id → asset/price）
+            from polytrader.execution.signer import (sign_clob_auth,
+                                                     derive_api_key_headers,
+                                                     l2_headers_new)
+            from eth_account import Account
+            pk = live_ctx["pk"]; eoa = live_ctx["eoa"]
+            ts = int(time.time())
+            sig = sign_clob_auth(eoa, pk, timestamp=ts, nonce=0)
+            creds = requests.get(
+                "https://clob.polymarket.com/auth/derive-api-key",
+                headers=derive_api_key_headers(eoa, sig, ts),
+                proxies=proxies, timeout=20).json()
+            h2 = l2_headers_new(eoa, creds["apiKey"], creds["passphrase"],
+                                creds["secret"], "GET", "/data/trades")
+            tr = requests.get("https://clob.polymarket.com/data/trades",
+                              params={"limit": 200, "sort": "desc"},
+                              headers=h2, proxies=proxies, timeout=20)
+            trades_map = {}
+            for t in tr.json().get("data", []):
+                oid = t.get("taker_order_id")
+                if oid and t.get("status") == "CONFIRMED":
+                    trades_map[oid] = {"asset": str(t.get("asset_id", "")),
+                                       "price": t.get("price"),
+                                       "tx": t.get("transaction_hash")}
+            # 3) DB pending
+            conn = db.connect()
+            with conn.cursor() as cur:
+                cur.execute("SELECT trade_id, order_id, slug FROM pending_trades "
+                            "WHERE mode='live' AND `window`='copytrade' "
+                            "AND status='pending'")
+                db_pending = {r["order_id"]: {"trade_id": r["trade_id"],
+                                              "slug": r["slug"]}
+                              for r in cur.fetchall() if r["order_id"]}
+            conn.close()
+            # 4) 对账
+            orphan_oids, missing_oids = _diff_positions_vs_db(
+                pos_assets, trades_map, db_pending)
+            if orphan_oids:
+                log(f"  [reconcile] 发现 {len(orphan_oids)} 笔孤儿订单（CLOB 有持仓 DB 无）")
+                for oid in orphan_oids[:5]:
+                    t = trades_map[oid]
+                    # 自动补录（trades 权威）
+                    slug = f"orphan-{str(t['asset'])[:10]}"
+                    try:
+                        mr = requests.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={"clob_token_ids": t["asset"], "limit": 2},
+                            proxies=proxies, timeout=15)
+                        items = mr.json() if isinstance(mr.json(), list) else []
+                        if items and items[0].get("slug"):
+                            slug = items[0]["slug"]
+                    except Exception:
+                        pass
+                    rec = {
+                        "trade_id": str(uuid.uuid4())[:8], "slug": slug,
+                        "coin": slug.split("-")[0], "window": "copytrade",
+                        "side": "YES", "entry_price": float(t["price"]),
+                        "size_usd": 1.0, "round": 0,
+                        "results_file": "backtest_results/copytrade_results_auto.jsonl",
+                        "mode": "live", "order_id": oid,
+                        "order_status": "matched",
+                        "fill_price": float(t["price"]), "fill_tx": t["tx"],
+                        "llm_reason": "auto-reconcile orphan",
+                    }
+                    from scripts.simulate_equity_updown import build_db_rec
+                    db.insert_pending([build_db_rec(rec, mode="live")])
+                    log(f"    ✓ 自动补录 {slug[:44]} @${t['price']}")
+            if missing_oids:
+                log(f"  [reconcile] {len(missing_oids)} 笔 DB pending 已无 CLOB 持仓"
+                    f"（结算/平仓待判定）")
+                for oid in missing_oids[:5]:
+                    info = db_pending[oid]
+                    s = fetch_settle_v2_for(oid, info["slug"], live_ctx)
+                    if s is not None:
+                        db.mark_settled(info["trade_id"], s,
+                                        1 if s == 1.0 else 0,
+                                        _calc_pnl(info["slug"], s))
+                        log(f"    ✓ 自动结算 {info['slug'][:44]} → {s}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  [reconcile] 对账失败: {str(e)[:100]}（下轮重试）")
+
+
+def fetch_settle_v2_for(order_id: str, slug: str, live_ctx: dict) -> float | None:
+    """对账线程专用结算判定：CLOB 持仓/closed + gamma 回退。"""
+    try:
+        import scripts.settle_worker as sw
+        return sw.fetch_settle_v2({"order_id": order_id, "slug": slug})
+    except Exception:
+        return None
+
+
+def _calc_pnl(slug: str, settle_yes: float) -> float:
+    """按 DB 单的 entry_price 计算结算盈亏（对账自动结算用）。"""
+    try:
+        conn = db.connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT side, entry_price, size_usd FROM pending_trades "
+                        "WHERE slug=%s AND mode='live' AND status='pending' "
+                        "ORDER BY created_at DESC LIMIT 1", (slug,))
+            r = cur.fetchone()
+        conn.close()
+        if not r:
+            return 0.0
+        entry = float(r.get("fill_price") or r["entry_price"])
+        size = float(r["size_usd"])
+        side = r["side"]
+        win = (side == "YES" and settle_yes == 1.0) or \
+              (side == "NO" and settle_yes == 0.0)
+        return round((size / entry) * (1.0 if win else 0.0) - size, 2)
+    except Exception:
+        return 0.0
 
 
 def _count_live_open(dbmod) -> int:
