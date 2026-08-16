@@ -144,7 +144,7 @@ class MirrorEngine:
         if ask_price is not None and exec_price > 0:
             slippage = ask_price / exec_price - 1.0
             if slippage > self.max_slippage:
-                log.info("mirror skip %s: slippage %.1f%% > %.1f%%",
+                log.debug("mirror skip %s: slippage %.1f%% > %.1f%%",
                          asset, slippage * 100, self.max_slippage * 100)
                 return None
         fill_price = ask_price if ask_price is not None else exec_price
@@ -269,7 +269,7 @@ class MirrorEngine:
                 # 二元套利/冲单过滤（同市场买卖往返或双侧买入）
                 if str(a.get("conditionId", "") or "") in arb_markets:
                     self._seen_trade_ids.add(trade_id)  # 套利订单永久跳过
-                    log.info("mirror skip %s: arb/wash market %s (wallet %s)",
+                    log.debug("mirror skip %s: arb/wash market %s (wallet %s)",
                              trade_id[:24], str(a.get("conditionId", ""))[:16],
                              wallet[:10])
                     continue
@@ -294,7 +294,7 @@ class MirrorEngine:
             return True
         age = time.time() - ts
         if age > self.max_age_seconds:
-            log.info("mirror skip %s: activity age %.0fs > %ds (stale, no alpha)",
+            log.debug("mirror skip %s: activity age %.0fs > %ds (stale, no alpha)",
                      trade_id[:24], age, self.max_age_seconds)
             return False
         return True
@@ -331,7 +331,7 @@ class MirrorEngine:
         outcome_name = str(act.get("outcome", "") or "")
         if self.mirror_yes_only:
             if str(outcome_index) != "0" and outcome_name.upper() != "YES":
-                log.info("mirror skip %s: not YES side (outcomeIndex=%s, outcome=%s)",
+                log.debug("mirror skip %s: not YES side (outcomeIndex=%s, outcome=%s)",
                          asset[:16], outcome_index, outcome_name)
                 return None
 
@@ -341,7 +341,7 @@ class MirrorEngine:
             allowed = self._allowed_slippage(act)
             slippage = ask_price / exec_price - 1.0
             if slippage > allowed:
-                log.info("mirror skip %s: slippage %.1f%% > allowed %.1f%% "
+                log.debug("mirror skip %s: slippage %.1f%% > allowed %.1f%% "
                          "(age %.0fs)", asset[:16], slippage * 100,
                          allowed * 100, _activity_age(act))
                 return None

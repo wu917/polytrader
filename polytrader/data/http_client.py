@@ -73,10 +73,13 @@ class HttpClient:
                 # （6 根 K 线 ~1.1KB，便于核对行情）；其他端点截断防刷屏
                 preview_len = 1500 if ("/klines" in url or "/candles" in url) else 200
                 body_preview = resp.text[:preview_len]
-                # 统一日志：每次请求的 url/status/耗时/响应预览（截断防刷屏）
-                log.info("→ %s %s | %s %dms | resp: %.200s",
-                         method, url[:150], resp.status_code, ms,
-                         body_preview.replace("\n", " ")[:preview_len])
+                # 请求明细（url/status/耗时/响应预览）降级 DEBUG：
+                # 高频轮询（activity/trades/positions 等）逐条 INFO 曾致
+                # polytrader.log 膨胀至 82MB（2026-08-16）；DEBUG 开启时
+                # 仍可核对，失败/重试保留 WARNING（见下方 except 分支）
+                log.debug("→ %s %s | %s %dms | resp: %.200s",
+                          method, url[:150], resp.status_code, ms,
+                          body_preview.replace("\n", " ")[:preview_len])
                 self._audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
                              "event": "http_request",
                              "method": method, "url": url[:200],
