@@ -70,7 +70,11 @@ _clob_ctx: dict = {"creds": None, "assets": {}, "positions": {},
 
 
 def _refresh_clob_ctx(force: bool = False) -> dict:
-    """每 5 分钟刷新一次 settle_v2 数据（认证 trades + 公开 positions 等）。"""
+    """每 5 分钟刷新一次 settle_v2 数据（认证 trades + 公开 positions 等）。
+
+    关键：任一数据源拉取失败**不更新时间戳**（不缓存空数据）——
+    抖动期间缓存的空 positions 曾导致已结算单永远判定 None（2026-08-16）。
+    """
     import time as _t
     now = _t.time()
     if not force and now - _clob_ctx["ts"] < 300 and _clob_ctx["assets"]:
@@ -90,14 +94,19 @@ def _refresh_clob_ctx(force: bool = False) -> dict:
         except Exception:
             _clob_ctx["creds"] = None  # 认证失败：v2 不可用，纯 gamma 降级
     if _clob_ctx["creds"]:
-        _clob_ctx["assets"] = _clob_order_assets(
-            _clob_ctx["creds"], _clob_ctx["eoa"])
+        assets = _clob_order_assets(_clob_ctx["creds"], _clob_ctx["eoa"])
         deposit = _clob_ctx.get("deposit", "")
-        if deposit:
-            _clob_ctx["positions"] = fetch_clob_positions_map(deposit)
-            _clob_ctx["closed"] = fetch_clob_closed_map(deposit)
-            _clob_ctx["actions"] = fetch_asset_actions(deposit)
-    _clob_ctx["ts"] = now
+        positions = fetch_clob_positions_map(deposit) if deposit else {}
+        closed = fetch_clob_closed_map(deposit) if deposit else {}
+        actions = fetch_asset_actions(deposit) if deposit else {}
+        # 任一关键源拉取失败（空集）→ 视为抖动，不更新缓存（下轮重试）
+        if not assets or (deposit and not positions):
+            return _clob_ctx
+        _clob_ctx["assets"] = assets
+        _clob_ctx["positions"] = positions
+        _clob_ctx["closed"] = closed
+        _clob_ctx["actions"] = actions
+        _clob_ctx["ts"] = now
     return _clob_ctx
 
 

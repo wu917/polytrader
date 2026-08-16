@@ -830,10 +830,17 @@ def _reconcile_positions_loop(live_ctx: dict, log, emit,
                     info = db_orders[oid]
                     s = fetch_settle_v2_for(oid, info["slug"], live_ctx)
                     if s is not None:
+                        # 精确计算 + 仅对仍 pending 的单结算（防与 settle_worker
+                        # 竞态覆盖：单已被结算则跳过）
+                        pnl = _calc_pnl_by_trade(info["trade_id"], s)
+                        if pnl is None:
+                            log(f"  [reconcile] {info['slug'][:44]} 已由其他进程"
+                                f"结算，跳过")
+                            continue
                         db.mark_settled(info["trade_id"], s,
-                                        1 if s == 1.0 else 0,
-                                        _calc_pnl(info["slug"], s))
-                        log(f"    ✓ 自动结算 {info['slug'][:44]} → {s}")
+                                        1 if s == 1.0 else 0, pnl)
+                        log(f"    ✓ 自动结算 {info['slug'][:44]} → {s} "
+                            f"pnl=${pnl:+.2f}")
         except Exception as e:  # noqa: BLE001
             log(f"  [reconcile] 对账失败: {str(e)[:100]}（下轮重试）")
 
@@ -847,18 +854,20 @@ def fetch_settle_v2_for(order_id: str, slug: str, live_ctx: dict) -> float | Non
         return None
 
 
-def _calc_pnl(slug: str, settle_yes: float) -> float:
-    """按 DB 单的 entry_price 计算结算盈亏（对账自动结算用）。"""
+def _calc_pnl_by_trade(trade_id: str, settle_yes: float) -> float | None:
+    """按 trade_id 精确计算结算盈亏；单已非 pending（被 settle_worker
+    抢先结算）返回 None——对账线程不得覆盖已结算数据（2026-08-16
+    曾把正确 pnl +0.43 覆盖为 0.0）。"""
     try:
         conn = db.connect()
         with conn.cursor() as cur:
-            cur.execute("SELECT side, entry_price, size_usd FROM pending_trades "
-                        "WHERE slug=%s AND mode='live' AND status='pending' "
-                        "ORDER BY created_at DESC LIMIT 1", (slug,))
+            cur.execute("SELECT side, entry_price, fill_price, size_usd "
+                        "FROM pending_trades WHERE trade_id=%s "
+                        "AND status='pending'", (trade_id,))
             r = cur.fetchone()
         conn.close()
         if not r:
-            return 0.0
+            return None
         entry = float(r.get("fill_price") or r["entry_price"])
         size = float(r["size_usd"])
         side = r["side"]
@@ -866,7 +875,7 @@ def _calc_pnl(slug: str, settle_yes: float) -> float:
               (side == "NO" and settle_yes == 0.0)
         return round((size / entry) * (1.0 if win else 0.0) - size, 2)
     except Exception:
-        return 0.0
+        return None
 
 
 def _count_live_open(dbmod) -> int:
