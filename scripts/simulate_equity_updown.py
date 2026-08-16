@@ -119,6 +119,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--min-edge", type=float, default=0.05)
     ap.add_argument("--min-liquidity", type=float, default=200.0)
+    ap.add_argument("--min-fill", type=float, default=None,
+                    help="坏单过滤下沿（默认 0.25；模拟验证可放宽）")
+    ap.add_argument("--max-fill", type=float, default=None,
+                    help="坏单过滤上沿（默认 0.85；模拟验证可放宽）")
     ap.add_argument("--size", type=float, default=100.0, help="每笔 USD（默认 $100）")
     ap.add_argument("--max-markets", type=int, default=10)
     ap.add_argument("--no-db", action="store_true",
@@ -178,10 +182,12 @@ def main() -> int:
         if m.slug in seen:
             continue
         fill = sim_market_price(books.get(m.condition_id), side, s.market_price)
-        if fill is None or not (MIN_FILL <= fill <= MAX_FILL):
+        lo = args.min_fill if args.min_fill is not None else MIN_FILL
+        hi = args.max_fill if args.max_fill is not None else MAX_FILL
+        if fill is None or not (lo <= fill <= hi):
             skipped += 1
             print(f"  -- {m.slug[:48]:48s} {side:3s} 成交价{fill} 超范围"
-                  f"[{MIN_FILL},{MAX_FILL}] 过滤")
+                  f"[{lo},{hi}] 过滤")
             audit({"ts": _ts(), "event": "trade_skipped_bad_price",
                    "slug": m.slug, "side": side, "fill": fill}, audit_path)
             continue

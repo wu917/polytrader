@@ -1,6 +1,8 @@
 """equity_updown 策略测试：mock LLM + mock 数据源。"""
 from __future__ import annotations
 
+import datetime
+
 import pytest
 
 from polytrader.ai.llm_scorer import LLMScorer
@@ -11,7 +13,12 @@ from polytrader.strategies.equity_updown import EquityUpdownStrategy, _ctx_summa
 
 def _market(slug: str = "nvda-up-or-down-on-august-14-2026",
             yes: float = 0.49, no: float = 0.51,
-            end_date: str = "2026-08-14T20:00:00Z") -> Market:
+            end_date: str | None = None) -> Market:
+    # 结算时间必须为未来（策略距结算 <30 分钟会跳过）——动态生成防
+    # 固定历史日期随时间过期（2026-08-16 曾致 5 个测试全部失败）
+    if end_date is None:
+        end_date = (datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return Market(
         condition_id="c1", question="NVIDIA (NVDA) Up or Down on August 14?",
         slug=slug, end_date=end_date,
@@ -32,9 +39,12 @@ def _ctx(close: float = 225.3) -> EquityContext:
 
 
 class FakeScorer(LLMScorer):
-    """固定返回 P(涨)，并记录收到的 prompt。"""
+    """固定返回 P(涨)，并记录收到的 prompt。
 
-    def __init__(self, p: float):
+    构造兼容策略并发路径的关键字参数调用（api_key/base_url/model/http）。
+    """
+
+    def __init__(self, p: float = 0.5, **kwargs):
         super().__init__(api_key="test-key", base_url="https://api.openai.com/v1",
                          model="test-model")
         self._p = p

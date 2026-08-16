@@ -39,7 +39,11 @@ def test_setup_logging_idempotent():
 
 
 def test_http_client_logs_success(capsys):
-    """HttpClient 成功请求应输出 INFO 日志（method/url/status/ms）。"""
+    """HttpClient 成功请求输出 DEBUG 日志（method/url/status/ms）。
+
+    2026-08-16 日志降噪：请求明细从 INFO 降级 DEBUG（高频轮询曾致
+    polytrader.log 膨胀至 82MB）；失败/重试仍 WARNING（另测）。
+    """
     import http.server
     import socketserver
     import threading
@@ -61,6 +65,14 @@ def test_http_client_logs_success(capsys):
         from polytrader.logging_setup import get_logger
         get_logger("data.http")  # 触发懒初始化
         http = HttpClient(proxy=None, timeout=5)
+        # INFO 级别：请求明细不输出（噪音降级）
+        r = http.get(f"http://127.0.0.1:{port}/test")
+        assert r.status_code == 200
+        out = capsys.readouterr().out
+        assert "→ GET" not in out  # 成功请求明细不在 INFO 输出
+        # DEBUG 级别：请求明细可见
+        import logging
+        logging.getLogger("polytrader").setLevel(logging.DEBUG)
         r = http.get(f"http://127.0.0.1:{port}/test")
         assert r.status_code == 200
         out = capsys.readouterr().out

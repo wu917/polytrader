@@ -66,8 +66,10 @@ class LLMScorer:
                         ],
                         "temperature": 0.0,
                         # 推理模型（deepseek-v4-flash 等）思维链会消耗大量 token，
-                        # 800 不够 → content 被截断为空；4000 保证 content 有完整 JSON
-                        "max_tokens": 4000,
+                        # 800 不够 → content 被截断为空；4000 对长 prompt（如
+                        # equity 日级盘 650+ tokens）推理链仍会耗尽（实测 5/9
+                        # 失败）→ 6000 覆盖长 prompt + 长推理链
+                        "max_tokens": 6000,
                     },
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 )
