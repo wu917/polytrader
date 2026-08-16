@@ -43,7 +43,7 @@ from polytrader.execution import order_v2
 from polytrader.risk.risk_manager import RiskManager
 
 # 坏单过滤价格带（沿用 run_live_loop 语义：空壳盘口极端价格不成交）
-DEFAULT_MIN_PRICE = 0.30
+DEFAULT_MIN_PRICE = 0.25
 DEFAULT_MAX_PRICE = 0.90
 # 实盘单笔硬上限（与 run_live_loop 一致，不可放大）
 MAX_ORDER_USD = 1.0
@@ -189,7 +189,19 @@ def main() -> int:
             print("!! .env 缺 POLYMARKET_PRIVATE_KEY / POLYMARKET_DEPOSIT_WALLET")
             return 1
         eoa = Account.from_key(pk).address
-        creds = derive_creds(eoa, pk)
+        # 启动认证容错：CLOB 网络抖动时重试（最多 5 次 × 10s），
+        # 避免"启动即崩"导致挂机任务反复失效（2026-08-16 实测）
+        creds = None
+        for attempt in range(5):
+            try:
+                creds = derive_creds(eoa, pk)
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! 认证失败第 {attempt + 1} 次: {str(e)[:60]}，10s 后重试")
+                time.sleep(10)
+        if creds is None:
+            print("!! 认证连续失败（网络不通？），退出")
+            return 1
         from polytrader.execution import chain
         bal = chain.call_balance(chain.PUSD, deposit) / 1e6
         need = args.size + 0.05
