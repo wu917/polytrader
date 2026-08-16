@@ -300,17 +300,28 @@ def test_load_delayed_orders_error_safe():
 # ---------- 持仓对账 diff ----------
 
 def test_diff_finds_orphan_and_missing():
-    """对账 diff：孤儿（CLOB 有持仓 DB 无）+ 疑似结算（DB 有但 CLOB 无）。"""
+    """对账 diff：孤儿（CLOB 有持仓 DB 无）+ 疑似结算（pending 但 CLOB 无持仓）。"""
     pos = {"assetA", "assetB"}
     trades = {
         "0xa1": {"asset": "assetA", "price": "0.5"},   # 孤儿：CLOB 持仓但 DB 无
         "0xa2": {"asset": "assetB", "price": "0.6"},
-        "0xa3": {"asset": "assetC", "price": "0.7"},   # DB 有但 CLOB 无持仓
+        "0xa3": {"asset": "assetC", "price": "0.7"},   # DB pending 但 CLOB 无持仓
     }
-    db_pending = {"0xa2": {"trade_id": "t2"}, "0xa3": {"trade_id": "t3"}}
-    orphan, missing = rcl._diff_positions_vs_db(pos, trades, db_pending)
+    db_orders = {"0xa2": {"trade_id": "t2", "status": "pending"},
+                 "0xa3": {"trade_id": "t3", "status": "pending"}}
+    orphan, missing = rcl._diff_positions_vs_db(pos, trades, db_orders)
     assert orphan == ["0xa1"]
     assert missing == ["0xa3"]
+
+
+def test_diff_settled_with_position_not_orphan():
+    """settled 但 CLOB 持仓未赎回 → 不算孤儿（2026-08-16 误补录教训）。"""
+    pos = {"assetA"}
+    trades = {"0xa1": {"asset": "assetA", "price": "0.5"}}
+    db_orders = {"0xa1": {"trade_id": "t1", "status": "settled"}}
+    orphan, missing = rcl._diff_positions_vs_db(pos, trades, db_orders)
+    assert orphan == []
+    assert missing == []  # settled 不在 pending，不触发结算判定
 
 
 def test_diff_no_mismatch():

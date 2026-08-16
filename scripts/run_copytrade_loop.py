@@ -712,20 +712,24 @@ def _live_slugs(dbmod) -> set[str]:
 
 
 def _diff_positions_vs_db(pos_assets: set[str], trades_map: dict[str, dict],
-                          db_pending: dict[str, dict]) -> tuple[list[str], list[str]]:
+                          db_orders: dict[str, dict]) -> tuple[list[str], list[str]]:
     """对账 diff：返回 (孤儿订单 order_id 列表, 疑似已结算 order_id 列表)。
 
-    - 孤儿：CLOB 有持仓（trades_map 有该 order_id 的成交）但 DB 无记录
+    db_orders 须包含全部 live 状态（pending/settled）——settled 但 CLOB
+    持仓未赎回的单不视为孤儿（2026-08-16 曾误补录重复单）。
+    - 孤儿：CLOB 有持仓（trades_map 有该 order_id 的成交）但 DB 无任何记录
     - 疑似结算：DB pending 的 order_id 在 trades 有 CONFIRMED 成交，
       但 CLOB 当前无持仓（已结算赎回或平仓）
     """
-    db_oids = set(db_pending.keys())
+    db_oids = set(db_orders.keys())
     orphan_oids = []
     for oid, t in trades_map.items():
         if oid not in db_oids and t.get("asset") in pos_assets:
             orphan_oids.append(oid)
+    pending_oids = {oid for oid, info in db_orders.items()
+                    if info.get("status") == "pending"}
     missing_oids = []
-    for oid in db_oids:
+    for oid in pending_oids:
         if oid in trades_map and trades_map[oid].get("asset") not in pos_assets:
             missing_oids.append(oid)
     return orphan_oids, missing_oids
@@ -776,19 +780,19 @@ def _reconcile_positions_loop(live_ctx: dict, log, emit,
                     trades_map[oid] = {"asset": str(t.get("asset_id", "")),
                                        "price": t.get("price"),
                                        "tx": t.get("transaction_hash")}
-            # 3) DB pending
+            # 3) DB live 全部状态（含 settled——settled 但持仓未赎回不算孤儿）
             conn = db.connect()
             with conn.cursor() as cur:
-                cur.execute("SELECT trade_id, order_id, slug FROM pending_trades "
-                            "WHERE mode='live' AND `window`='copytrade' "
-                            "AND status='pending'")
-                db_pending = {r["order_id"]: {"trade_id": r["trade_id"],
-                                              "slug": r["slug"]}
-                              for r in cur.fetchall() if r["order_id"]}
+                cur.execute("SELECT trade_id, order_id, slug, status FROM pending_trades "
+                            "WHERE mode='live' AND `window`='copytrade'")
+                db_orders = {r["order_id"]: {"trade_id": r["trade_id"],
+                                             "slug": r["slug"],
+                                             "status": r["status"]}
+                             for r in cur.fetchall() if r["order_id"]}
             conn.close()
             # 4) 对账
             orphan_oids, missing_oids = _diff_positions_vs_db(
-                pos_assets, trades_map, db_pending)
+                pos_assets, trades_map, db_orders)
             if orphan_oids:
                 log(f"  [reconcile] 发现 {len(orphan_oids)} 笔孤儿订单（CLOB 有持仓 DB 无）")
                 for oid in orphan_oids[:5]:
@@ -823,7 +827,7 @@ def _reconcile_positions_loop(live_ctx: dict, log, emit,
                 log(f"  [reconcile] {len(missing_oids)} 笔 DB pending 已无 CLOB 持仓"
                     f"（结算/平仓待判定）")
                 for oid in missing_oids[:5]:
-                    info = db_pending[oid]
+                    info = db_orders[oid]
                     s = fetch_settle_v2_for(oid, info["slug"], live_ctx)
                     if s is not None:
                         db.mark_settled(info["trade_id"], s,
