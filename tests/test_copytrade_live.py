@@ -268,14 +268,17 @@ def test_live_slugs_empty_on_error(monkeypatch):
 
 
 def test_load_delayed_orders_restores_pending_fills():
-    """启动恢复：DB 中 delayed 单重新登记追踪（防重启后孤儿订单）。"""
+    """启动恢复：DB 中 delayed/unknown 单重新登记追踪（防重启后孤儿订单）。"""
     class FakeDB:
+        captured_sql = None
+
         @staticmethod
         def connect():
             class Cur:
                 def __enter__(self): return self
                 def __exit__(self, *a): return False
-                def execute(self, sql, *a): pass
+                def execute(self, sql, *a):
+                    FakeDB.captured_sql = sql
                 def fetchall(self):
                     return [{"trade_id": "t1", "order_id": "0xa1"},
                             {"trade_id": "t2", "order_id": "0xa2"},
@@ -286,6 +289,10 @@ def test_load_delayed_orders_restores_pending_fills():
             return Conn()
     rows = rcl._load_delayed_orders(FakeDB)
     assert rows == [("t1", "0xa1"), ("t2", "0xa2")]
+    # unknown 未确认单必须一并恢复追踪（CLOB 官方枚举，重启丢失曾致孤儿订单）
+    assert "unknown" in FakeDB.captured_sql
+    assert "IN ('delayed','unknown')" in FakeDB.captured_sql
+    assert "status='pending'" in FakeDB.captured_sql
 
 
 def test_load_delayed_orders_error_safe():
@@ -351,6 +358,8 @@ def test_hot_limit_file_overrides(monkeypatch, tmp_path):
         assert rcl._hot_limit(args, True) == 2  # 改小立即生效
         f.write_text("abc\n", encoding="utf-8")
         assert rcl._hot_limit(args, True) == 3  # 非法回退启动值
+        f.write_text("10\n", encoding="utf-8")
+        assert rcl._hot_limit(args, True) == 10  # 热文件直接生效（放宽上限）
     finally:
         if orig is not None:
             f.write_text(orig, encoding="utf-8")
@@ -364,9 +373,15 @@ def test_hot_limit_fallback_without_file(monkeypatch, tmp_path):
         max_live_orders = 3
         max_open_positions = 10
     f = rcl.ROOT / "logs" / "copytrade_limit.txt"
-    if f.exists():
-        f.unlink()
+    orig = f.read_text(encoding="utf-8") if f.exists() else None
     try:
-        assert rcl._hot_limit(Args(), True) == 3
+        if f.exists():
+            f.unlink()
+        assert rcl._hot_limit(Args(), True) == 3  # 回退启动参数
+        assert rcl._hot_limit(Args(), False) == 10  # paper 不受影响
     finally:
-        f.unlink(missing_ok=True)
+        # 恢复原文件（否则跑测试会误删生产热文件，如 copytrade_limit.txt=10）
+        if orig is not None:
+            f.write_text(orig, encoding="utf-8")
+        elif f.exists():
+            f.unlink(missing_ok=True)

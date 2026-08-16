@@ -113,8 +113,8 @@ def main() -> int:
                     help="未结算持仓上限（按 DB copytrade pending 数控制，结算释放后自动恢复开单）")
     ap.add_argument("--live", action="store_true",
                     help="实盘模式：FOK 真实下单（默认 paper 模拟；需用户显式授权）")
-    ap.add_argument("--max-live-orders", type=int, default=2,
-                    help="实盘总开单硬上限（开满即停止开单，默认 2）")
+    ap.add_argument("--max-live-orders", type=int, default=6,
+                    help="实盘总开单硬上限（开满即停止开单，默认 6；热文件可放宽）")
     ap.add_argument("--no-db", action="store_true", help="不入库（只打印信号）")
     ap.add_argument("--log", type=str, default="", help="日志文件路径")
     args = ap.parse_args()
@@ -219,12 +219,13 @@ def main() -> int:
                     "negrisk_cache": {},  # token_id -> (neg_risk, 时间)
                     "pending_fills": [],  # [(trade_id, order_id, first_seen_ts)]
                     }
-        # 启动恢复：DB 中 order_status='delayed' 的历史单重新登记追踪
-        # （pending_fills 是内存态，重启后丢失曾导致孤儿订单——无法回填成交价）
+        # 启动恢复：DB 中 order_status='delayed'/'unknown' 的历史单重新登记
+        # 追踪（pending_fills 是内存态，重启后丢失曾导致孤儿订单——无法
+        # 回填成交价或释放占坑；unknown 同属未确认态，必须一并恢复）
         for tid, oid in _load_delayed_orders(db):
             live_ctx["pending_fills"].append((tid, oid, time.time()))
         if live_ctx["pending_fills"]:
-            print(f"  恢复 {len(live_ctx['pending_fills'])} 笔 delayed 单追踪")
+            print(f"  恢复 {len(live_ctx['pending_fills'])} 笔未确认单追踪")
         # 持仓对账子线程：CLOB positions ↔ DB 定期对账（孤儿补录/疑似结算触发）
         import threading
         t = threading.Thread(
@@ -656,7 +657,7 @@ def _hot_limit(args, is_live: bool) -> int:
 
     仅对实盘（live）生效；paper 用启动参数。运行中改文件即生效
     （无需重启）：改小立即收紧（waiting），改大立即放行。
-    文件缺失/非法时回退启动参数。
+    文件缺失/非法时回退启动参数（--max-live-orders，即初始硬限制）。
     """
     if not is_live:
         return args.max_open_positions
@@ -674,13 +675,19 @@ def _hot_limit(args, is_live: bool) -> int:
 
 
 def _load_delayed_orders(dbmod) -> list[tuple[str, str]]:
-    """DB 中 order_status='delayed' 的 live 单（重启后恢复回填追踪）。"""
+    """DB 中 order_status='delayed'/'unknown' 的 live 单（重启后恢复回填追踪）。
+
+    unknown 是 CLOB 官方枚举（下单即返回/超时确认兜底）——未成交单
+    超时释放（_release_pending）后 order_status 可能仍是 unknown 但
+    status='cancelled' 已排除；此处只取仍 pending 的未确认单。
+    """
     try:
         conn = dbmod.connect()
         with conn.cursor() as cur:
             cur.execute("SELECT trade_id, order_id FROM pending_trades "
                         "WHERE mode='live' AND `window`='copytrade' "
-                        "AND order_status='delayed' AND status='pending'")
+                        "AND order_status IN ('delayed','unknown') "
+                        "AND status='pending'")
             rows = cur.fetchall()
         conn.close()
         return [(str(r["trade_id"]), str(r["order_id"]))
