@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 ROOT = Path(__file__).resolve().parent.parent
 
 from polytrader import db
+from polytrader.db import fetch_wallet_blacklist
 from polytrader.config import load_config
 from polytrader.copytrade.leaderboard import OfficialLeaderboardProvider
 from polytrader.copytrade.mirror import MirrorEngine
@@ -291,6 +292,19 @@ def main() -> int:
             rec["error"] = f"scan: {e}"
             signals = []
 
+        # 黑名单剔除：DB copytrade_wallet_blacklist（用户手动维护），
+        # 每轮扫描时过滤这些钱包的信号（2026-08-17 per-wallet 画像需求）
+        blacklist = fetch_wallet_blacklist() if not args.no_db else set()
+        if blacklist and signals:
+            before = len(signals)
+            signals = [s for s in signals
+                       if str(s.extra.get("mirror_wallet", "")).lower()
+                       not in blacklist]
+            dropped = before - len(signals)
+            if dropped:
+                log(f"  blacklist: 剔除 {dropped} 笔黑名单钱包信号"
+                    f"（黑名单 {len(blacklist)} 个）")
+
         # 3) 过滤 + 风控 + 成交 + 入库
         #    每市场仅跟 1 笔：同 slug 已有 live 单则跳过加仓（集中度受控）
         live_slugs = _live_slugs(db) if (args.live and not args.no_db) else set()
@@ -324,6 +338,7 @@ def main() -> int:
                     log(f"  {s.market.slug[:40]} 无 token_id，跳过")
                     continue
                 # 吃单侧 ask 预检（同 run_live_loop 修复后逻辑：勿用 1-bid 估算）
+                b = None
                 try:
                     b = clob.get_book(token_id)
                     expect_fill = b.best_ask().price if b and b.best_ask() else None
@@ -336,14 +351,31 @@ def main() -> int:
                         f"{args.max_buy_price}]（空壳盘口）")
                     continue
                 px = round(min(args.max_buy_price, max(0.01, fill_base + 0.01)), 2)
+                # 盘口深度预检：FOK 限价内 ask 累计深度须 ≥ 下单金额
+                # （空壳盘只有 1 档薄单时 FOK 排队 10min 超时未成交，
+                #  2026-08-17 实测 30 次超时释放占 1/4 下单——吞吐损失）
+                try:
+                    depth = b.ask_depth_usd(px) if b else 0.0
+                except Exception:
+                    depth = 0.0
+                if depth < args.size:
+                    log(f"  filter(live): {s.market.slug[:40]} ask 深度 "
+                        f"${depth:.2f} < ${args.size:.0f}（FOK 必超时，跳过）")
+                    continue
                 log(f"  >>> LIVE BUY YES {s.market.slug[:40]:42s} FOK@{px} "
                     f"${args.size} (mirror {str(s.extra.get('mirror_wallet', ''))[:10]}...)")
-                resp = live_ctx["place_order"](
-                    live_ctx["creds"], live_ctx["eoa"], live_ctx["pk"],
-                    live_ctx["deposit"], token_id, order_v2.BUY,
-                    args.size, px, order_type="FOK",
-                    tick_cache=live_ctx["tick_cache"],
-                    negrisk_cache=live_ctx["negrisk_cache"])
+                try:
+                    resp = live_ctx["place_order"](
+                        live_ctx["creds"], live_ctx["eoa"], live_ctx["pk"],
+                        live_ctx["deposit"], token_id, order_v2.BUY,
+                        args.size, px, order_type="FOK",
+                        tick_cache=live_ctx["tick_cache"],
+                        negrisk_cache=live_ctx["negrisk_cache"])
+                except Exception as e:  # noqa: BLE001
+                    # 下单网络抖动不得杀进程（2026-08-17 15:14 crash 教训：
+                    # _req 3 次重试失败抛 RuntimeError 未捕获 → 跟单停止 4.7h）
+                    log(f"  !! 下单失败（网络抖动，跳过本轮）: {e}")
+                    continue
                 print(f"    POST /order: {resp['status_code']}")
                 print(f"    {resp['body'][:200]}")
                 try:

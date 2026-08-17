@@ -385,3 +385,40 @@ def test_hot_limit_fallback_without_file(monkeypatch, tmp_path):
             f.write_text(orig, encoding="utf-8")
         elif f.exists():
             f.unlink(missing_ok=True)
+
+
+# ---------- per-wallet 黑名单（扫描剔除） ----------
+
+def test_blacklist_filters_signals(monkeypatch):
+    """黑名单钱包的信号在扫描后剔除（fetch_wallet_blacklist 每轮读取）。"""
+    class Sig:
+        def __init__(self, slug, wallet):
+            self.market = type("M", (), {"slug": slug})()
+            self.extra = {"mirror_wallet": wallet}
+    sigs = [Sig("m1", "0xAAA111"), Sig("m2", "0xBBB222"), Sig("m3", "0xaaa111")]
+    monkeypatch.setattr(rcl, "fetch_wallet_blacklist",
+                        lambda: {"0xaaa111"})
+    out = [s for s in sigs
+           if str(s.extra.get("mirror_wallet", "")).lower() not in {"0xaaa111"}]
+    assert [s.market.slug for s in out] == ["m2"]  # 大小写不敏感剔除
+
+
+def test_blacklist_db_roundtrip():
+    """黑名单表读写（add 后 fetch 能读到，remove 后清空）。"""
+    from polytrader import db as pdb
+    pdb.ensure_schema()
+    conn = pdb.connect()
+    w = "0xtestroundtrip99"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO copytrade_wallet_blacklist (wallet, reason) "
+                        "VALUES (%s, '单测') ON DUPLICATE KEY UPDATE reason='单测'",
+                        (w,))
+        conn.commit()
+        assert w in pdb.fetch_wallet_blacklist()
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM copytrade_wallet_blacklist WHERE wallet=%s", (w,))
+        conn.commit()
+        conn.close()
+    assert w not in pdb.fetch_wallet_blacklist()

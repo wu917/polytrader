@@ -77,9 +77,47 @@ def ensure_schema() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                   COMMENT='已开单待结算队列：5m/15m 加密 updown、daily 股票商品盘、event 事件盘、copytrade 跟单盘共用；开单 INSERT(pending)→settle_worker 轮询→mark_settled(settled)'
             """)
+            # 2026-08-17 per-wallet 画像：跟单单记录来源大牛钱包
+            # （幂等加列：MySQL 8 无 ADD COLUMN IF NOT EXISTS，查 information_schema）
+            cur.execute(
+                "SELECT COUNT(*) n FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='pending_trades' "
+                "AND COLUMN_NAME='mirror_wallet'")
+            if cur.fetchone()["n"] == 0:
+                cur.execute(
+                    "ALTER TABLE pending_trades ADD COLUMN mirror_wallet "
+                    "VARCHAR(66) NULL COMMENT '跟单来源大牛钱包（per-wallet 画像/黑名单用）' "
+                    "AFTER llm_model")
+            # 黑名单表：用户手动维护，扫描时剔除
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS copytrade_wallet_blacklist (
+                    wallet      VARCHAR(66) NOT NULL PRIMARY KEY COMMENT '大牛 proxyWallet 地址（0x 开头）',
+                    reason      VARCHAR(255) COMMENT '拉黑原因（手动指定时填写）',
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '拉黑时间',
+                    INDEX idx_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                  COMMENT='跟单黑名单：用户手动维护，每次扫描剔除这些钱包的活动'
+            """)
         _schema_checked = True
     finally:
         conn.close()
+
+
+def fetch_wallet_blacklist() -> set[str]:
+    """当前黑名单钱包集合（空表/查询失败返回空集，不阻塞扫描）。"""
+    try:
+        ensure_schema()
+        conn = connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT wallet FROM copytrade_wallet_blacklist")
+            return {str(r["wallet"]).lower() for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        return set()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def insert_pending(recs: list[dict]) -> int:
@@ -90,12 +128,13 @@ def insert_pending(recs: list[dict]) -> int:
     sql = ("INSERT IGNORE INTO pending_trades "
            "(trade_id, slug, coin, `window`, side, entry_price, size_usd, "
            "round, results_file, mode, order_id, order_status, "
-           "fill_price, fill_tx, llm_p, ref_price, edge, llm_reason, llm_model) "
+           "fill_price, fill_tx, llm_p, ref_price, edge, llm_reason, llm_model, "
+           "mirror_wallet) "
            "VALUES (%(trade_id)s, %(slug)s, %(coin)s, %(window)s, %(side)s, "
            "%(entry_price)s, %(size_usd)s, %(round)s, %(results_file)s, "
            "%(mode)s, %(order_id)s, %(order_status)s, "
            "%(fill_price)s, %(fill_tx)s, %(llm_p)s, %(ref_price)s, %(edge)s, "
-           "%(llm_reason)s, %(llm_model)s)")
+           "%(llm_reason)s, %(llm_model)s, %(mirror_wallet)s)")
     rows = []
     for r in recs:
         rows.append({
@@ -114,6 +153,7 @@ def insert_pending(recs: list[dict]) -> int:
             "edge": r.get("edge"),
             "llm_reason": r.get("llm_reason"),
             "llm_model": r.get("llm_model"),
+            "mirror_wallet": r.get("mirror_wallet"),
         })
     conn = connect()
     try:

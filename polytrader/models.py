@@ -89,6 +89,10 @@ class OrderBook:
         """前 N 档总挂单金额（美元）。"""
         return sum(l.price * l.size for l in self.bids[:levels] + self.asks[:levels])
 
+    def ask_depth_usd(self, max_price: float) -> float:
+        """ask 侧价格 ≤ max_price 的累计挂单金额（美元，FOK 可吃深度）。"""
+        return sum(l.price * l.size for l in self.asks if l.price <= max_price)
+
 
 @dataclass
 class Signal:

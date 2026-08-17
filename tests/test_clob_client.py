@@ -72,3 +72,15 @@ def test_midpoint():
     assert client.get_midpoint("tok1") == 0.525
     client2 = ClobClient(http=FakeHttp({"mid": None}))
     assert client2.get_midpoint("tok1") is None
+
+
+def test_ask_depth_usd_fok_depth():
+    """FOK 可吃深度：ask 侧价格 ≤ 限价的累计 USD（深度预检用）。"""
+    client = ClobClient(http=FakeHttp(BOOK_JSON))
+    book = client.get_book("tok1")
+    # asks: 0.53×80=42.4 + 0.54×150=81 → 限价 0.54 全吃 = 123.4
+    assert abs(book.ask_depth_usd(0.54) - (0.53 * 80 + 0.54 * 150)) < 1e-9
+    # 限价 0.53 只吃第一档 = 42.4
+    assert abs(book.ask_depth_usd(0.53) - 0.53 * 80) < 1e-9
+    # 限价低于最优 ask → 0（FOK 必超时）
+    assert book.ask_depth_usd(0.52) == 0.0

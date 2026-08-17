@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,20 @@ class HttpError(Exception):
 
 
 class HttpClient:
-    """线程安全的 requests 封装：代理、超时、指数退避重试、可选调用审计。"""
+    """线程安全的 requests 封装：代理、超时、指数退避重试、可选调用审计。
+
+    代理熔断（circuit breaker，2026-08-17）：
+    - 本机代理节点间歇性中断（一天数十次全域 000），中断期间每个请求
+      拖满 3×15s 重试 → 一轮扫描几百请求 = 重试黑洞（数十分钟空转）
+    - 连续 CB_THRESHOLD 次整体失败 → 熔断打开：后续请求快速失败（不走
+      网络不重试），每 CB_PROBE_INTERVAL 放行一个探测请求（half-open）
+    - 探测成功 → 熔断关闭自动恢复；线程安全（对账线程/主循环共享）
+    """
+
+    # 熔断参数
+    CB_THRESHOLD = 5        # 连续整体失败次数 → 打开熔断
+    CB_COOLDOWN = 60.0      # 熔断打开时长（探测周期外快速失败）
+    CB_PROBE_INTERVAL = 20.0  # 熔断期间探测请求最小间隔
 
     def __init__(self, proxy: str | None = None, timeout: int = 15, max_retries: int = 3,
                  audit_path: str | None = None):
@@ -37,6 +51,56 @@ class HttpClient:
                 "https": proxy,
             })
             log.info("HTTP client using proxy %s", proxy)
+        # 熔断状态（线程安全）
+        self._cb_lock = threading.Lock()
+        self._cb_failures = 0
+        self._cb_opened_at = 0.0
+        self._cb_open_until = 0.0
+        self._cb_last_probe = 0.0
+
+    # ---- 熔断控制 ----
+
+    def _cb_should_fast_fail(self) -> bool:
+        """熔断打开时：非探测请求快速失败。探测请求放行（更新探测时间）。"""
+        with self._cb_lock:
+            now = time.time()
+            if not self._cb_open_until or now >= self._cb_open_until:
+                return False
+            # 熔断窗口内：限速放行探测
+            if now - self._cb_last_probe >= self.CB_PROBE_INTERVAL:
+                self._cb_last_probe = now
+                return False
+            return True
+
+    def _cb_record_success(self) -> None:
+        with self._cb_lock:
+            if self._cb_open_until:
+                was_open = True
+            else:
+                was_open = False
+            self._cb_failures = 0
+            self._cb_open_until = 0.0
+            if was_open:
+                log.info("circuit CLOSED: 代理恢复，熔断解除")
+
+    def _cb_record_failure(self) -> None:
+        with self._cb_lock:
+            self._cb_failures += 1
+            if self._cb_failures >= self.CB_THRESHOLD and not self._cb_open_until:
+                now = time.time()
+                self._cb_opened_at = now
+                self._cb_open_until = now + self.CB_COOLDOWN
+                self._cb_last_probe = now  # 打开瞬间不放行探测，等 PROBE_INTERVAL
+                log.warning("circuit OPEN: 连续 %d 次失败（代理中断？），"
+                            "%.0fs 内快速失败、每 %.0fs 探测一次",
+                            self._cb_failures, self.CB_COOLDOWN,
+                            self.CB_PROBE_INTERVAL)
+
+    @property
+    def circuit_open(self) -> bool:
+        """当前是否处于熔断打开状态（诊断用）。"""
+        with self._cb_lock:
+            return bool(self._cb_open_until and time.time() < self._cb_open_until)
 
     def close(self):
         """关闭审计文件（若开启）。"""
@@ -60,6 +124,9 @@ class HttpClient:
         return self._request("POST", url, json=json, **kwargs)
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        # 熔断打开：快速失败（不走网络不重试），探测请求除外
+        if self._cb_should_fast_fail():
+            raise HttpError(f"{method} {url} fast-fail: circuit open（代理中断，等待探测恢复）")
         kwargs.setdefault("timeout", self.timeout)
         last_err: Exception | None = None
         t0 = time.time()
@@ -88,6 +155,7 @@ class HttpClient:
                              "status": resp.status_code,
                              "ms": ms,
                              "resp_preview": body_preview})
+                self._cb_record_success()
                 return resp
             except (requests.RequestException, requests.HTTPError) as exc:
                 last_err = exc
@@ -100,6 +168,7 @@ class HttpClient:
                      "method": method, "url": url[:200],
                      "params": {k: str(v)[:100] for k, v in (kwargs.get("params") or {}).items()},
                      "error": str(last_err)[:300]})
+        self._cb_record_failure()
         raise HttpError(f"{method} {url} failed after {self.max_retries} attempts: {last_err}")
 
     def get_json(self, url: str, params: dict | None = None, **kwargs: Any) -> Any:
