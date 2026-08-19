@@ -112,6 +112,9 @@ def build_db_rec(t: dict, mode: str = "simulate") -> dict:
         rec["order_status"] = t.get("order_status")
         rec["fill_price"] = t.get("fill_price")
         rec["fill_tx"] = t.get("fill_tx")
+    # 跟单来源钱包（per-wallet 画像/黑名单用，2026-08-17；live copytrade 有值）
+    if t.get("mirror_wallet"):
+        rec["mirror_wallet"] = t["mirror_wallet"]
     return rec
 
 
