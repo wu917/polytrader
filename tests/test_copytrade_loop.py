@@ -349,3 +349,28 @@ def test_leaderboard_target_profit_gate():
                           min_profit_usd=5000, min_trades=0,
                           require_activity=False)
     assert engine.refresh_targets() == []
+
+
+def test_min_mirror_usd_filters_noise_trades():
+    """重仓门槛：usdcSize 低于门槛的碎单不跟，重仓单正常跟。"""
+    api = FakeActivityApi({"0xpro": [
+        act(usdcSize="8.9", transactionHash="0xnoise1"),    # 碎单
+        act(usdcSize="120.0", transactionHash="0xbig1"),    # 重仓
+    ]})
+    engine = _activity_engine(api, min_mirror_usd=50.0)
+    engine.refresh_targets()
+    signals = engine.scan_activity()
+    assert len(signals) == 1  # 只跟 $120 重仓单
+    # 碎单未入去重集：门槛为 0 时重扫可见
+    engine2 = _activity_engine(FakeActivityApi({"0xpro": [
+        act(usdcSize="8.9", transactionHash="0xnoise1")]}), min_mirror_usd=0)
+    engine2.refresh_targets()
+    assert len(engine2.scan_activity()) == 1
+
+
+def test_min_mirror_usd_zero_disables():
+    """min_mirror_usd=0 关闭门槛（兼容旧行为：无 usdcSize 字段也放行）。"""
+    api = FakeActivityApi({"0xpro": [act(transactionHash="0xnosize")]})  # 无 usdcSize
+    engine = _activity_engine(api, min_mirror_usd=0)
+    engine.refresh_targets()
+    assert len(engine.scan_activity()) == 1

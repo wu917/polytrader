@@ -45,7 +45,9 @@ from polytrader.risk.risk_manager import RiskManager
 
 # 坏单过滤价格带（沿用 run_live_loop 语义：空壳盘口极端价格不成交）
 DEFAULT_MIN_PRICE = 0.25
-DEFAULT_MAX_PRICE = 0.90
+# 0.70+ 追高段数学负 EV：67% 胜率仍 -4.15（须 >77% 才打平），
+# 2026-08-19 历史复盘后收紧上沿 0.90 → 0.65
+DEFAULT_MAX_PRICE = 0.65
 # 实盘单笔硬上限（与 run_live_loop 一致，不可放大）
 MAX_ORDER_USD = 1.0
 
@@ -102,6 +104,9 @@ def main() -> int:
                     help="关闭套利/冲单过滤（默认开启：同市场买卖往返或双侧买入不跟）")
     ap.add_argument("--wash-window", type=int, default=1800,
                     help="套利/冲单判断时间窗秒（默认 1800s）")
+    ap.add_argument("--min-mirror-usd", type=float, default=50.0,
+                    help="重仓门槛：大牛单 usdcSize 低于该值不跟（碎单=噪声，"
+                         "默认 $50；0=关闭）")
     ap.add_argument("--reconcile-interval", type=int, default=300,
                     help="持仓对账子线程间隔秒（默认 300s：CLOB positions ↔ DB 对账）")
     ap.add_argument("--min-buy-price", type=float, default=DEFAULT_MIN_PRICE)
@@ -174,6 +179,7 @@ def main() -> int:
         require_activity=False,  # 排行榜源无活跃时间字段
         wash_filter=not args.no_wash_filter,
         wash_window_s=args.wash_window,
+        min_mirror_usd=args.min_mirror_usd,
     )
     engine._seen_trade_ids = seen  # 载入历史去重
     risk = RiskManager(mode="paper", max_position_usd=args.max_size_usd * 4)

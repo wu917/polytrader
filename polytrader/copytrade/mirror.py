@@ -34,6 +34,7 @@ class MirrorEngine:
         wash_filter: bool = True,
         wash_window_s: int = 1800,
         arb_gap_s: int = 60,
+        min_mirror_usd: float = 0.0,
     ):
         self.provider = provider
         self.data_api = data_api
@@ -50,6 +51,10 @@ class MirrorEngine:
         self.wash_filter = wash_filter  # 过滤套利/冲单订单（默认开）
         self.wash_window_s = wash_window_s  # 关联判断时间窗
         self.arb_gap_s = arb_gap_s  # 双 BUY 反向判套利的双腿最大间隔（防对冲误判）
+        # 重仓门槛：大牛 usdcSize < 该值的碎单/试探单不跟（噪声），
+        # 2026-08-19 复盘：0x2005d16a（ITF 碎单跟风 22% 胜率）与 0xfe787d2d
+        # （跟到中位 $8.9 碎单、漏 $50+ 重仓）——只跟高信心重仓信号
+        self.min_mirror_usd = min_mirror_usd
         self._seen_trade_ids: set[str] = set()  # 已镜像交易去重
         self._target_wallets: list[str] = []
         # 钱包交易历史：wallet -> conditionId -> [(side, outcome_index, ts)]
@@ -266,6 +271,21 @@ class MirrorEngine:
                 # 超龄活动不跟（轮询+索引延迟下，久远买入的信息已消化，追高无 alpha）
                 if not self._age_ok(a, trade_id):
                     continue
+                # 重仓门槛：碎单/试探单不跟（大牛中位单 $8.9 是噪声，
+                # $50+ 重仓才是利润来源——只跟高信心信号）
+                if self.min_mirror_usd > 0:
+                    try:
+                        usd = float(a.get("usdcSize", 0) or 0)
+                    except (TypeError, ValueError):
+                        usd = 0.0
+                    if usd < self.min_mirror_usd:
+                        log.debug("mirror skip %s: usdcSize $%.1f < $%.0f "
+                                  "(noise trade, wallet %s)",
+                                  trade_id[:24], usd, self.min_mirror_usd,
+                                  wallet[:10])
+                        # 不入去重集：该单金额不足永远不跟，但同市场
+                        # 后续重仓单仍可触发——跳过即可
+                        continue
                 # 二元套利/冲单过滤（同市场买卖往返或双侧买入）
                 if str(a.get("conditionId", "") or "") in arb_markets:
                     self._seen_trade_ids.add(trade_id)  # 套利订单永久跳过
