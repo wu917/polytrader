@@ -121,11 +121,15 @@ def test_build_cmd_no_symbols_omits_flag():
     assert "--symbols" not in cmd
 
 
-def test_build_cmd_simulate_account_and_log():
-    """simulate 命令：account/日志/金额全参数正确。"""
-    cfg = sched.load_equity_config()
+def test_build_cmd_simulate_account_and_log(tmp_path):
+    """simulate 命令：account/日志/金额全参数正确。
+
+    用隔离配置（生产 config/equity.yaml 可能切到 live:true）。
+    """
+    cfg = sched.load_equity_config(tmp_path / "missing.yaml")
     cfg.update({"account": "my_acct", "size": 3.5, "min_edge": 0.08,
-                "min_liquidity": 500, "max_markets": 5})
+                "min_liquidity": 500, "max_markets": 5, "live": False,
+                "strategy": "equity"})
     cmd = sched.build_cmd(cfg)
     s = " ".join(cmd)
     assert "simulate_equity_updown.py" in s
@@ -264,3 +268,202 @@ def test_discover_symbols_whitelist_filters(monkeypatch):
     search_calls = [c for c in calls if "public-search" in c]
     assert len(search_calls) == 1 and "nvda" in search_calls[0]
     assert not any("spy" in c for c in search_calls)
+
+
+# ---------- spy_reversal 策略 skill ----------
+
+def test_spy_reversal_signal_yes_in_band():
+    """昨日跌幅 -1.0%（区间内）→ 对 spy 盘出 YES 信号。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy, ReversalParams
+    from polytrader.models import Market, Outcome
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            assert symbol == "SPY"
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 101.5},
+                {"t": "d3", "c": 100.49},  # 昨日 -1.0%
+            ]
+    m = Market(condition_id="c1", question="SPY up or down?",
+               slug="spy-up-or-down-on-x",
+               outcomes=[Outcome(outcome_id="o0", token_id="tok0", price="0.45"),
+                         Outcome(outcome_id="o1", token_id="tok1", price="0.55")])
+    strat = SpyReversalStrategy(fetcher=FakeFetcher())
+    sigs = strat.scan([m])
+    assert len(sigs) == 1
+    s = sigs[0]
+    assert s.extra["side"] == "YES"
+    assert abs(s.extra["llm_p"] - 0.667) < 1e-6
+    assert s.edge > 0.1  # 0.667 - 0.45
+
+
+def test_spy_reversal_no_signal_normal_day():
+    """昨日小涨 → 无信号。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy
+    from polytrader.models import Market, Outcome
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 100.2},   # +0.2%
+                {"t": "d3", "c": 100.1},
+            ]
+    m = Market(condition_id="c1", question="x",
+               slug="spy-up-or-down-on-x", outcomes=[])
+    assert SpyReversalStrategy(fetcher=FakeFetcher()).scan([m]) == []
+
+
+def test_spy_reversal_extreme_no_signal():
+    """极端暴跌（-2.5%）→ 默认无信号（不接飞刀）。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy
+    from polytrader.models import Market, Outcome
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 102.6},
+                {"t": "d3", "c": 100.03},  # -2.5%
+            ]
+    m = Market(condition_id="c1", question="x",
+               slug="spy-up-or-down-on-x", outcomes=[])
+    assert SpyReversalStrategy(fetcher=FakeFetcher()).scan([m]) == []
+
+
+def test_spy_reversal_streak_bonus():
+    """连跌 3 天 → 概率提升至 streak_p。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy, ReversalParams
+    from polytrader.models import Market, Outcome
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 105.0},
+                {"t": "d2", "c": 104.0},  # -0.95%
+                {"t": "d3", "c": 103.0},  # -0.96%
+                {"t": "d4", "c": 101.9},  # -1.07%（昨跌幅在区间）
+            ]
+    m = Market(condition_id="c1", question="x",
+               slug="spy-up-or-down-on-x",
+               outcomes=[Outcome(outcome_id="o0", token_id="t0", price="0.5"),
+                         Outcome(outcome_id="o1", token_id="t1", price="0.5")])
+    strat = SpyReversalStrategy(fetcher=FakeFetcher())
+    sigs = strat.scan([m])
+    assert len(sigs) == 1
+    assert abs(sigs[0].extra["llm_p"] - 0.72) < 1e-6  # streak_bonus 生效
+    assert strat.last_signal_info["down_streak"] == 3
+
+
+def test_spy_reversal_ignores_non_spy_markets():
+    """非 spy 盘不产信号（可插拔：多标的扫描只挑 spy）。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy
+    from polytrader.models import Market
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 101.5},
+                {"t": "d3", "c": 100.49},
+            ]
+    m = Market(condition_id="c1", question="x",
+               slug="nvda-up-or-down-on-x", outcomes=[])
+    assert SpyReversalStrategy(fetcher=FakeFetcher()).scan([m]) == []
+
+
+def test_spy_momentum_signal_up_day():
+    """涨侧动量：昨日涨幅 ≥+1.0% → YES 信号（p=0.62）。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy
+    from polytrader.models import Market, Outcome
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 100.8},
+                {"t": "d3", "c": 101.85},  # 昨日 +1.04%
+            ]
+    m = Market(condition_id="c1", question="x",
+               slug="spy-up-or-down-on-x",
+               outcomes=[Outcome(outcome_id="o0", token_id="t0", price="0.55"),
+                         Outcome(outcome_id="o1", token_id="t1", price="0.45")])
+    strat = SpyReversalStrategy(fetcher=FakeFetcher())
+    sigs = strat.scan([m])
+    assert len(sigs) == 1
+    s = sigs[0]
+    assert s.extra["side"] == "YES"
+    assert abs(s.extra["llm_p"] - 0.62) < 1e-6
+    assert strat.last_signal_info["mode"] == "momentum"
+
+
+def test_spy_momentum_up_streak_bonus():
+    """连涨 ≥3 天 + 昨涨 ≥1% → 概率提升 0.657。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy
+    from polytrader.models import Market, Outcome
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 100.5},   # +0.5%
+                {"t": "d3", "c": 101.2},   # +0.7%
+                {"t": "d4", "c": 102.3},   # +1.09%（昨涨 ≥1%）
+            ]
+    m = Market(condition_id="c1", question="x",
+               slug="spy-up-or-down-on-x",
+               outcomes=[Outcome(outcome_id="o0", token_id="t0", price="0.5"),
+                         Outcome(outcome_id="o1", token_id="t1", price="0.5")])
+    strat = SpyReversalStrategy(fetcher=FakeFetcher())
+    sigs = strat.scan([m])
+    assert len(sigs) == 1
+    assert abs(sigs[0].extra["llm_p"] - 0.657) < 1e-6
+    assert strat.last_signal_info["up_streak"] == 3
+
+
+def test_spy_no_signal_flat_day():
+    """小幅震荡日（|chg| < 0.8 且 < +1.0）→ 无信号。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy
+    from polytrader.models import Market
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 100.3},   # +0.3%
+                {"t": "d3", "c": 100.55},  # +0.25%
+            ]
+    m = Market(condition_id="c1", question="x",
+               slug="spy-up-or-down-on-x", outcomes=[])
+    assert SpyReversalStrategy(fetcher=FakeFetcher()).scan([m]) == []
+
+
+def test_spy_reversal_only_today_market():
+    """只对今日结算盘出信号；明日盘跳过（2026-08-19 隐患修复）。"""
+    from polytrader.strategies.spy_reversal import SpyReversalStrategy
+    from polytrader.models import Market, Outcome
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    class FakeFetcher:
+        def fetch_bars(self, kind, symbol):
+            return [
+                {"t": "d1", "c": 100.0},
+                {"t": "d2", "c": 101.5},
+                {"t": "d3", "c": 100.49},  # -1.0% 触发
+            ]
+    mk = lambda end: Market(
+        condition_id="c1", question="x",
+        slug=f"spy-up-or-down-on-{end.replace('-', '-')}",
+        end_date=f"{end}T20:00:00Z",
+        outcomes=[Outcome(outcome_id="o0", token_id="t0", price="0.5"),
+                  Outcome(outcome_id="o1", token_id="t1", price="0.5")])
+    strat = SpyReversalStrategy(fetcher=FakeFetcher())
+    tomorrow = (datetime.now(ZoneInfo("America/New_York"))
+                .strftime("%Y-%m-%d"))
+    sigs = strat.scan([mk(today), mk("2099-01-01")])
+    assert len(sigs) == 1  # 只有今日盘出信号
+    assert sigs[0].market.end_date.startswith(today)

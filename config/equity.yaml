@@ -13,13 +13,21 @@ schedule:
 #   指数: spy qqq ndx
 #   商品/海外代理: xauusd xagusd wti hsi ukx
 # 空列表 = 全部
-symbols: ["nvda", "tsla", "msft", "aapl", "amzn", "googl", "meta", "coin", "pltr", "spy", "qqq"]
+# 2026-08-19 实盘切换：只跑 spy（spy_reversal 策略目标盘）
+symbols: ["spy"]
 
 # 账户（config/accounts.yaml 中账户名；入 pending_trades.account 区分统计）
 account: default
 
+# 策略：equity=LLM 评估（默认）| spy_reversal=SPY 大跌次日反转 skill
+#   spy_reversal 条件（720 天回测：昨跌幅 -0.8%~-1.5% → 次日涨率 66.7%）：
+#   无需 LLM，仅对 spy-up-or-down 盘出 YES 信号
+# 2026-08-19 实盘切换：spy_reversal（用户授权，$1/笔，仅 spy 盘）
+strategy: spy_reversal
+
 # live=false 模拟成交（simulate_equity_updown），true 真实 FOK 下单（需授权）
-live: false
+# 2026-08-19 用户授权实盘
+live: true
 
 # 单笔金额 / LLM 信号门槛 / 流动性门槛 / 每轮最多几笔
 size: 1.0

@@ -61,6 +61,7 @@ def load_equity_config(path: Path | None = None) -> dict:
     cfg.setdefault("symbols", [])
     cfg.setdefault("account", "default")
     cfg.setdefault("live", False)
+    cfg.setdefault("strategy", "equity")  # equity=LLM | spy_reversal=反转 skill
     cfg.setdefault("size", 1.0)
     cfg.setdefault("min_edge", 0.05)
     cfg.setdefault("min_liquidity", 200.0)
@@ -73,6 +74,7 @@ def build_cmd(cfg: dict) -> list[str]:
     """按配置构造单轮触发命令（复用既有脚本，不重复实现交易逻辑）。"""
     syms = ",".join(str(s) for s in (cfg.get("symbols") or []))
     acct = str(cfg.get("account") or "default")
+    strat = str(cfg.get("strategy") or "equity")
     common = [
         str(ROOT / ".venv" / "bin" / "python"),
     ]
@@ -81,9 +83,10 @@ def build_cmd(cfg: dict) -> list[str]:
         cmd = [*common, script,
                "--size", str(cfg.get("size", 1.0)),
                "--min-edge", str(cfg.get("min_edge", 0.05)),
-               "--min-liquidity", str(cfg.get("min_liquidity", 200)),
+               "--min-liquidity", str(float(cfg.get("min_liquidity", 200))),
                "--per-round", str(cfg.get("per_run", 3)),
                "--account", acct,
+               "--strategy", strat,
                "--log", str(ROOT / "logs" / "equity_scheduler_run.log")]
     else:
         script = str(ROOT / "scripts" / "simulate_equity_updown.py")
@@ -93,6 +96,7 @@ def build_cmd(cfg: dict) -> list[str]:
                "--min-liquidity", str(float(cfg.get("min_liquidity", 200))),
                "--max-markets", str(cfg.get("max_markets", 10)),
                "--account", acct,
+               "--strategy", strat,
                "--log", str(ROOT / "logs" / "equity_scheduler_run.log")]
     if syms:
         cmd += ["--symbols", syms]

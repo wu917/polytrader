@@ -75,9 +75,13 @@ def test_load_equity_config_defaults(tmp_path):
     assert cfg["account"] == "default"
 
 
-def test_build_cmd_simulate():
-    """live=false → 复用 simulate_equity_updown.py（不重复实现交易）。"""
-    cfg = load_equity_config()
+def test_build_cmd_simulate(tmp_path):
+    """live=false → 复用 simulate_equity_updown.py（不重复实现交易）。
+
+    用隔离配置（生产 config/equity.yaml 可能切到 live:true）。
+    """
+    cfg = load_equity_config(tmp_path / "missing.yaml")
+    cfg["live"] = False
     cfg["symbols"] = ["nvda", "spy"]
     cfg["account"] = "equity_acct"
     cfg["size"] = 2.0
@@ -88,9 +92,9 @@ def test_build_cmd_simulate():
     assert "--size" in cmd and "2.0" in cmd
 
 
-def test_build_cmd_live():
+def test_build_cmd_live(tmp_path):
     """live=true → 复用 run_equity_live_loop.py（真实下单链路）。"""
-    cfg = load_equity_config()
+    cfg = load_equity_config(tmp_path / "missing.yaml")
     cfg["live"] = True
     cfg["per_run"] = 5
     cmd = build_cmd(cfg)

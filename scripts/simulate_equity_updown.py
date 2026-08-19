@@ -146,6 +146,9 @@ def main() -> int:
                     help="标的白名单（逗号分隔，如 nvda,spy,tsla；空=全部 17 个）")
     ap.add_argument("--account", type=str, default="default",
                     help="账户名（config/accounts.yaml，入库 account 列统计）")
+    ap.add_argument("--strategy", type=str, default="equity",
+                    choices=["equity", "spy_reversal"],
+                    help="策略：equity=LLM 评估（默认）| spy_reversal=SPY 大跌反转 skill")
     args = ap.parse_args()
 
     if args.log:
@@ -160,11 +163,18 @@ def main() -> int:
     cfg = load_config()
     scorer = LLMScorer(api_key=cfg.llm_api_key, base_url=cfg.llm_base_url,
                        model=cfg.llm_model)
-    if not scorer.enabled:
+    if not scorer.enabled and args.strategy != "spy_reversal":
         print("!! LLM not configured (LLM_API_KEY missing)")
         return 1
-    strat = EquityUpdownStrategy(scorer, min_edge=args.min_edge,
-                                 max_markets=args.max_markets)
+    # 策略选择：equity=LLM 评估（默认）；spy_reversal=大跌次日反转 skill
+    if args.strategy == "spy_reversal":
+        from polytrader.strategies.spy_reversal import SpyReversalStrategy
+        strat = SpyReversalStrategy()
+        print("strategy: spy_reversal（SPY 大跌次日反转，无需 LLM）")
+    else:
+        strat = EquityUpdownStrategy(scorer, min_edge=args.min_edge,
+                                     max_markets=args.max_markets)
+        print("strategy: equity_updown（LLM 评估）")
     markets = [to_market(m) for m in mkts]
 
     # 盘口快照（模拟成交用吃单侧价）

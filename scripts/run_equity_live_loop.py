@@ -48,6 +48,9 @@ def main() -> int:
                     help="标的白名单（逗号分隔，如 nvda,spy,tsla；空=全部 17 个）")
     ap.add_argument("--account", type=str, default="default",
                     help="账户名（config/accounts.yaml，入库 account 列统计）")
+    ap.add_argument("--strategy", type=str, default="equity",
+                    choices=["equity", "spy_reversal"],
+                    help="策略：equity=LLM 评估（默认）| spy_reversal=SPY 大跌反转 skill")
     ap.add_argument("--log", type=str, default="",
                     help="日志文件路径（输出同时写文件，默认只输出到 stdout）")
     args = ap.parse_args()
@@ -80,14 +83,20 @@ def main() -> int:
         print(f"!! 资金不足：需要 ${need:.2f}，只有 ${bal:.2f}（先充值）")
         return 1
 
-    # ---- LLM 评估 ----
+    # ---- 策略选择（equity=LLM 评估默认 / spy_reversal=大跌反转 skill）----
     cfg = load_config()
     scorer = LLMScorer(api_key=cfg.llm_api_key, base_url=cfg.llm_base_url,
                        model=cfg.llm_model)
-    if not scorer.enabled:
+    if not scorer.enabled and args.strategy != "spy_reversal":
         print("!! LLM not configured (LLM_API_KEY missing)")
         return 1
-    strat = EquityUpdownStrategy(scorer, min_edge=args.min_edge)
+    if args.strategy == "spy_reversal":
+        from polytrader.strategies.spy_reversal import SpyReversalStrategy
+        strat = SpyReversalStrategy()
+        print("strategy: spy_reversal（SPY 大跌次日反转，无需 LLM）")
+    else:
+        strat = EquityUpdownStrategy(scorer, min_edge=args.min_edge)
+        print("strategy: equity_updown（LLM 评估）")
 
     http = HttpClient(proxy=PROXY, timeout=15)
     mkts = discover_daily_updown(http, symbols=_parse_symbols(args.symbols))
@@ -126,7 +135,6 @@ def main() -> int:
         expect_fill = None
         try:
             from polytrader.data.clob_client import ClobClient
-            from polytrader.data.http_client import HttpClient
             b = ClobClient(http=HttpClient(proxy=PROXY, timeout=15)).get_book(token_id)
             if b:
                 if side == "YES":
