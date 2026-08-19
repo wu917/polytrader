@@ -121,6 +121,9 @@ def main() -> int:
                     help="实盘模式：FOK 真实下单（默认 paper 模拟；需用户显式授权）")
     ap.add_argument("--max-live-orders", type=int, default=6,
                     help="实盘总开单硬上限（开满即停止开单，默认 6；热文件可放宽）")
+    ap.add_argument("--account", type=str, default="default",
+                    help="账户名（config/accounts.yaml：钱包/EOA 私钥配置，"
+                         "入库 account 列区分任务策略统计）")
     ap.add_argument("--no-db", action="store_true", help="不入库（只打印信号）")
     ap.add_argument("--log", type=str, default="", help="日志文件路径")
     args = ap.parse_args()
@@ -192,10 +195,13 @@ def main() -> int:
         load_dotenv(ROOT / ".env")
         from scripts.run_live_loop import derive_creds, place_order, get_order_auth
         from eth_account import Account
-        pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
-        deposit = os.environ.get("POLYMARKET_DEPOSIT_WALLET", "").strip()
+        from polytrader.accounts import get_account
+        acct = get_account(args.account)
+        pk = acct.private_key
+        deposit = acct.deposit_wallet
         if not pk or not deposit:
-            print("!! .env 缺 POLYMARKET_PRIVATE_KEY / POLYMARKET_DEPOSIT_WALLET")
+            print(f"!! 账户 '{args.account}' 缺 private_key / deposit_wallet"
+                  f"（config/accounts.yaml 或 .env）")
             return 1
         eoa = Account.from_key(pk).address
         # 启动认证容错：CLOB 网络抖动时重试（最多 5 次 × 10s），
@@ -420,6 +426,7 @@ def main() -> int:
                         "model": None,
                         "mirror_wallet": s.extra.get("mirror_wallet"),
                         "mirror_trade_id": s.extra.get("mirror_trade_id"),
+                        "account": args.account,
                     }
                     # delayed 响应不含成交信息：登记待轮询回填（下一轮起查）
                     if body.get("status") == "delayed" and rec_row["order_id"]:
@@ -485,6 +492,7 @@ def main() -> int:
                 "model": None,
                 "mirror_wallet": s.extra.get("mirror_wallet"),
                 "mirror_trade_id": s.extra.get("mirror_trade_id"),
+                "account": args.account,
             }
             if not args.no_db:
                 from scripts.simulate_equity_updown import build_db_rec

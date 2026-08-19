@@ -1,0 +1,29 @@
+# 股票/商品日级涨跌盘定时交易配置（run_equity_scheduler.py 专用）
+#
+# 调度器常驻，按美东时间每日固定时刻自动触发一轮扫描+评估+下单；
+# 下单结果存 pending_trades（window='daily' + account），settle_worker 结算。
+
+schedule:
+  timezone: America/New_York
+  # 美东每日触发时刻（可多个，如开盘后/午间/收盘前）
+  runs: ["09:30", "12:00", "14:30"]
+
+# 标的白名单（slug 前缀小写，对应 SYMBOL_MAP 17 个）：
+#   股票: nvda tsla msft aapl amzn googl meta coin pltr
+#   指数: spy qqq ndx
+#   商品/海外代理: xauusd xagusd wti hsi ukx
+# 空列表 = 全部
+symbols: ["nvda", "tsla", "msft", "aapl", "amzn", "googl", "meta", "coin", "pltr", "spy", "qqq"]
+
+# 账户（config/accounts.yaml 中账户名；入 pending_trades.account 区分统计）
+account: default
+
+# live=false 模拟成交（simulate_equity_updown），true 真实 FOK 下单（需授权）
+live: false
+
+# 单笔金额 / LLM 信号门槛 / 流动性门槛 / 每轮最多几笔
+size: 1.0
+min_edge: 0.05
+min_liquidity: 200.0
+per_run: 3
+max_markets: 10

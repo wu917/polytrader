@@ -34,14 +34,18 @@ GAMMA_MARKET = "https://gamma-api.polymarket.com/markets?slug="
 PROXY = "http://127.0.0.1:7897"
 
 
-def discover_daily_updown(http: HttpClient) -> list[dict]:
+def discover_daily_updown(http: HttpClient,
+                          symbols: list[str] | None = None) -> list[dict]:
     """public-search 各标的 slug 前缀 + 当日 slug 直查，找未结算 up-or-down 盘。
 
     返回 market 元数据列表（含 outcomePrices）。
+    symbols: 白名单前缀（如 ["nvda","spy"]，大小写不敏感）；None/空 = 全部
+    17 个 SYMBOL_MAP 标的。
     过滤：closed 或 endDate 已过（public-search 偶有历史盘 closed 未标）。
     public-search 有搜索质量问题（偶漏当日盘，如 SPY），
     因此对每个前缀再用美东日期构造 slug 直查 keyset 补漏。
     """
+    allowed = {s.strip().lower() for s in (symbols or []) if s and s.strip()}
     now = int(time.time())
     seen: dict[str, dict] = {}
 
@@ -68,8 +72,10 @@ def discover_daily_updown(http: HttpClient) -> list[dict]:
         if slug and slug not in seen:
             seen[slug] = m
 
-    # 1) public-search 全量发现
-    for prefix in SYMBOL_MAP:
+    # 1) public-search 全量发现（symbols 白名单过滤）
+    prefixes = list(SYMBOL_MAP) if not allowed else [
+        p for p in SYMBOL_MAP if p in allowed]
+    for prefix in prefixes:
         try:
             resp = http.get_json(SEARCH_BASE + prefix)
         except Exception:
@@ -95,7 +101,7 @@ def discover_daily_updown(http: HttpClient) -> list[dict]:
     if et_today.weekday() < 5:
         candidates.append(et_today)
     candidates.append(_next_trading_day(et_today))
-    for prefix in SYMBOL_MAP:
+    for prefix in prefixes:
         for d in candidates:
             slug = f"{prefix}-up-or-down-on-{d.strftime('%B').lower()}-{d.day}-{d.year}"
             try:

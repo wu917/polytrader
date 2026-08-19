@@ -1,0 +1,22 @@
+# PolyTrader 账户配置：钱包与 Polymarket 账号地址（任务启动时按 --account 加载）
+#
+# 每个账户包含：
+#   deposit_wallet  : Polymarket deposit wallet 地址（下单扣款/余额检查，pUSD）
+#   funder          : 充值钱包（可选，充值时用）
+#   private_key_env : EOA 私钥所在的环境变量名（推荐，私钥不落明文）
+#   private_key     : 私钥明文（不推荐；两者都缺时回退 env POLYMARKET_PRIVATE_KEY）
+#
+# 不同任务策略用不同账户跑（如 copytrade 用 default、equity 用 equity_acct），
+# 入 pending_trades.account 区分，统计按 account 出金额/收益率。
+
+accounts:
+  default:
+    deposit_wallet: ""            # 留空则回退 env POLYMARKET_DEPOSIT_WALLET
+    funder: ""
+    private_key_env: POLYMARKET_PRIVATE_KEY
+    private_key: ""
+
+  # equity_acct:
+  #   deposit_wallet: "0x..."
+  #   funder: "0x..."
+  #   private_key_env: POLY_ACC_EQUITY_PRIVATE_KEY

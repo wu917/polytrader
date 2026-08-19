@@ -88,6 +88,16 @@ def ensure_schema() -> None:
                     "ALTER TABLE pending_trades ADD COLUMN mirror_wallet "
                     "VARCHAR(66) NULL COMMENT '跟单来源大牛钱包（per-wallet 画像/黑名单用）' "
                     "AFTER llm_model")
+            # 2026-08-19 多账户：下单账号名（区分任务策略/金额收益率统计）
+            cur.execute(
+                "SELECT COUNT(*) n FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='pending_trades' "
+                "AND COLUMN_NAME='account'")
+            if cur.fetchone()["n"] == 0:
+                cur.execute(
+                    "ALTER TABLE pending_trades ADD COLUMN account "
+                    "VARCHAR(32) NULL COMMENT '下单账户名（config/accounts.yaml，按任务策略区分统计）' "
+                    "AFTER mirror_wallet")
             # 黑名单表：用户手动维护，扫描时剔除
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS copytrade_wallet_blacklist (
@@ -129,12 +139,12 @@ def insert_pending(recs: list[dict]) -> int:
            "(trade_id, slug, coin, `window`, side, entry_price, size_usd, "
            "round, results_file, mode, order_id, order_status, "
            "fill_price, fill_tx, llm_p, ref_price, edge, llm_reason, llm_model, "
-           "mirror_wallet) "
+           "mirror_wallet, account) "
            "VALUES (%(trade_id)s, %(slug)s, %(coin)s, %(window)s, %(side)s, "
            "%(entry_price)s, %(size_usd)s, %(round)s, %(results_file)s, "
            "%(mode)s, %(order_id)s, %(order_status)s, "
            "%(fill_price)s, %(fill_tx)s, %(llm_p)s, %(ref_price)s, %(edge)s, "
-           "%(llm_reason)s, %(llm_model)s, %(mirror_wallet)s)")
+           "%(llm_reason)s, %(llm_model)s, %(mirror_wallet)s, %(account)s)")
     rows = []
     for r in recs:
         rows.append({
@@ -154,6 +164,7 @@ def insert_pending(recs: list[dict]) -> int:
             "llm_reason": r.get("llm_reason"),
             "llm_model": r.get("llm_model"),
             "mirror_wallet": r.get("mirror_wallet"),
+            "account": r.get("account"),
         })
     conn = connect()
     try:

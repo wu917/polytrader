@@ -38,6 +38,12 @@ from scripts.scan_equity_updown import (  # noqa: E402
 MIN_FILL, MAX_FILL = 0.25, 0.85
 
 
+def _parse_symbols(s: str) -> list[str] | None:
+    """--symbols 参数解析：逗号分隔 → 小写前缀列表；空串/None → None（全部）。"""
+    parts = [x.strip().lower() for x in (s or "").split(",") if x.strip()]
+    return parts or None
+
+
 def audit(rec: dict, path: str | None):
     """写审计 JSONL（与 5m 盘同风格）。"""
     if not path:
@@ -115,6 +121,9 @@ def build_db_rec(t: dict, mode: str = "simulate") -> dict:
     # 跟单来源钱包（per-wallet 画像/黑名单用，2026-08-17；live copytrade 有值）
     if t.get("mirror_wallet"):
         rec["mirror_wallet"] = t["mirror_wallet"]
+    # 下单账户名（多账户统计用，2026-08-19）
+    if t.get("account"):
+        rec["account"] = t["account"]
     return rec
 
 
@@ -133,13 +142,17 @@ def main() -> int:
     ap.add_argument("--wait", type=int, default=0,
                     help="等待结算秒数（0=不等，日级盘建议由 settle_worker 结算）")
     ap.add_argument("--log", type=str, default="", help="日志文件路径")
+    ap.add_argument("--symbols", type=str, default="",
+                    help="标的白名单（逗号分隔，如 nvda,spy,tsla；空=全部 17 个）")
+    ap.add_argument("--account", type=str, default="default",
+                    help="账户名（config/accounts.yaml，入库 account 列统计）")
     args = ap.parse_args()
 
     if args.log:
         sys.stdout = _Tee(args.log)  # type: ignore[assignment]
 
     http = HttpClient(proxy=PROXY, timeout=15)
-    mkts = discover_daily_updown(http)
+    mkts = discover_daily_updown(http, symbols=_parse_symbols(args.symbols))
     mkts = [m for m in mkts if float(m.get("liquidity") or 0) >= args.min_liquidity]
     print(f"discovered {len(mkts)} tradable daily up-or-down markets "
           f"(liq>={args.min_liquidity:.0f})")
@@ -207,6 +220,7 @@ def main() -> int:
             "llm_reason": s.extra.get("llm_reason"),
             "model": s.extra.get("model"),
             "results_file": str(OUT_DIR / f"equity_results_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"),
+            "account": args.account,
         }
         trades.append(t)
         seen.add(m.slug)

@@ -34,7 +34,7 @@ from polytrader.execution import order_v2  # noqa: E402
 from scripts.run_live_loop import _Tee, _req, derive_creds, place_order  # noqa: E402
 from scripts.scan_equity_updown import (  # noqa: E402
     PROXY, discover_daily_updown, to_market)
-from scripts.simulate_equity_updown import build_db_rec  # noqa: E402
+from scripts.simulate_equity_updown import build_db_rec, _parse_symbols  # noqa: E402
 from polytrader.strategies.equity_updown import EquityUpdownStrategy  # noqa: E402
 
 
@@ -44,6 +44,10 @@ def main() -> int:
     ap.add_argument("--min-edge", type=float, default=0.05)
     ap.add_argument("--min-liquidity", type=float, default=200.0)
     ap.add_argument("--per-round", type=int, default=1, help="本轮最多开几笔")
+    ap.add_argument("--symbols", type=str, default="",
+                    help="标的白名单（逗号分隔，如 nvda,spy,tsla；空=全部 17 个）")
+    ap.add_argument("--account", type=str, default="default",
+                    help="账户名（config/accounts.yaml，入库 account 列统计）")
     ap.add_argument("--log", type=str, default="",
                     help="日志文件路径（输出同时写文件，默认只输出到 stdout）")
     args = ap.parse_args()
@@ -53,11 +57,14 @@ def main() -> int:
         from polytrader.logging_setup import setup_logging
         setup_logging(level="INFO", log_file=args.log)
 
-    # ---- 凭证与资金预检（与 run_live_loop 一致）----
-    pk = os.environ["POLYMARKET_PRIVATE_KEY"]
-    deposit = os.environ.get("POLYMARKET_DEPOSIT_WALLET", "").strip()
-    if not deposit:
-        print("!! .env 缺 POLYMARKET_DEPOSIT_WALLET")
+    # ---- 凭证与资金预检（账户配置化：config/accounts.yaml，env 兜底）----
+    from polytrader.accounts import get_account
+    acct = get_account(args.account)
+    pk = acct.private_key
+    deposit = acct.deposit_wallet
+    if not pk or not deposit:
+        print(f"!! 账户 '{args.account}' 缺 private_key / deposit_wallet"
+              f"（config/accounts.yaml 或 .env）")
         return 1
     eoa = Account.from_key(pk).address
     creds = derive_creds(eoa, pk)
@@ -83,7 +90,7 @@ def main() -> int:
     strat = EquityUpdownStrategy(scorer, min_edge=args.min_edge)
 
     http = HttpClient(proxy=PROXY, timeout=15)
-    mkts = discover_daily_updown(http)
+    mkts = discover_daily_updown(http, symbols=_parse_symbols(args.symbols))
     mkts = [m for m in mkts if float(m.get("liquidity") or 0) >= args.min_liquidity]
     print(f"discovered {len(mkts)} tradable daily up-or-down markets")
     if not mkts:
@@ -175,6 +182,7 @@ def main() -> int:
                 "fill_tx": tx_hash,
                 "results_file": str(ROOT / "backtest_results"
                                     / f"equity_results_live_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"),
+                "account": args.account,
             }, mode="live")
             try:
                 db.insert_pending([rec])
